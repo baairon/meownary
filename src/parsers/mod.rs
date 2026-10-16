@@ -16,6 +16,8 @@ pub mod image;
 pub mod macho;
 pub mod media;
 pub mod pe;
+pub mod provenance;
+pub mod text;
 pub mod zip;
 
 use crate::model::Finding;
@@ -37,6 +39,7 @@ pub fn registry() -> Registry {
     probes.extend(media::probes());
     probes.extend(image::probes());
     probes.extend(doc::probes());
+    probes.extend(text::probes());
     probes.extend(deception::probes());
     probes.extend(catalog_probe::probes());
     probes
