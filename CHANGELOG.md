@@ -6,6 +6,27 @@ All notable changes to meownary are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Folders in the view**: the files pane shows one folder at a time, its
+  subfolders first, instead of every scanned file in one list. Rows stay put
+  while a scan fills them in, each folder shows its own progress, file count
+  and findings, and a folder can be picked for scrub or deattribute.
+- **Progress for every action**: plans, copies, scrubs, deletes and undo run
+  off the input thread with a thin progress bar naming the file in work, and
+  `esc` stops after the current file.
+- **Picker**: browses with keys like the view (`enter` opens, `left` goes up,
+  `s` scans, `/` filters or takes a path), reads folders in the background,
+  counts each folder's files, and keeps its layout still.
+- **Previews**: the README images draw seamless borders with rounded corners,
+  rounded chips and gradient progress bars.
+
+### Fixed
+
+- The highlight no longer moves when a file appears or disappears above it,
+  such as a `.deattributed` copy sorting before its original.
+- Columns line up for file names with wide characters.
+
 ## [0.1.0] - unreleased
 
 The first release.

@@ -15,7 +15,7 @@
   <a href="#exit-codes">Exit codes</a>
 </p>
 
-<p align="center"><img src="assets/preview.svg" width="960" alt="The meownary interactive view after a scan of 16 files. Left: the file list, one row per file with a severity dot, its detected type and a finding count. Right: the five findings of the highlighted executable, each with severity, title, confidence and signature id, removable ones tagged and one picked. Under them a peek box for the highlighted finding: kind tamper: appended data, action cut the file at 0x9c400, verdict warn, truncating may remove an appended code signature. Footer: key hints including d scrub and a deattribute, and 1 selected."></p>
+<p align="center"><img src="assets/preview.svg" width="960" alt="The meownary interactive view after a scan of 16 files, while a deattribute writes its copies: under the summary, an activity line reads Writing copies 5 of 5 with a thin rainbow progress bar and the archive being rebuilt. Left: the downloads folder, its subfolders first, each with a severity dot, its file count and a finding count, then its files with their detected type. Right: the five findings of the highlighted executable, each with severity, title, confidence and signature id, removable ones tagged and one picked. Under them a peek box for the highlighted finding: kind tamper: appended data, action cut the file at 0x9c400, verdict warn, truncating may remove an appended code signature. Footer: key hints including d scrub and a deattribute, and 1 selected."></p>
 
 ## What it does
 
@@ -82,7 +82,7 @@ meownary undo [--last | --all] [--json]
   `=`. `--` ends options, so later arguments are paths.
 - **Environment**: `MEOWNARY_STATE_DIR` moves the state directory. `NO_COLOR`
   turns color off and `MEOWNARY_NO_ANIM` stills the view's wordmark, each when
-  set and not empty.
+  set and not empty. Progress bars keep moving either way while work runs.
 
 ## Deattribute
 
@@ -440,18 +440,29 @@ picker's last five picks, written only when you pick something in the picker.
 
 ## Interactive view
 
-`meownary <path>` opens a terminal view that lists files as the walk finds
-them; `meownary` alone opens a picker first.
+`meownary <path>` opens a terminal view over a streaming scan, one folder at
+a time; `meownary` alone opens a picker first.
 
-<p align="center"><img src="assets/picker.svg" width="960" alt="The meownary picker on first run: the wordmark, one line saying nothing is changed until you confirm an action, an empty path input, and a list of places to start from: Downloads, Desktop, Documents, Pictures, the current folder, drive C: and home. Footer: up/dn move, right open, left back, enter scan, tab complete, esc quit."></p>
+<p align="center"><img src="assets/picker.svg" width="960" alt="The meownary picker browsing Downloads: the wordmark, one line saying nothing is changed until you confirm an action, the folder's path, a pinned Scan this folder row with its file count still counting, then the subfolders with their counts and the files with their sizes. Footer: up/dn move, enter open, left up, s scan here, / filter, ? keys, esc quit."></p>
 
-- **Picker**: the path line is also a live filter for the folder it points at.
-  Letters always type; arrows move, `right` or `tab` opens a folder, `left`
-  goes up, and `enter` scans the highlighted file or folder. Recent picks come
-  first, then common folders, drives and home. It asks before scanning a whole
-  home folder, the folder that holds every user's home, or a drive.
-- **Reopen**: `o` brings the picker back over the view; `esc` returns to the
-  view unchanged.
+- **Picker**: browse with the arrows or `j` and `k`; `enter` or `right` opens
+  a folder or scans a file, `left` or `backspace` goes up, and `s` scans the
+  folder you are in. `/` filters the folder, or takes a typed path, and a
+  pasted path jumps there. Recent picks come first, then common folders,
+  drives and home. Folders show their file counts as they are counted, and
+  the picker asks before scanning a whole home folder, the folder that holds
+  every user's home, or a drive, with the count so far.
+- **Reopen**: `o` brings the picker back over the view, at the folder you are
+  in; `esc` returns to the view unchanged.
+- **Folders**: the files pane shows one folder: its subfolders first, then its
+  files. Rows stay put while the scan fills them in; a folder being scanned
+  shows its own progress bar, then its file count and findings. `enter` or
+  `right` opens a folder, `left` or `backspace` goes up, and the highlighted
+  folder's summary fills the findings pane. `space` picks a folder, and `d`
+  or `a` on a folder covers every file under it; delete works on files only.
+- **Progress**: scans, plans, copies, scrubs, deletes and undo run in the
+  background with a thin progress bar on the header, naming the file being
+  worked on. `esc` stops after the current file; undo runs to the end.
 - **Saved marks**: a file you scrub gets a `scrubbed` chip in the list. After
   deattribute, the original gets a `deattributed` chip and its copy a `copy`
   chip. The status line names what was saved.
@@ -475,13 +486,14 @@ them; `meownary` alone opens a picker first.
 - **Editor**: `e` opens the highlighted file in `$VISUAL` or `$EDITOR`, else
   `notepad` on Windows and `vi` elsewhere. A change is journaled like a scrub.
 - **Browse**: `enter` opens a finding's detail with the bytes around it, `b`
-  groups findings, and `/` filters by path, format, signature id or title.
-  `left`, `right` or `tab` switch panes.
+  groups findings, and `/` filters the folder you are in by path, format,
+  signature id or title. `tab` switches panes, and `left` goes back from the
+  findings to the files.
 
 <details>
 <summary>Key reference</summary>
 
-<p align="center"><img src="assets/keys.svg" width="960" alt="The meownary key reference, the ? sheet, drawn over the dimmed interactive view. Move: up/dn or j/k move, pgup/pgdn page, home/end or g/G top or bottom, tab, left/right or h/l switch pane, enter open, esc back. Act: space select, d scrub markers, a deattribute, D or x delete file, e open in editor, u undo last. View: b buckets, / filter, o open file or folder, ? keys, q or ctrl+c quit. Confirm: y confirm, n or esc cancel. Filter: backspace erase, enter keep, esc clear. Press any key to close."></p>
+<p align="center"><img src="assets/keys.svg" width="960" alt="The meownary key reference, the ? sheet, drawn over the dimmed interactive view. Move: up/dn or j/k move, pgup/pgdn page, home/end or g/G top or bottom, enter or right/l open, left/h or backspace up a folder, tab switch pane, esc back. Act: space select, d scrub markers, a deattribute, A deep deattribute, D or x delete file, e open in editor, u undo last. View: o open file or folder, b buckets, / filter, ? keys, q or ctrl+c quit. Prompts: y confirm, n or esc cancel or clear, enter keep the filter, backspace erase. Press any key to close."></p>
 
 </details>
 

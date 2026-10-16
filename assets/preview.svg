@@ -1,260 +1,168 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" font-family="Cascadia Mono, Consolas, Menlo, monospace" font-size="16" xml:space="preserve">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" font-family="Cascadia Mono, Consolas, Menlo, monospace" font-size="15.5" xml:space="preserve">
 <title>meownary interactive view</title>
+<defs>
+<clipPath id="frame"><rect width="960" height="600" rx="12"/></clipPath>
+<linearGradient id="bar0" gradientUnits="userSpaceOnUse" x1="335.85" y1="0" x2="400.95" y2="0">
+<stop offset="0" stop-color="#48658a"/>
+<stop offset="0.1429" stop-color="#48718a"/>
+<stop offset="0.2857" stop-color="#48717e"/>
+<stop offset="0.4286" stop-color="#487172"/>
+<stop offset="0.5714" stop-color="#487166"/>
+<stop offset="0.7143" stop-color="#48715a"/>
+<stop offset="0.8571" stop-color="#54715a"/>
+<stop offset="1" stop-color="#5f715a"/>
+</linearGradient>
+<linearGradient id="bar1" gradientUnits="userSpaceOnUse" x1="233.55" y1="0" x2="326.55" y2="0">
+<stop offset="0" stop-color="#ff4040"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#ff4040;#ff7240;#ffa340;#ffd540;#f7ff40;#c5ff40;#93ff40;#61ff40;#40ff50;#40ff82;#40ffb4;#40ffe6;#40e6ff;#40b4ff;#4082ff;#4051ff;#6140ff;#9340ff;#c540ff;#f740ff;#ff40d6;#ff40a4;#ff4072;#ff4040"/></stop>
+<stop offset="0.1" stop-color="#ff4070"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#ff4070;#ff4240;#ff7440;#ffa540;#ffd740;#f5ff40;#c3ff40;#91ff40;#5fff40;#40ff52;#40ff84;#40ffb6;#40ffe8;#40e4ff;#40b2ff;#4080ff;#404fff;#6340ff;#9540ff;#c740ff;#f940ff;#ff40d4;#ff40a2;#ff4070"/></stop>
+<stop offset="0.2" stop-color="#ff409f"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#ff409f;#ff406e;#ff4440;#ff7640;#ffa740;#ffd940;#f3ff40;#c1ff40;#8fff40;#5dff40;#40ff54;#40ff86;#40ffb8;#40ffea;#40e2ff;#40b0ff;#407eff;#404dff;#6540ff;#9740ff;#c940ff;#fb40ff;#ff40d2;#ff409f"/></stop>
+<stop offset="0.3" stop-color="#ff40cf"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#ff40cf;#ff409d;#ff406c;#ff4640;#ff7840;#ffa940;#ffdc40;#f1ff40;#bfff40;#8dff40;#5bff40;#40ff56;#40ff88;#40ffba;#40ffec;#40e0ff;#40aeff;#407cff;#404aff;#6740ff;#9940ff;#cb40ff;#fd40ff;#ff40cf"/></stop>
+<stop offset="0.4" stop-color="#ff40ff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#ff40ff;#ff40cd;#ff409b;#ff4069;#ff4840;#ff7a40;#ffac40;#ffde40;#eeff40;#bdff40;#8bff40;#59ff40;#40ff59;#40ff8b;#40ffbc;#40ffee;#40deff;#40acff;#407aff;#4048ff;#6940ff;#9b40ff;#cd40ff;#ff40ff"/></stop>
+<stop offset="0.5" stop-color="#cf40ff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#cf40ff;#ff40fd;#ff40cb;#ff4099;#ff4067;#ff4a40;#ff7c40;#ffae40;#ffe040;#ecff40;#bbff40;#89ff40;#57ff40;#40ff5b;#40ff8d;#40ffbe;#40fff0;#40dcff;#40aaff;#4078ff;#4046ff;#6b40ff;#9d40ff;#cf40ff"/></stop>
+<stop offset="0.6" stop-color="#9f40ff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#9f40ff;#d140ff;#ff40fb;#ff40c9;#ff4097;#ff4065;#ff4c40;#ff7e40;#ffb040;#ffe240;#eaff40;#b9ff40;#86ff40;#55ff40;#40ff5d;#40ff8f;#40ffc0;#40fff2;#40daff;#40a8ff;#4076ff;#4044ff;#6d40ff;#9f40ff"/></stop>
+<stop offset="0.7" stop-color="#7040ff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#7040ff;#a140ff;#d340ff;#ff40f9;#ff40c7;#ff4095;#ff4063;#ff4e40;#ff8040;#ffb240;#ffe440;#e8ff40;#b6ff40;#84ff40;#53ff40;#40ff5f;#40ff91;#40ffc2;#40fff5;#40d8ff;#40a6ff;#4074ff;#4042ff;#7040ff"/></stop>
+<stop offset="0.8" stop-color="#4040ff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#4040ff;#7240ff;#a340ff;#d540ff;#ff40f7;#ff40c5;#ff4093;#ff4061;#ff5040;#ff8240;#ffb440;#ffe640;#e6ff40;#b4ff40;#82ff40;#51ff40;#40ff61;#40ff93;#40ffc5;#40fff7;#40d6ff;#40a4ff;#4072ff;#4040ff"/></stop>
+<stop offset="0.9" stop-color="#4070ff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#4070ff;#4240ff;#7440ff;#a540ff;#d740ff;#ff40f5;#ff40c3;#ff4091;#ff405f;#ff5240;#ff8440;#ffb640;#ffe840;#e4ff40;#b2ff40;#80ff40;#4fff40;#40ff63;#40ff95;#40ffc7;#40fff9;#40d4ff;#40a2ff;#4070ff"/></stop>
+<stop offset="1" stop-color="#409fff"><animate attributeName="stop-color" dur="3.5s" repeatCount="indefinite" values="#409fff;#406eff;#4440ff;#7640ff;#a740ff;#d940ff;#ff40f3;#ff40c1;#ff408f;#ff405d;#ff5440;#ff8640;#ffb840;#ffea40;#e2ff40;#b0ff40;#7eff40;#4dff40;#40ff65;#40ff97;#40ffc9;#40fffb;#40d2ff;#409fff"/></stop>
+</linearGradient>
+</defs>
+<g clip-path="url(#frame)">
 <rect width="960" height="600" fill="#16131d"/>
 <g>
-<rect x="864" y="0" width="86.4" height="20" fill="#ff6b8b"/>
-<rect x="441.6" y="60" width="96" height="20" fill="#c084fc"/>
-<rect x="432" y="80" width="19.2" height="20" fill="#332952"/>
-<rect x="451.2" y="80" width="86.4" height="20" fill="#f6c560"/>
-<rect x="537.6" y="80" width="412.8" height="20" fill="#332952"/>
-<rect x="432" y="100" width="518.4" height="20" fill="#332952"/>
-<rect x="451.2" y="120" width="86.4" height="20" fill="#2e254a"/>
-<rect x="451.2" y="160" width="86.4" height="20" fill="#2e254a"/>
-<rect x="451.2" y="200" width="86.4" height="20" fill="#1f2b45"/>
-<rect x="451.2" y="240" width="86.4" height="20" fill="#1f2b45"/>
-<rect x="9.6" y="320" width="403.2" height="20" fill="#241f33"/>
-<rect x="528" y="520" width="57.6" height="20" fill="#f6c560"/>
-<rect x="9.6" y="580" width="67.2" height="20" fill="#a78bfa"/>
-<rect x="163.2" y="580" width="67.2" height="20" fill="#a78bfa"/>
-<rect x="316.8" y="580" width="28.8" height="20" fill="#a78bfa"/>
-<rect x="422.4" y="580" width="28.8" height="20" fill="#a78bfa"/>
-<rect x="585.6" y="580" width="28.8" height="20" fill="#a78bfa"/>
-<rect x="700.8" y="580" width="28.8" height="20" fill="#a78bfa"/>
-<rect x="835.2" y="580" width="115.2" height="20" fill="#d8b4fe"/>
+<rect x="852" y="16" width="84" height="17" rx="3" fill="#ff6b8b"/>
+<rect x="443" y="73" width="93" height="17" rx="3" fill="#c084fc"/>
+<rect x="452" y="130" width="84" height="17" rx="3" fill="#2e254a"/>
+<rect x="434" y="92" width="502" height="36" rx="3" fill="#332952"/>
+<rect x="452" y="168" width="84" height="17" rx="3" fill="#2e254a"/>
+<rect x="452" y="206" width="84" height="17" rx="3" fill="#1f2b45"/>
+<rect x="452" y="244" width="84" height="17" rx="3" fill="#1f2b45"/>
+<rect x="24" y="282" width="391" height="17" rx="3" fill="#241f33"/>
+<rect x="527" y="510" width="55" height="17" rx="3" fill="#f6c560"/>
+<rect x="24" y="567" width="65" height="17" rx="3" fill="#a78bfa"/>
+<rect x="173" y="567" width="65" height="17" rx="3" fill="#a78bfa"/>
+<rect x="322" y="567" width="46" height="17" rx="3" fill="#a78bfa"/>
+<rect x="443" y="567" width="28" height="17" rx="3" fill="#a78bfa"/>
+<rect x="824" y="567" width="112" height="17" rx="3" fill="#d8b4fe"/>
+<rect x="452" y="92" width="84" height="17" rx="3" fill="#f6c560"/>
 </g>
-<text x="9.6" y="15"><tspan fill="#ff4040" font-weight="bold">m<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff4040;#ff7240;#ffa340;#ffd540;#f7ff40;#c5ff40;#93ff40;#61ff40;#40ff50;#40ff82;#40ffb4;#40ffe6;#40e6ff;#40b4ff;#4082ff;#4051ff;#6140ff;#9340ff;#c540ff;#f740ff;#ff40d6;#ff40a4;#ff4072;#ff4040"/></tspan></text>
-<text x="19.2" y="15"><tspan fill="#ff40bf" font-weight="bold">e<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff40bf;#ff408d;#ff405c;#ff5640;#ff8840;#ffb940;#ffec40;#e1ff40;#afff40;#7dff40;#4bff40;#40ff66;#40ff98;#40ffca;#40fffc;#40d0ff;#409eff;#406cff;#4540ff;#7740ff;#a940ff;#db40ff;#ff40f1;#ff40bf"/></tspan></text>
-<text x="28.8" y="15"><tspan fill="#bf40ff" font-weight="bold">o<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#bf40ff;#f140ff;#ff40db;#ff40a9;#ff4077;#ff4046;#ff6c40;#ff9e40;#ffd040;#fcff40;#cbff40;#99ff40;#67ff40;#40ff4b;#40ff7d;#40ffae;#40ffe0;#40ecff;#40baff;#4088ff;#4056ff;#5b40ff;#8d40ff;#bf40ff"/></tspan></text>
-<text x="38.4" y="15"><tspan fill="#4040ff" font-weight="bold">w<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#4040ff;#7240ff;#a340ff;#d540ff;#ff40f7;#ff40c5;#ff4093;#ff4061;#ff5040;#ff8240;#ffb440;#ffe640;#e6ff40;#b4ff40;#82ff40;#51ff40;#40ff61;#40ff93;#40ffc5;#40fff7;#40d6ff;#40a4ff;#4072ff;#4040ff"/></tspan></text>
-<text x="48" y="15" fill="#a78bfa" font-weight="bold">n</text>
-<text x="57.6" y="15" fill="#b799fb" font-weight="bold">a</text>
-<text x="67.2" y="15" fill="#c8a6fd" font-weight="bold">r</text>
-<text x="76.8" y="15" fill="#d8b4fe" font-weight="bold">y</text>
-<text x="873.6" y="15" textLength="67.2" lengthAdjust="spacing" fill="#16131d" font-weight="bold">1 alert</text>
-<text x="9.6" y="35" textLength="547.2" lengthAdjust="spacing" fill="#ece6f7">Scanned 16 files: 11 with findings, 12 removable markers.</text>
-<text x="9.6" y="55" textLength="48" lengthAdjust="spacing" fill="#6b6577">Press</text>
-<text x="67.2" y="55" fill="#a78bfa">?</text>
-<text x="86.4" y="55" textLength="86.4" lengthAdjust="spacing" fill="#6b6577">for keys,</text>
-<text x="182.4" y="55" fill="#a78bfa">q</text>
-<text x="201.6" y="55" textLength="76.8" lengthAdjust="spacing" fill="#6b6577">to quit.</text>
-<text x="0" y="75" fill="#4a4263">╭</text>
-<text x="28.8" y="75" textLength="48" lengthAdjust="spacing" fill="#9a91b0">files</text>
-<text x="96" y="75" textLength="268.8" lengthAdjust="spacing" fill="#4a4263">────────────────────────────</text>
-<text x="374.4" y="75" textLength="19.2" lengthAdjust="spacing" fill="#9a91b0">16</text>
-<text x="412.8" y="75" fill="#4a4263">╮</text>
-<text x="422.4" y="75" fill="#c084fc" font-weight="bold">╭</text>
-<text x="451.2" y="75" textLength="76.8" lengthAdjust="spacing" fill="#16131d" font-weight="bold">findings</text>
-<text x="547.2" y="75" textLength="182.4" lengthAdjust="spacing" fill="#c084fc" font-weight="bold">───────────────────</text>
-<text x="739.2" y="75" textLength="192" lengthAdjust="spacing" fill="#9a91b0" font-weight="bold">setup-tool-2.4.1.exe</text>
-<text x="950.4" y="75" fill="#c084fc" font-weight="bold">╮</text>
-<text x="0" y="95" fill="#4a4263">│</text>
-<text x="19.2" y="95" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="95" textLength="124.8" lengthAdjust="spacing" fill="#ece6f7">beach-day.jpg</text>
-<text x="336" y="95" textLength="38.4" lengthAdjust="spacing" fill="#9a91b0">jpeg</text>
-<text x="393.6" y="95" fill="#d8b4fe" font-weight="bold">2</text>
-<text x="412.8" y="95" fill="#4a4263">│</text>
-<text x="422.4" y="95" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="95" textLength="38.4" lengthAdjust="spacing" fill="#16131d" font-weight="bold">warn</text>
-<text x="547.2" y="95" textLength="297.6" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">1.8 MB appended after the image</text>
-<text x="950.4" y="95" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="115" fill="#4a4263">│</text>
-<text x="19.2" y="115" fill="#8fbcff" font-weight="bold">●</text>
-<text x="38.4" y="115" textLength="124.8" lengthAdjust="spacing" fill="#ece6f7">clip-0193.mp4</text>
-<text x="345.6" y="115" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">mp4</text>
-<text x="393.6" y="115" fill="#8fbcff" font-weight="bold">1</text>
-<text x="412.8" y="115" fill="#4a4263">│</text>
-<text x="422.4" y="115" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="115" textLength="76.8" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">moderate</text>
-<text x="547.2" y="115" textLength="96" lengthAdjust="spacing" fill="#a78bfa">pe.overlay</text>
-<text x="854.4" y="115" textLength="86.4" lengthAdjust="spacing" fill="#f5a3d0" font-weight="bold">removable</text>
-<text x="950.4" y="115" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="135" fill="#4a4263">│</text>
-<text x="19.2" y="135" fill="#6b6577">·</text>
-<text x="38.4" y="135" textLength="76.8" lengthAdjust="spacing" fill="#9a91b0">fonts.7z</text>
-<text x="355.2" y="135" textLength="19.2" lengthAdjust="spacing" fill="#9a91b0">7z</text>
-<text x="393.6" y="135" fill="#6b6577">-</text>
-<text x="412.8" y="135" fill="#4a4263">│</text>
-<text x="422.4" y="135" fill="#c084fc" font-weight="bold">│</text>
-<text x="432" y="135" fill="#f5a3d0" font-weight="bold">+</text>
-<text x="460.8" y="135" textLength="57.6" lengthAdjust="spacing" fill="#d8b4fe">notice</text>
-<text x="547.2" y="135" textLength="345.6" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">PDB path left in the debug directory</text>
-<text x="950.4" y="135" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="155" fill="#4a4263">│</text>
-<text x="19.2" y="155" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="155" textLength="134.4" lengthAdjust="spacing" fill="#ece6f7">game-patch.zip</text>
-<text x="345.6" y="155" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">zip</text>
-<text x="393.6" y="155" fill="#d8b4fe" font-weight="bold">1</text>
-<text x="412.8" y="155" fill="#4a4263">│</text>
-<text x="422.4" y="155" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="155" textLength="57.6" lengthAdjust="spacing" fill="#7ee0a1" font-weight="bold">strong</text>
-<text x="547.2" y="155" textLength="105.6" lengthAdjust="spacing" fill="#a78bfa">pe.pdb_path</text>
-<text x="854.4" y="155" textLength="86.4" lengthAdjust="spacing" fill="#f5a3d0" font-weight="bold">removable</text>
-<text x="950.4" y="155" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="175" fill="#4a4263">│</text>
-<text x="19.2" y="175" fill="#6b6577">·</text>
-<text x="38.4" y="175" textLength="76.8" lengthAdjust="spacing" fill="#9a91b0">icon.png</text>
-<text x="345.6" y="175" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">png</text>
-<text x="393.6" y="175" fill="#6b6577">-</text>
-<text x="412.8" y="175" fill="#4a4263">│</text>
-<text x="422.4" y="175" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="175" textLength="57.6" lengthAdjust="spacing" fill="#d8b4fe">notice</text>
-<text x="547.2" y="175" textLength="326.4" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">No embedded Authenticode signature</text>
-<text x="950.4" y="175" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="195" fill="#4a4263">│</text>
-<text x="19.2" y="195" fill="#6b6577">·</text>
-<text x="38.4" y="195" textLength="96" lengthAdjust="spacing" fill="#9a91b0">install.sh</text>
-<text x="316.8" y="195" textLength="57.6" lengthAdjust="spacing" fill="#9a91b0">script</text>
-<text x="393.6" y="195" fill="#6b6577">-</text>
-<text x="412.8" y="195" fill="#4a4263">│</text>
-<text x="422.4" y="195" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="195" textLength="57.6" lengthAdjust="spacing" fill="#7ee0a1" font-weight="bold">strong</text>
-<text x="547.2" y="195" textLength="144" lengthAdjust="spacing" fill="#a78bfa">pe.authenticode</text>
-<text x="950.4" y="195" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="215" fill="#4a4263">│</text>
-<text x="19.2" y="215" fill="#8fbcff" font-weight="bold">●</text>
-<text x="38.4" y="215" textLength="153.6" lengthAdjust="spacing" fill="#ece6f7">invoice-0425.pdf</text>
-<text x="345.6" y="215" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">pdf</text>
-<text x="393.6" y="215" fill="#8fbcff" font-weight="bold">1</text>
-<text x="412.8" y="215" fill="#4a4263">│</text>
-<text x="422.4" y="215" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="215" textLength="38.4" lengthAdjust="spacing" fill="#8fbcff">info</text>
-<text x="547.2" y="215" textLength="345.6" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">Linked with MSVC 19.38 (Rich header)</text>
-<text x="950.4" y="215" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="235" fill="#4a4263">│</text>
-<text x="19.2" y="235" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="235" textLength="144" lengthAdjust="spacing" fill="#ece6f7">lease-draft.pdf</text>
-<text x="345.6" y="235" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">pdf</text>
-<text x="393.6" y="235" fill="#d8b4fe" font-weight="bold">2</text>
-<text x="412.8" y="235" fill="#4a4263">│</text>
-<text x="422.4" y="235" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="235" textLength="57.6" lengthAdjust="spacing" fill="#7ee0a1" font-weight="bold">strong</text>
-<text x="547.2" y="235" textLength="134.4" lengthAdjust="spacing" fill="#a78bfa">pe.rich_header</text>
-<text x="950.4" y="235" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="255" fill="#4a4263">│</text>
-<text x="19.2" y="255" fill="#6b6577">·</text>
-<text x="38.4" y="255" textLength="86.4" lengthAdjust="spacing" fill="#9a91b0">notes.txt</text>
-<text x="364.8" y="255" fill="#9a91b0">?</text>
-<text x="393.6" y="255" fill="#6b6577">-</text>
-<text x="412.8" y="255" fill="#4a4263">│</text>
-<text x="422.4" y="255" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="255" textLength="38.4" lengthAdjust="spacing" fill="#8fbcff">info</text>
-<text x="547.2" y="255" textLength="336" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">NSIS installer stub (Nullsoft 3.09)</text>
-<text x="950.4" y="255" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="275" fill="#4a4263">│</text>
-<text x="19.2" y="275" fill="#ff6b8b" font-weight="bold">●</text>
-<text x="38.4" y="275" textLength="86.4" lengthAdjust="spacing" fill="#ece6f7">photo.jpg</text>
-<text x="355.2" y="275" textLength="19.2" lengthAdjust="spacing" fill="#9a91b0">pe</text>
-<text x="393.6" y="275" fill="#ff6b8b" font-weight="bold">2</text>
-<text x="412.8" y="275" fill="#4a4263">│</text>
-<text x="422.4" y="275" fill="#c084fc" font-weight="bold">│</text>
-<text x="460.8" y="275" textLength="76.8" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">moderate</text>
-<text x="547.2" y="275" textLength="211.2" lengthAdjust="spacing" fill="#a78bfa">catalog.installer.nsis</text>
-<text x="950.4" y="275" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="295" fill="#4a4263">│</text>
-<text x="19.2" y="295" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="295" textLength="115.2" lengthAdjust="spacing" fill="#ece6f7">portrait.png</text>
-<text x="345.6" y="295" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">png</text>
-<text x="393.6" y="295" fill="#d8b4fe" font-weight="bold">1</text>
-<text x="412.8" y="295" fill="#4a4263">│</text>
-<text x="422.4" y="295" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="295" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="315" fill="#4a4263">│</text>
-<text x="19.2" y="315" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="315" textLength="163.2" lengthAdjust="spacing" fill="#ece6f7">report-final.docx</text>
-<text x="326.4" y="315" textLength="48" lengthAdjust="spacing" fill="#9a91b0">ooxml</text>
-<text x="393.6" y="315" fill="#d8b4fe" font-weight="bold">1</text>
-<text x="412.8" y="315" fill="#4a4263">│</text>
-<text x="422.4" y="315" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="315" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="335" fill="#4a4263">│</text>
-<text x="19.2" y="335" fill="#f6c560" font-weight="bold">●</text>
-<text x="38.4" y="335" textLength="192" lengthAdjust="spacing" fill="#ece6f7">setup-tool-2.4.1.exe</text>
-<text x="355.2" y="335" textLength="19.2" lengthAdjust="spacing" fill="#9a91b0">pe</text>
-<text x="393.6" y="335" fill="#f6c560" font-weight="bold">5</text>
-<text x="412.8" y="335" fill="#4a4263">│</text>
-<text x="422.4" y="335" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="335" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="355" fill="#4a4263">│</text>
-<text x="19.2" y="355" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="355" textLength="105.6" lengthAdjust="spacing" fill="#ece6f7">sources.zip</text>
-<text x="345.6" y="355" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">zip</text>
-<text x="393.6" y="355" fill="#d8b4fe" font-weight="bold">1</text>
-<text x="412.8" y="355" fill="#4a4263">│</text>
-<text x="422.4" y="355" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="355" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="375" fill="#4a4263">│</text>
-<text x="19.2" y="375" fill="#d8b4fe" font-weight="bold">●</text>
-<text x="38.4" y="375" textLength="134.4" lengthAdjust="spacing" fill="#ece6f7">voice-memo.mp3</text>
-<text x="345.6" y="375" textLength="28.8" lengthAdjust="spacing" fill="#9a91b0">mp3</text>
-<text x="393.6" y="375" fill="#d8b4fe" font-weight="bold">1</text>
-<text x="412.8" y="375" fill="#4a4263">│</text>
-<text x="422.4" y="375" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="375" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="395" fill="#4a4263">│</text>
-<text x="19.2" y="395" fill="#6b6577">·</text>
-<text x="38.4" y="395" textLength="134.4" lengthAdjust="spacing" fill="#9a91b0">wallpaper.webp</text>
-<text x="336" y="395" textLength="38.4" lengthAdjust="spacing" fill="#9a91b0">webp</text>
-<text x="393.6" y="395" fill="#6b6577">-</text>
-<text x="412.8" y="395" fill="#4a4263">│</text>
-<text x="422.4" y="395" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="395" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="415" fill="#4a4263">│</text>
-<text x="412.8" y="415" fill="#4a4263">│</text>
-<text x="422.4" y="415" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="415" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="435" fill="#4a4263">│</text>
-<text x="412.8" y="435" fill="#4a4263">│</text>
-<text x="422.4" y="435" fill="#c084fc" font-weight="bold">│</text>
-<text x="950.4" y="435" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="455" fill="#4a4263">│</text>
-<text x="412.8" y="455" fill="#4a4263">│</text>
-<text x="422.4" y="455" fill="#c084fc" font-weight="bold">│</text>
-<text x="441.6" y="455" textLength="38.4" lengthAdjust="spacing" fill="#9a91b0">peek</text>
-<text x="489.6" y="455" textLength="451.2" lengthAdjust="spacing" fill="#4a4263">───────────────────────────────────────────────</text>
-<text x="950.4" y="455" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="475" fill="#4a4263">│</text>
-<text x="412.8" y="475" fill="#4a4263">│</text>
-<text x="422.4" y="475" fill="#c084fc" font-weight="bold">│</text>
-<text x="441.6" y="475" textLength="38.4" lengthAdjust="spacing" fill="#9a91b0">kind</text>
-<text x="528" y="475" textLength="201.6" lengthAdjust="spacing" fill="#ece6f7">tamper: appended data</text>
-<text x="950.4" y="475" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="495" fill="#4a4263">│</text>
-<text x="412.8" y="495" fill="#4a4263">│</text>
-<text x="422.4" y="495" fill="#c084fc" font-weight="bold">│</text>
-<text x="441.6" y="495" textLength="38.4" lengthAdjust="spacing" fill="#9a91b0">note</text>
-<text x="528" y="495" textLength="96" lengthAdjust="spacing" fill="#ece6f7">at 0x9c400</text>
-<text x="950.4" y="495" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="515" fill="#4a4263">│</text>
-<text x="412.8" y="515" fill="#4a4263">│</text>
-<text x="422.4" y="515" fill="#c084fc" font-weight="bold">│</text>
-<text x="441.6" y="515" textLength="57.6" lengthAdjust="spacing" fill="#9a91b0">action</text>
-<text x="528" y="515" textLength="220.8" lengthAdjust="spacing" fill="#ece6f7">cut the file at 0x9c400</text>
-<text x="950.4" y="515" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="535" fill="#4a4263">│</text>
-<text x="412.8" y="535" fill="#4a4263">│</text>
-<text x="422.4" y="535" fill="#c084fc" font-weight="bold">│</text>
-<text x="441.6" y="535" textLength="67.2" lengthAdjust="spacing" fill="#9a91b0">verdict</text>
-<text x="537.6" y="535" textLength="38.4" lengthAdjust="spacing" fill="#16131d" font-weight="bold">warn</text>
-<text x="604.8" y="535" textLength="316.8" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">truncating may remove an appended</text>
-<text x="950.4" y="535" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="555" fill="#4a4263">│</text>
-<text x="412.8" y="555" fill="#4a4263">│</text>
-<text x="422.4" y="555" fill="#c084fc" font-weight="bold">│</text>
-<text x="528" y="555" textLength="134.4" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">code signature</text>
-<text x="950.4" y="555" fill="#c084fc" font-weight="bold">│</text>
-<text x="0" y="575" textLength="422.4" lengthAdjust="spacing" fill="#4a4263">╰──────────────────────────────────────────╯</text>
-<text x="422.4" y="575" textLength="537.6" lengthAdjust="spacing" fill="#c084fc" font-weight="bold">╰──────────────────────────────────────────────────────╯</text>
-<text x="19.2" y="595" textLength="48" lengthAdjust="spacing" fill="#16131d" font-weight="bold">enter</text>
-<text x="86.4" y="595" textLength="57.6" lengthAdjust="spacing" fill="#9a91b0">detail</text>
-<text x="172.8" y="595" textLength="48" lengthAdjust="spacing" fill="#16131d" font-weight="bold">space</text>
-<text x="240" y="595" textLength="57.6" lengthAdjust="spacing" fill="#9a91b0">select</text>
-<text x="326.4" y="595" fill="#16131d" font-weight="bold">d</text>
-<text x="355.2" y="595" textLength="48" lengthAdjust="spacing" fill="#9a91b0">scrub</text>
-<text x="432" y="595" fill="#16131d" font-weight="bold">a</text>
-<text x="460.8" y="595" textLength="105.6" lengthAdjust="spacing" fill="#9a91b0">deattribute</text>
-<text x="595.2" y="595" fill="#16131d" font-weight="bold">e</text>
-<text x="624" y="595" textLength="57.6" lengthAdjust="spacing" fill="#9a91b0">editor</text>
-<text x="710.4" y="595" fill="#16131d" font-weight="bold">?</text>
-<text x="739.2" y="595" textLength="38.4" lengthAdjust="spacing" fill="#9a91b0">keys</text>
-<text x="844.8" y="595" textLength="96" lengthAdjust="spacing" fill="#16131d" font-weight="bold">1 selected</text>
+<g fill="none">
+<path d="M331.2 62.5 H405.6" stroke="url(#bar0)" stroke-width="1.2"/>
+<path d="M24.3 81.5 H23.65 A4.15 4.15 0 0 0 19.5 85.65 V552.35 A4.15 4.15 0 0 0 23.65 556.5 H415.35 A4.15 4.15 0 0 0 419.5 552.35 V85.65 A4.15 4.15 0 0 0 415.35 81.5 H414.9" stroke="#4a4263" stroke-width="1.2"/>
+<path d="M145.2 81.5 H368.4" stroke="#4a4263" stroke-width="1.2"/>
+<path d="M433.5 81.5 H432.65 A4.15 4.15 0 0 0 428.5 85.65 V552.35 A4.15 4.15 0 0 0 432.65 556.5 H936.35 A4.15 4.15 0 0 0 940.5 552.35 V85.65 A4.15 4.15 0 0 0 936.35 81.5 H935.7" stroke="#c084fc" stroke-width="1.2"/>
+<path d="M545.1 81.5 H721.8" stroke="#c084fc" stroke-width="1.2"/>
+<path d="M489.3 442.5 H926.4" stroke="#4a4263" stroke-width="1.2"/>
+<path d="M230.4 62.5 H329.7" stroke="url(#bar1)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<g>
+<circle cx="38.25" cy="100.5" r="3.1" fill="#d8b4fe"/>
+<circle cx="38.25" cy="119.5" r="3.1" fill="#d8b4fe"/>
+<circle cx="38.25" cy="138.5" r="3.1" fill="#d8b4fe"/>
+<circle cx="38.25" cy="157.5" r="3.1" fill="#d8b4fe"/>
+<circle cx="38.25" cy="214.5" r="3.1" fill="#8fbcff"/>
+<circle cx="38.25" cy="233.5" r="3.1" fill="#d8b4fe"/>
+<circle cx="38.25" cy="271.5" r="3.1" fill="#ff6b8b"/>
+<circle cx="38.25" cy="290.5" r="3.1" fill="#f6c560"/>
+<circle cx="38.25" cy="309.5" r="3.1" fill="#d8b4fe"/>
+</g>
+<text x="24.3" y="29.34"><tspan fill="#ff4040" font-weight="bold">m<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff4040;#ff7240;#ffa340;#ffd540;#f7ff40;#c5ff40;#93ff40;#61ff40;#40ff50;#40ff82;#40ffb4;#40ffe6;#40e6ff;#40b4ff;#4082ff;#4051ff;#6140ff;#9340ff;#c540ff;#f740ff;#ff40d6;#ff40a4;#ff4072;#ff4040"/></tspan></text>
+<text x="33.6" y="29.34"><tspan fill="#ff40bf" font-weight="bold">e<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff40bf;#ff408d;#ff405c;#ff5640;#ff8840;#ffb940;#ffec40;#e1ff40;#afff40;#7dff40;#4bff40;#40ff66;#40ff98;#40ffca;#40fffc;#40d0ff;#409eff;#406cff;#4540ff;#7740ff;#a940ff;#db40ff;#ff40f1;#ff40bf"/></tspan></text>
+<text x="42.9" y="29.34"><tspan fill="#bf40ff" font-weight="bold">o<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#bf40ff;#f140ff;#ff40db;#ff40a9;#ff4077;#ff4046;#ff6c40;#ff9e40;#ffd040;#fcff40;#cbff40;#99ff40;#67ff40;#40ff4b;#40ff7d;#40ffae;#40ffe0;#40ecff;#40baff;#4088ff;#4056ff;#5b40ff;#8d40ff;#bf40ff"/></tspan></text>
+<text x="52.2" y="29.34"><tspan fill="#4040ff" font-weight="bold">w<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#4040ff;#7240ff;#a340ff;#d540ff;#ff40f7;#ff40c5;#ff4093;#ff4061;#ff5040;#ff8240;#ffb440;#ffe640;#e6ff40;#b4ff40;#82ff40;#51ff40;#40ff61;#40ff93;#40ffc5;#40fff7;#40d6ff;#40a4ff;#4072ff;#4040ff"/></tspan></text>
+<text x="61.5" y="29.34" fill="#a78bfa" font-weight="bold">n</text>
+<text x="70.8" y="29.34" fill="#b799fb" font-weight="bold">a</text>
+<text x="80.1" y="29.34" fill="#c8a6fd" font-weight="bold">r</text>
+<text x="89.4" y="29.34" fill="#d8b4fe" font-weight="bold">y</text>
+<text x="861.3" y="29.34" textLength="65.1" lengthAdjust="spacing" fill="#16131d" font-weight="bold">1 alert</text>
+<text x="24.3" y="48.34" textLength="530.1" lengthAdjust="spacing" fill="#ece6f7">Scanned 16 files: 11 with findings, 12 removable markers.</text>
+<text x="24.3" y="67.34" textLength="195.3" lengthAdjust="spacing" fill="#d8b4fe">Writing copies 5 of 5</text>
+<text x="414.9" y="67.34" textLength="186" lengthAdjust="spacing" fill="#ece6f7">Games\game-patch.zip</text>
+<text x="42.9" y="86.34" textLength="83.7" lengthAdjust="spacing" fill="#9a91b0">downloads</text>
+<text x="377.7" y="86.34" textLength="18.6" lengthAdjust="spacing" fill="#9a91b0">16</text>
+<text x="452.1" y="86.34" textLength="74.4" lengthAdjust="spacing" fill="#16131d" font-weight="bold">findings</text>
+<text x="731.1" y="86.34" textLength="186" lengthAdjust="spacing" fill="#9a91b0" font-weight="bold">setup-tool-2.4.1.exe</text>
+<text x="52.2" y="105.34" textLength="93" lengthAdjust="spacing" fill="#ece6f7">Documents\</text>
+<text x="321.9" y="105.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">1 file</text>
+<text x="396.3" y="105.34" fill="#d8b4fe" font-weight="bold">1</text>
+<text x="461.4" y="105.34" textLength="37.2" lengthAdjust="spacing" fill="#16131d" font-weight="bold">warn</text>
+<text x="545.1" y="105.34" textLength="288.3" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">1.8 MB appended after the image</text>
+<text x="52.2" y="124.34" textLength="55.8" lengthAdjust="spacing" fill="#ece6f7">Games\</text>
+<text x="312.6" y="124.34" textLength="65.1" lengthAdjust="spacing" fill="#9a91b0">2 files</text>
+<text x="396.3" y="124.34" fill="#d8b4fe" font-weight="bold">1</text>
+<text x="461.4" y="124.34" textLength="74.4" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">moderate</text>
+<text x="545.1" y="124.34" textLength="93" lengthAdjust="spacing" fill="#a78bfa">pe.overlay</text>
+<text x="842.7" y="124.34" textLength="83.7" lengthAdjust="spacing" fill="#f5a3d0" font-weight="bold">removable</text>
+<text x="52.2" y="143.34" textLength="55.8" lengthAdjust="spacing" fill="#ece6f7">Media\</text>
+<text x="312.6" y="143.34" textLength="65.1" lengthAdjust="spacing" fill="#9a91b0">2 files</text>
+<text x="396.3" y="143.34" fill="#d8b4fe" font-weight="bold">2</text>
+<text x="433.5" y="143.34" fill="#f5a3d0" font-weight="bold">+</text>
+<text x="461.4" y="143.34" textLength="55.8" lengthAdjust="spacing" fill="#d8b4fe">notice</text>
+<text x="545.1" y="143.34" textLength="334.8" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">PDB path left in the debug directory</text>
+<text x="52.2" y="162.34" textLength="65.1" lengthAdjust="spacing" fill="#ece6f7">Photos\</text>
+<text x="312.6" y="162.34" textLength="65.1" lengthAdjust="spacing" fill="#9a91b0">3 files</text>
+<text x="396.3" y="162.34" fill="#d8b4fe" font-weight="bold">3</text>
+<text x="461.4" y="162.34" textLength="55.8" lengthAdjust="spacing" fill="#7ee0a1" font-weight="bold">strong</text>
+<text x="545.1" y="162.34" textLength="102.3" lengthAdjust="spacing" fill="#a78bfa">pe.pdb_path</text>
+<text x="842.7" y="162.34" textLength="83.7" lengthAdjust="spacing" fill="#f5a3d0" font-weight="bold">removable</text>
+<text x="33.6" y="181.34" fill="#6b6577">·</text>
+<text x="52.2" y="181.34" textLength="74.4" lengthAdjust="spacing" fill="#9a91b0">icon.png</text>
+<text x="349.8" y="181.34" textLength="27.9" lengthAdjust="spacing" fill="#9a91b0">png</text>
+<text x="396.3" y="181.34" fill="#6b6577">-</text>
+<text x="461.4" y="181.34" textLength="55.8" lengthAdjust="spacing" fill="#d8b4fe">notice</text>
+<text x="545.1" y="181.34" textLength="316.2" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">No embedded Authenticode signature</text>
+<text x="33.6" y="200.34" fill="#6b6577">·</text>
+<text x="52.2" y="200.34" textLength="93" lengthAdjust="spacing" fill="#9a91b0">install.sh</text>
+<text x="321.9" y="200.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">script</text>
+<text x="396.3" y="200.34" fill="#6b6577">-</text>
+<text x="461.4" y="200.34" textLength="55.8" lengthAdjust="spacing" fill="#7ee0a1" font-weight="bold">strong</text>
+<text x="545.1" y="200.34" textLength="139.5" lengthAdjust="spacing" fill="#a78bfa">pe.authenticode</text>
+<text x="52.2" y="219.34" textLength="148.8" lengthAdjust="spacing" fill="#ece6f7">invoice-0425.pdf</text>
+<text x="349.8" y="219.34" textLength="27.9" lengthAdjust="spacing" fill="#9a91b0">pdf</text>
+<text x="396.3" y="219.34" fill="#8fbcff" font-weight="bold">1</text>
+<text x="461.4" y="219.34" textLength="37.2" lengthAdjust="spacing" fill="#8fbcff">info</text>
+<text x="545.1" y="219.34" textLength="334.8" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">Linked with MSVC 19.38 (Rich header)</text>
+<text x="52.2" y="238.34" textLength="139.5" lengthAdjust="spacing" fill="#ece6f7">lease-draft.pdf</text>
+<text x="349.8" y="238.34" textLength="27.9" lengthAdjust="spacing" fill="#9a91b0">pdf</text>
+<text x="396.3" y="238.34" fill="#d8b4fe" font-weight="bold">2</text>
+<text x="461.4" y="238.34" textLength="55.8" lengthAdjust="spacing" fill="#7ee0a1" font-weight="bold">strong</text>
+<text x="545.1" y="238.34" textLength="130.2" lengthAdjust="spacing" fill="#a78bfa">pe.rich_header</text>
+<text x="33.6" y="257.34" fill="#6b6577">·</text>
+<text x="52.2" y="257.34" textLength="83.7" lengthAdjust="spacing" fill="#9a91b0">notes.txt</text>
+<text x="368.4" y="257.34" fill="#9a91b0">?</text>
+<text x="396.3" y="257.34" fill="#6b6577">-</text>
+<text x="461.4" y="257.34" textLength="37.2" lengthAdjust="spacing" fill="#8fbcff">info</text>
+<text x="545.1" y="257.34" textLength="325.5" lengthAdjust="spacing" fill="#ece6f7" font-weight="bold">NSIS installer stub (Nullsoft 3.09)</text>
+<text x="52.2" y="276.34" textLength="83.7" lengthAdjust="spacing" fill="#ece6f7">photo.jpg</text>
+<text x="359.1" y="276.34" textLength="18.6" lengthAdjust="spacing" fill="#9a91b0">pe</text>
+<text x="396.3" y="276.34" fill="#ff6b8b" font-weight="bold">2</text>
+<text x="461.4" y="276.34" textLength="74.4" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">moderate</text>
+<text x="545.1" y="276.34" textLength="204.6" lengthAdjust="spacing" fill="#a78bfa">catalog.installer.nsis</text>
+<text x="52.2" y="295.34" textLength="186" lengthAdjust="spacing" fill="#ece6f7">setup-tool-2.4.1.exe</text>
+<text x="359.1" y="295.34" textLength="18.6" lengthAdjust="spacing" fill="#9a91b0">pe</text>
+<text x="396.3" y="295.34" fill="#f6c560" font-weight="bold">5</text>
+<text x="52.2" y="314.34" textLength="102.3" lengthAdjust="spacing" fill="#ece6f7">sources.zip</text>
+<text x="349.8" y="314.34" textLength="27.9" lengthAdjust="spacing" fill="#9a91b0">zip</text>
+<text x="396.3" y="314.34" fill="#d8b4fe" font-weight="bold">1</text>
+<text x="442.8" y="447.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">peek</text>
+<text x="442.8" y="466.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">kind</text>
+<text x="526.5" y="466.34" textLength="195.3" lengthAdjust="spacing" fill="#ece6f7">tamper: appended data</text>
+<text x="442.8" y="485.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">note</text>
+<text x="526.5" y="485.34" textLength="93" lengthAdjust="spacing" fill="#ece6f7">at 0x9c400</text>
+<text x="442.8" y="504.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">action</text>
+<text x="526.5" y="504.34" textLength="213.9" lengthAdjust="spacing" fill="#ece6f7">cut the file at 0x9c400</text>
+<text x="442.8" y="523.34" textLength="65.1" lengthAdjust="spacing" fill="#9a91b0">verdict</text>
+<text x="535.8" y="523.34" textLength="37.2" lengthAdjust="spacing" fill="#16131d" font-weight="bold">warn</text>
+<text x="600.9" y="523.34" textLength="306.9" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">truncating may remove an appended</text>
+<text x="526.5" y="542.34" textLength="130.2" lengthAdjust="spacing" fill="#f6c560" font-weight="bold">code signature</text>
+<text x="33.6" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">enter</text>
+<text x="98.7" y="580.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">detail</text>
+<text x="182.4" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">space</text>
+<text x="247.5" y="580.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">select</text>
+<text x="331.2" y="580.34" textLength="27.9" lengthAdjust="spacing" fill="#16131d" font-weight="bold">tab</text>
+<text x="377.7" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#9a91b0">files</text>
+<text x="452.1" y="580.34" fill="#16131d" font-weight="bold">?</text>
+<text x="480" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">keys</text>
+<text x="833.4" y="580.34" textLength="93" lengthAdjust="spacing" fill="#16131d" font-weight="bold">1 selected</text>
+</g>
+<rect x="0.5" y="0.5" width="959" height="599" rx="11.5" fill="none" stroke="#4a4263"/>
 </svg>
