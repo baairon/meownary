@@ -128,37 +128,55 @@ Every blank is one of two kinds, `brand` or `patch`.
 ### Deep mode
 
 `--deep`, or `A` in the view, runs a wider sweep on top of the basic one. It
-looks for copyrights, patch credits, build and install paths, licensing
-endpoints and messages, and product identifiers corroborated by exports or
-repeated class and UI strings. Deep edits can break loading, registration and
-licensing behavior, so inspect and test the copy before using it.
+looks for copyrights, patch credits, build paths, licensing library marks, and
+the vendor and product names the file itself gives away. Deep edits can break
+loading, signing, registration and licensing behavior, and a plug-in whose
+match name changes no longer matches projects saved with the original, so
+inspect and test the copy before using it.
 
 | Format | Deep also changes |
 |---|---|
-| PE | strings in initialized data sections and resources, and the .NET `#US` heap; the export directory's DLL name, rewritten to a neutral same-length `module` name; COFF, export, resource and debug timestamps; the PDB path and RSDS GUID; POGO, VC feature and REPRO debug records; the Authenticode directory, cleared so the copy is cleanly unsigned |
-| ELF | strings in `.rodata`, `.data` and `.comment` |
-| Mach-O | strings in `__TEXT` `__cstring`, `__const`, `__ustring` and `__oslogstring`, and `__DATA` `__const` and `__data` |
+| PE | strings in initialized data sections; string table, dialog and message table resources; the .NET `#US` heap, and the assembly's Company, Product, Title, Description and Copyright values, each rewritten to its own label; Adobe plug-in property lists (PiPL), where the plug-in name becomes `Effect`, a category naming the vendor becomes `Effects`, and an After Effects match name of 18 characters or more becomes a neutral id of the same length; the export directory's DLL name, rewritten to a neutral same-length `module` name; COFF, export, resource and debug timestamps; the PDB path and RSDS GUID, the image name in a MISC record, and an embedded portable PDB, cleared along with its debug entry; POGO, VC feature and REPRO debug records; the Authenticode directory, cleared so the copy is cleanly unsigned |
+| ELF | strings in `.rodata`, `.data`, `.comment`, `.debug_str` and `.debug_line_str` |
+| Mach-O | strings in `__TEXT` `__cstring`, `__const`, `__ustring` and `__oslogstring`, and `__DATA` `__const` and `__data`; the source and object file paths of debug stabs; the embedded code signature, blanked with `LC_CODE_SIGNATURE` emptied so the copy is cleanly unsigned |
+| Resource fork | `STR ` and `STR#` strings and PiPL properties, in a raw Macintosh resource fork or an AppleDouble `._` file |
 | Plain text | patch credits, copyright marks and build paths, filled with spaces up to the end of their line or quoted value, so quotes, tags and newlines stay put |
 | Anything else | patch credits, copyright marks and build paths in NUL-terminated strings, only where the bytes around them do not look compressed or encrypted |
 
+A name counts when the file states it outright, in a copyright line, a version
+CompanyName, the export's module name, a .NET AssemblyCompany, a PiPL match
+name or a code signature's identifier, or when two independent hints agree:
+product names, manifest identities, PDB and image names, certificate names,
+link hosts and registry keys. An all-caps product mark counts once it appears
+three times, one of them in a class name or UI string. Each name is blanked
+where it stands as a whole word or a capitalized part of one, and the rest of
+the string stays readable: `Acme license expired` keeps `license expired`.
+
 Deep never touches:
 
-- code sections;
-- PE import tables, the export address, name and ordinal tables, TLS,
-  relocations, load config, exception tables, resource directory nodes, RTTI
-  names, or .NET metadata other than the `#US` user string heap;
+- code sections; in a PE, a name found in one is reported as
+  `identity in code`;
+- PE import tables, the export address, name and ordinal tables and their
+  forwarders, TLS, relocations, load config, exception tables, resource
+  directory nodes and names, RTTI names, PiPL entry points, or .NET metadata
+  besides the `#US` heap and those assembly values;
+- PE version resources, which the basic pass handles by key, or manifests;
 - ELF `.dynstr`, `.symtab`, `.dynamic`, notes, unwind data or Go build info;
-- Mach-O `__LINKEDIT`, Objective-C class and selector names, or a section
-  holding instructions;
-- PE version and manifest resources, which the basic pass handles by key.
+- Mach-O symbol names, `__LINKEDIT` data besides stab paths and the code
+  signature, Objective-C class and selector names, or a section holding
+  instructions;
+- the names of resources in a resource fork, which the host looks up;
+- URLs and registry keys, kept byte for byte even inside a string that is
+  cleaned around them.
 
-A string is swept only when it stands alone between NUL bytes, so text
-embedded in a larger blob is left as it is. Matches are whole words:
-`dispatched by` is not a `patched by` credit. Licensing words such as
-`license` or `trial` count only beside a link in the same string. The sweep
-reads only the file's bytes, never its name, so the same file gives the same
-copy on disk, inside an archive and on a rerun, and a deep copy plans nothing
-more.
+Outside the structures above, a string is swept only when it stands alone:
+between NUL bytes as UTF-8, Windows ANSI or UTF-16 text of up to 65,536
+characters, or as a short string led by its own length byte. Text embedded in
+a larger blob is left as it is.
+Matches are whole words: `dispatched by` is not a `patched by` credit. A deep
+sweep reads at most 256 MiB of a file. It reads only the file's bytes, never
+its name, so the same file gives the same copy on disk, inside an archive and
+on a rerun, and a deep copy plans nothing more.
 
 ### Archives
 
@@ -207,7 +225,10 @@ beside the original.
 
 A skip names one generic reason. A file's credits are skipped as
 `load-bearing`, `no removable marker`, `unsafe edit`, `changed since scan` or
-`io error`. Inside an archive, an entry can also be skipped as
+`io error`. Deep mode also reports names it found but had to keep, and what
+it could not read: `identity in code`, `functional name kept`,
+`functional value kept`, `malformed metadata` and `deep scan budget reached`.
+Inside an archive, an entry can also be skipped as
 `unsupported entry`, `entry too large`, `nested archive`, `signed package` or
 `rest of the archive is unreadable`, and an archive with nothing to change
 reports `nothing to blank inside the archive`.
@@ -222,6 +243,11 @@ reports `nothing to blank inside the archive`.
 | `unsafe edit` | the blank is not rated safe, it overlaps a blank with another fill, planning failed internally, or the copy's path is a symbolic link or not a file |
 | `changed since scan` | the original's size or bytes changed after planning |
 | `io error` | the walk could not read the file (a cloud-only placeholder is never opened), the original could not be opened, or the copy could not be written |
+| `identity in code` | a vendor or product name the deep sweep found sits in a PE code section, which it never edits |
+| `functional name kept` | a name the deep sweep found is part of an import, export, RTTI class name, plug-in entry point or resource name, which stays byte for byte |
+| `functional value kept` | a name the deep sweep found is part of a URL or registry key, which stays byte for byte |
+| `malformed metadata` | a structure that can name the vendor (a PiPL list, .NET metadata, an embedded PDB, a code signature, a resource map) could not be read safely, so it is left as it is |
+| `deep scan budget reached` | the deep sweep stopped at its 256 MiB read limit, or a record was too large to read |
 | `unsupported entry` | an archive entry that is encrypted, ZIP64, corrupt or uses an unknown method |
 | `entry too large` | an archive entry over 256 MiB uncompressed |
 | `nested archive` | an archive inside the archive, which is never opened |
@@ -266,7 +292,8 @@ encryption info.
   is a usage error.
 - Run a warn-level edit, or one the safety check refuses.
 - Re-sign an executable. The copy of a signed file carries a broken
-  signature, or none for a PE in deep mode, and the run reports the caveat.
+  signature, or none for a PE or Mach-O in deep mode, and the run reports the
+  caveat.
 
 ## Scrub
 
@@ -462,7 +489,10 @@ a time; `meownary` alone opens a picker first.
   or `a` on a folder covers every file under it; delete works on files only.
 - **Progress**: scans, plans, copies, scrubs, deletes and undo run in the
   background with a thin progress bar on the header, naming the file being
-  worked on. `esc` stops after the current file; undo runs to the end.
+  worked on. The bar flows in the wordmark's rainbow, and a sheen in the same
+  colors runs over the file in progress, or over the whole bar until there is
+  something to count. `esc` stops after the current file; undo runs to the
+  end.
 - **Saved marks**: a file you scrub gets a `scrubbed` chip in the list. After
   deattribute, the original gets a `deattributed` chip and its copy a `copy`
   chip. The status line names what was saved.

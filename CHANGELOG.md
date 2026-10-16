@@ -6,6 +6,15 @@ All notable changes to meownary are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Wider deep mode**: `--deep` and `A` also clean Macintosh resource forks
+  and AppleDouble `._` files, PE dialog, message table and PiPL plug-in
+  resources, .NET assembly attributes, MISC and embedded PDB debug records,
+  ELF debug strings and Mach-O debug stab paths, and leave a Mach-O copy
+  cleanly unsigned. Names found but kept, in code, linkage, URLs or registry
+  keys, are reported with their own skip reasons.
+
 ### Changed
 
 - **Folders in the view**: the files pane shows one folder at a time, its
@@ -20,12 +29,17 @@ All notable changes to meownary are recorded here. The format follows
   counts each folder's files, and keeps its layout still.
 - **Previews**: the README images draw seamless borders with rounded corners,
   rounded chips and gradient progress bars.
+- **Progress bar shimmer**: the span of the file in work, and the whole bar
+  before anything is counted, shimmers in the wordmark's rainbow instead of a
+  faint wash.
 
 ### Fixed
 
 - The highlight no longer moves when a file appears or disappears above it,
   such as a `.deattributed` copy sorting before its original.
 - Columns line up for file names with wide characters.
+- Deep mode keeps the first letter of a vendor named after a copyright mark,
+  so a vendor whose name starts with C is found wherever it appears.
 
 ## [0.1.0] - unreleased
 
