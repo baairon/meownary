@@ -87,6 +87,7 @@ pub fn draw_into(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
             backdrop(buf, area, look);
             app.rainbow_cells.clear();
             draw_confirm(buf, body, app, look);
+            app.confirm_drawn = true;
         }
         Some(Overlay::Filter) | None => {}
     }
@@ -878,7 +879,7 @@ fn saved_chip(app: &App, path: &Path, look: &Look) -> Option<(&'static str, Styl
             Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
         }
     };
-    if app.copy_of(path).is_some() {
+    if app.is_copy(path) {
         return Some(("copy", soft(look.p.info, Color::Rgb(0x1f, 0x2b, 0x45))));
     }
     app.saved(path).map(|s| {
@@ -1820,6 +1821,11 @@ fn item_action(item: &app::PlanItem) -> String {
         return "save a copy".to_string();
     }
     match item.marker.removal {
+        RemovalStrategy::RawBlank { .. } if item.replacement.is_some() => format!(
+            "rewrite {} at 0x{:x}",
+            human_size(item.marker.region.len),
+            item.marker.region.offset
+        ),
         RemovalStrategy::RawBlank { .. } => {
             format!(
                 "blank {} at 0x{:x}",
@@ -1850,7 +1856,10 @@ fn plan_lines(
     let mut starts = Vec::new();
     for item in &plan.items {
         starts.push(lines.len());
+        let deep = plan.kind == app::PlanKind::DeepDeattribute;
         let (chip, reason, tone) = match &item.risk {
+            // A deep edit is safe to write but may stop the copy loading.
+            Risk::Safe if deep => (" deep    ", None, Tone::Warn),
             Risk::Safe => (" safe    ", None, Tone::Good),
             Risk::Warn(r) => (" warn    ", Some(r.clone()), Tone::Warn),
             Risk::Refuse(r) => (" refuse  ", Some(r.clone()), Tone::Bad),
@@ -1906,6 +1915,33 @@ fn draw_confirm(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
     let (lines, starts) = plan_lines(app, plan, inner_w, look);
 
     let mut notes: Vec<Line> = Vec::new();
+    // The deep warning goes first so a short terminal never drops it.
+    if plan.kind == app::PlanKind::DeepDeattribute {
+        notes.push(Line::from(Span::styled(
+            "Deep edits can break loading or licensing. Check the copy before use.",
+            look.tone(Tone::Warn),
+        )));
+    }
+    for caveat in &plan.caveats {
+        notes.push(Line::from(Span::styled(
+            caveat.clone(),
+            look.tone(Tone::Warn),
+        )));
+    }
+    if let Some(first) = plan.replaces.first() {
+        let name = first
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| app.display_path(first));
+        let more = match plan.replaces.len() {
+            1 => String::new(),
+            n => format!(" +{} more", app::thousands(n - 1)),
+        };
+        notes.push(Line::from(Span::styled(
+            format!("Replaces {name}{more}."),
+            look.tone(Tone::Warn),
+        )));
+    }
     let refused = plan.items.len() - plan.runnable();
     if refused > 0 {
         notes.push(Line::from(Span::styled(
@@ -1939,7 +1975,10 @@ fn draw_confirm(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
             look.tone(Tone::Warn),
         )));
     }
-    if plan.kind == app::PlanKind::Deattribute {
+    if matches!(
+        plan.kind,
+        app::PlanKind::Deattribute | app::PlanKind::DeepDeattribute
+    ) {
         notes.push(Line::from(Span::styled(
             "A copy is saved beside each original. The originals never change.",
             look.faint(),
@@ -1968,7 +2007,7 @@ fn draw_confirm(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
     let tone = match plan.kind {
         app::PlanKind::Scrub => Tone::Info,
         app::PlanKind::Deattribute => Tone::Info,
-        app::PlanKind::Delete => Tone::Warn,
+        app::PlanKind::DeepDeattribute | app::PlanKind::Delete => Tone::Warn,
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)

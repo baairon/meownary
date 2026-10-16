@@ -116,6 +116,7 @@ pub struct Status {
 pub enum PlanKind {
     Scrub,
     Deattribute,
+    DeepDeattribute,
     Delete,
 }
 
@@ -131,9 +132,20 @@ pub struct PlanItem {
     pub marker: Marker,
     pub risk: Risk,
     pub expected_hash: Option<String>,
+    pub replacement: Option<Vec<u8>>,
+    /// Which credit a deattribute item blanks or rewrites.
+    pub credit: Option<deattribute::Kind>,
     /// Set when the item means "the files inside this archive": a deattributed
     /// copy is rebuilt around them instead of blanking one region.
-    pub archive: Option<deattribute::ArchiveKind>,
+    pub archive: Option<ArchivePlan>,
+}
+
+/// An archive a deattribute plan rebuilds, with what its dry run found, so
+/// the confirm and the write both work from the one dry run.
+#[derive(Debug, Clone)]
+pub struct ArchivePlan {
+    pub kind: deattribute::ArchiveKind,
+    pub dry_run: deattribute::ArchiveOutcome,
 }
 
 /// A batch awaiting confirmation.
@@ -144,6 +156,10 @@ pub struct Plan {
     /// Weak-confidence findings left out of a bulk action.
     pub weak_left_out: usize,
     pub private_skips: Vec<String>,
+    /// What the copies lose besides the credits, one line per kind of loss.
+    pub caveats: Vec<String>,
+    /// Copies already on disk that this plan would replace.
+    pub replaces: Vec<PathBuf>,
     pub scroll: usize,
 }
 
@@ -156,10 +172,22 @@ impl Plan {
             .count()
     }
 
+    /// The deattribute mode a deattribute plan runs in.
+    pub fn mode(&self) -> deattribute::Mode {
+        if self.kind == PlanKind::DeepDeattribute {
+            deattribute::Mode::Deep
+        } else {
+            deattribute::Mode::Basic
+        }
+    }
+
     pub fn title(&self) -> String {
         let n = self.runnable();
         match self.kind {
             PlanKind::Scrub => format!("Scrub {n} {}?", plural(n, "marker", "markers")),
+            PlanKind::DeepDeattribute => {
+                format!("Deep deattribute {n} {}?", plural(n, "edit", "edits"))
+            }
             PlanKind::Deattribute => {
                 let archives = self.items.iter().filter(|i| i.archive.is_some()).count();
                 let markers = n.saturating_sub(archives);
@@ -190,8 +218,12 @@ pub enum Effect {
         path: PathBuf,
         offset: u64,
     },
-    /// Apply a confirmed plan as one undo group.
+    /// Apply a confirmed plan as one undo group (a deattribute plan writes
+    /// its copies off the input thread instead).
     Apply(Plan),
+    /// Build a deattribute plan off the input thread and hand it back
+    /// through [`App::plan_ready`].
+    PlanDeattribute(DeattributeRequest),
     /// The picker chose a file or folder: start scanning it.
     Scan(PathBuf),
     /// Open the picker again over the current view.
@@ -261,6 +293,48 @@ pub struct SavedItem {
     pub edits: usize,
 }
 
+/// Work the view is waiting on. Edit keys are ignored until it finishes, so
+/// a key typed meanwhile never acts on a plan nobody has seen yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    Planning,
+    Writing,
+}
+
+impl Busy {
+    /// The status line while this work runs.
+    pub fn status(self) -> &'static str {
+        match self {
+            Busy::Planning => "Planning...",
+            Busy::Writing => "Writing copies...",
+        }
+    }
+}
+
+/// Everything a deattribute plan is built from, so it can be built on a
+/// worker thread while the view keeps drawing.
+#[derive(Debug, Clone)]
+pub struct DeattributeRequest {
+    pub root: PathBuf,
+    pub mode: deattribute::Mode,
+    /// The selected files' reports, in path order.
+    pub reports: Vec<FileReport>,
+}
+
+/// What writing a deattribute plan's copies did.
+#[derive(Debug, Default)]
+pub struct CopiesOutcome {
+    pub saved: Vec<SavedItem>,
+    /// Files whose copy was not written, each reason led by the file's
+    /// display path.
+    pub failed: Vec<String>,
+    /// Display paths of written copies that did not pass verification.
+    pub unverified: Vec<String>,
+    /// Fresh reports for copies under the scanned root, each with the
+    /// original it was made from.
+    pub copies: Vec<(PathBuf, FileReport)>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     pub flagged: usize,
@@ -316,6 +390,12 @@ pub struct App {
     saved: HashMap<PathBuf, Saved>,
     /// Output copies listed in the view, mapped to their originals.
     copies: HashMap<PathBuf, PathBuf>,
+    /// Work running off the input thread, if any.
+    pub busy: Option<Busy>,
+    /// Set by the renderer once the open confirm has been drawn; `y` does
+    /// nothing before that, so a key queued ahead of the modal cannot
+    /// confirm it.
+    pub confirm_drawn: bool,
 }
 
 impl App {
@@ -355,6 +435,8 @@ impl App {
             picker_offset: 0,
             saved: HashMap::new(),
             copies: HashMap::new(),
+            busy: None,
+            confirm_drawn: false,
         }
     }
 
@@ -392,11 +474,19 @@ impl App {
 
     /// Add freshly scanned reports (one drained batch). The list stays sorted
     /// by path while the scan streams in, so nothing reshuffles at the end.
+    /// A path already listed keeps its report: a copy written and rescanned
+    /// while the scan streams would otherwise show up twice.
     pub fn push_reports(&mut self, mut batch: Vec<FileReport>) {
+        batch.sort_by(|a, b| a.path.cmp(&b.path));
+        batch.dedup_by(|a, b| a.path == b.path);
+        batch.retain(|r| {
+            self.reports
+                .binary_search_by(|have| have.path.cmp(&r.path))
+                .is_err()
+        });
         if batch.is_empty() {
             return;
         }
-        batch.sort_by(|a, b| a.path.cmp(&b.path));
         self.reports.extend(batch);
         // Two sorted runs: the stable sort merges them in linear time.
         self.reports.sort_by(|a, b| a.path.cmp(&b.path));
@@ -460,11 +550,14 @@ impl App {
 
     // ---- saved marks ---------------------------------------------------
 
-    /// Mark `path` as saved. Another save of the same kind into the same
-    /// output adds its edits to the count.
+    /// Mark `path` as saved. Another scrub of the same file adds its edits to
+    /// the count; a new deattributed copy replaces the old one, so its count
+    /// replaces the old count.
     pub fn mark_saved(&mut self, path: &Path, kind: SavedKind, output: PathBuf, edits: usize) {
         match self.saved.get_mut(path) {
-            Some(s) if s.kind == kind && s.output == output => s.edits += edits,
+            Some(s) if kind == SavedKind::Scrubbed && s.kind == kind && s.output == output => {
+                s.edits += edits
+            }
             _ => {
                 self.saved.insert(
                     path.to_path_buf(),
@@ -503,21 +596,67 @@ impl App {
     /// Whether `path` is under the scanned root (a single-file scan has
     /// nothing under it).
     pub fn in_root(&self, path: &Path) -> bool {
-        path != self.root && path.starts_with(&self.root) && self.root.is_dir()
+        under_root(&self.root, path)
     }
 
-    /// A deattributed copy was written to `copy`. When it lands under the
-    /// scanned root it joins the list, scanned, and points back to
+    /// A deattributed copy was written and scanned as `report`. When it lands
+    /// under the scanned root it joins the list and points back to
     /// `original`. True when it was added.
-    pub fn add_output_copy(&mut self, original: &Path, copy: &Path) -> bool {
-        if !self.in_root(copy) {
+    pub fn add_output_copy(&mut self, original: &Path, report: FileReport) -> bool {
+        if !self.in_root(&report.path) {
             return false;
         }
-        let report = crate::scan::scan_file(copy, &crate::parsers::registry());
         self.copies
-            .insert(copy.to_path_buf(), original.to_path_buf());
+            .insert(report.path.clone(), original.to_path_buf());
         self.replace_report(report);
         true
+    }
+
+    /// Whether `path` is a deattributed copy: one written this session, or
+    /// any file named like one.
+    pub fn is_copy(&self, path: &Path) -> bool {
+        self.copies.contains_key(path) || deattribute::is_deattributed(path)
+    }
+
+    /// Start waiting on `work`: edit keys are ignored until it finishes.
+    pub fn begin_busy(&mut self, work: Busy) {
+        self.busy = Some(work);
+        self.set_status(work.status(), Tone::Info);
+    }
+
+    /// A deattribute plan finished building: offer it, or say why not.
+    pub fn plan_ready(&mut self, plan: Result<Plan, String>) {
+        self.busy = None;
+        self.status = None;
+        self.offer(plan);
+    }
+
+    /// The copies of a confirmed deattribute plan were written (or not).
+    /// Write failures are listed before the plan's own skips.
+    pub fn copies_written(&mut self, plan_skips: &[String], out: CopiesOutcome) {
+        self.busy = None;
+        self.clear_picks();
+        let mut skipped = out.failed;
+        skipped.extend(plan_skips.iter().cloned());
+        self.record_saved(SavedKind::Deattributed, &out.saved, &skipped, &[]);
+        if let (Some(first), Some(status)) = (out.unverified.first(), self.status.as_mut()) {
+            if status.text.ends_with('.') {
+                status.text.pop();
+            }
+            status
+                .text
+                .push_str(&format!("; verification incomplete for {first}"));
+            if out.unverified.len() > 1 {
+                status
+                    .text
+                    .push_str(&format!(" +{} more", thousands(out.unverified.len() - 1)));
+            }
+            status.text.push('.');
+            status.tone = Tone::Warn;
+        }
+        for (original, report) in out.copies {
+            self.add_output_copy(&original, report);
+        }
     }
 
     /// Mark every saved file and say what was saved in the status line, with
@@ -545,6 +684,16 @@ impl App {
         refused: &[String],
     ) -> Status {
         let Some(first) = items.first() else {
+            if kind == SavedKind::Deattributed && !skipped.is_empty() {
+                return Status {
+                    text: format!(
+                        "Saved nothing; skipped {}: {}.",
+                        thousands(skipped.len()),
+                        skipped[0]
+                    ),
+                    tone: Tone::Bad,
+                };
+            }
             let plan = match kind {
                 SavedKind::Scrubbed => PlanKind::Scrub,
                 SavedKind::Deattributed => PlanKind::Deattribute,
@@ -696,13 +845,7 @@ impl App {
 
     /// A path as shown: relative to the scan root, or the file name.
     pub fn display_path(&self, p: &Path) -> String {
-        match p.strip_prefix(&self.root) {
-            Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
-            _ => p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.to_string_lossy().into_owned()),
-        }
+        display_under(&self.root, p)
     }
 
     /// The scan line: progress while scanning, a summary after.
@@ -829,6 +972,15 @@ impl App {
         if key == Key::Interrupt {
             return self.quit();
         }
+        if let Some(work) = self.busy
+            && matches!(
+                key,
+                Key::Scrub | Key::Deattribute | Key::DeepDeattribute | Key::Delete | Key::Yes
+            )
+        {
+            self.set_status(work.status(), Tone::Info);
+            return Effect::None;
+        }
         match &mut self.overlay {
             Some(Overlay::Help) => {
                 self.overlay = None;
@@ -837,6 +989,8 @@ impl App {
             Some(Overlay::Confirm(plan)) => {
                 let len = plan.items.len();
                 match key {
+                    // Only once the modal has been seen.
+                    Key::Yes if !self.confirm_drawn => {}
                     Key::Yes => {
                         if let Some(Overlay::Confirm(plan)) = self.overlay.take() {
                             return Effect::Apply(plan);
@@ -894,7 +1048,8 @@ impl App {
                 };
                 self.offer(plan)
             }
-            Key::Deattribute => self.offer(self.deattribute_plan()),
+            Key::Deattribute => self.request_plan(deattribute::Mode::Basic),
+            Key::DeepDeattribute => self.request_plan(deattribute::Mode::Deep),
             Key::Delete => {
                 let plan = self.delete_plan();
                 self.offer(plan)
@@ -1075,10 +1230,25 @@ impl App {
         match plan {
             Ok(plan) => {
                 self.overlay = Some(Overlay::Confirm(plan));
+                self.confirm_drawn = false;
             }
             Err(why) => self.set_status(why, Tone::Info),
         }
         Effect::None
+    }
+
+    /// Hand the selected files to the runtime to plan off the input thread.
+    fn request_plan(&mut self, mode: deattribute::Mode) -> Effect {
+        match self.deattribute_request(mode) {
+            Ok(req) => {
+                self.begin_busy(Busy::Planning);
+                Effect::PlanDeattribute(req)
+            }
+            Err(why) => {
+                self.set_status(why, Tone::Info);
+                Effect::None
+            }
+        }
     }
 
     // ---- plans ---------------------------------------------------------
@@ -1216,6 +1386,8 @@ impl App {
                     marker: m.clone(),
                     risk: edit::assess(r.format.as_deref(), r.size, m),
                     expected_hash: None,
+                    replacement: None,
+                    credit: None,
                     archive: None,
                 });
             }
@@ -1235,12 +1407,31 @@ impl App {
             items,
             weak_left_out: weak,
             private_skips: Vec::new(),
+            caveats: Vec::new(),
+            replaces: Vec::new(),
             scroll: 0,
         })
     }
 
-    /// Deattribute every selected file through the same planner as headless clean.
+    /// Deattribute every selected file through the same planner as headless
+    /// clean, right here. The view builds its plans on a worker through
+    /// [`App::deattribute_request`] and [`plan_deattribute`] instead.
     pub fn deattribute_plan(&self) -> Result<Plan, String> {
+        self.deattribute_plan_mode(deattribute::Mode::Basic)
+    }
+
+    /// [`App::deattribute_plan`] in `mode`.
+    pub fn deattribute_plan_mode(&self, mode: deattribute::Mode) -> Result<Plan, String> {
+        plan_deattribute(&self.deattribute_request(mode)?)
+    }
+
+    /// The files a deattribute in `mode` would cover: the picks, the
+    /// highlighted bucket's files, or the highlighted file. Only the reports
+    /// are gathered here; reading the files is left to [`plan_deattribute`].
+    pub fn deattribute_request(
+        &self,
+        mode: deattribute::Mode,
+    ) -> Result<DeattributeRequest, String> {
         let mut paths = BTreeSet::new();
         paths.extend(self.picked_files.iter().cloned());
         paths.extend(self.picked_findings.iter().map(|(path, _)| path.clone()));
@@ -1262,94 +1453,16 @@ impl App {
         if paths.is_empty() {
             return Err(MSG_NOTHING.to_string());
         }
-
-        let mut items = Vec::new();
-        let mut private_skips = Vec::new();
-        for report in self
-            .reports
-            .iter()
-            .filter(|report| paths.contains(&report.path))
-        {
-            if let Some(kind) = deattribute::archive_kind(&report.path, report.format.as_deref()) {
-                self.archive_plan_item(report, kind, &mut items, &mut private_skips);
-                continue;
-            }
-            let Ok(view) = WindowedFile::open(&report.path) else {
-                private_skips.push(format!("{}: io error", self.display_path(&report.path)));
-                continue;
-            };
-            let file_plan = deattribute::plan(report, &view);
-            for skipped in file_plan.skipped {
-                private_skips.push(format!(
-                    "{}: {} ({})",
-                    self.display_path(&report.path),
-                    skipped.kind.slug(),
-                    skipped.reason.slug()
-                ));
-            }
-            for target in file_plan.targets {
-                items.push(PlanItem {
-                    path: report.path.clone(),
-                    format: report.format.clone(),
-                    size: report.size,
-                    label: target.kind.slug().to_string(),
-                    title: target.kind.slug().to_string(),
-                    marker: target.marker,
-                    risk: Risk::Safe,
-                    expected_hash: Some(target.expected_hash),
-                    archive: None,
-                });
-            }
-        }
-        if items.is_empty() && private_skips.is_empty() {
-            return Err(MSG_NOTHING.to_string());
-        }
-        Ok(Plan {
-            kind: PlanKind::Deattribute,
-            items,
-            weak_left_out: 0,
-            private_skips,
-            scroll: 0,
+        Ok(DeattributeRequest {
+            root: self.root.clone(),
+            mode,
+            reports: self
+                .reports
+                .iter()
+                .filter(|report| paths.contains(&report.path))
+                .cloned()
+                .collect(),
         })
-    }
-
-    /// Plan one archive as a single item meaning "the files inside": a dry run
-    /// through the same writer counts the files that have something to blank.
-    fn archive_plan_item(
-        &self,
-        report: &FileReport,
-        kind: deattribute::ArchiveKind,
-        items: &mut Vec<PlanItem>,
-        private_skips: &mut Vec<String>,
-    ) {
-        let shown = self.display_path(&report.path);
-        let outcome = match deattribute::deattribute_archive(&report.path, kind, true) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                private_skips.push(format!("{shown}: {}", edit_error_reason(&e)));
-                return;
-            }
-        };
-        for (entry, reason) in &outcome.skipped {
-            private_skips.push(format!("{shown}:{}: {}", plain(entry), reason.slug()));
-        }
-        let n = outcome.entries_cleaned;
-        if n == 0 {
-            private_skips.push(format!("{shown}: {}", deattribute::NOTHING_INSIDE));
-            return;
-        }
-        let label = format!("{} {} inside", thousands(n), plural(n, "file", "files"));
-        items.push(PlanItem {
-            path: report.path.clone(),
-            format: report.format.clone(),
-            size: report.size,
-            title: label.clone(),
-            label,
-            marker: Marker::blank(Region::new(0, 0), ContainerKind::Raw),
-            risk: Risk::Safe,
-            expected_hash: None,
-            archive: Some(kind),
-        });
     }
 
     /// Delete the picked files, or the highlighted one.
@@ -1381,6 +1494,8 @@ impl App {
                     risk: edit::assess(r.format.as_deref(), r.size, &marker),
                     marker,
                     expected_hash: None,
+                    replacement: None,
+                    credit: None,
                     archive: None,
                 }
             })
@@ -1390,6 +1505,8 @@ impl App {
             items,
             weak_left_out: 0,
             private_skips: Vec::new(),
+            caveats: Vec::new(),
+            replaces: Vec::new(),
             scroll: 0,
         })
     }
@@ -1402,13 +1519,205 @@ fn plain(name: &str) -> String {
         .collect()
 }
 
-/// The generic reason a deattributed copy was not written.
-pub fn edit_error_reason(e: &edit::EditError) -> &'static str {
+/// Why a deattributed copy was not written, in a few generic words. A
+/// refusal's own text names the rule, never the file's content.
+pub fn edit_error_reason(e: &edit::EditError) -> String {
     match e {
-        edit::EditError::Changed => "changed since scan",
-        edit::EditError::Io(_) => "io error",
-        _ => "unsafe edit",
+        edit::EditError::Changed => "changed since scan".to_string(),
+        edit::EditError::Io(_) => "io error".to_string(),
+        edit::EditError::Symlink(_) => "a symlink, which is never followed".to_string(),
+        edit::EditError::Refused(r) | edit::EditError::Unsupported(r) => plain(r),
+        edit::EditError::Locked(_) => "another meownary process is editing".to_string(),
+        edit::EditError::NeedsForce(_) => "unsafe edit".to_string(),
     }
+}
+
+/// A path as shown under `root`: relative to it, or the file name.
+pub fn display_under(root: &Path, p: &Path) -> String {
+    match p.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+        _ => p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+    }
+}
+
+/// Whether `path` is under the scanned `root` (a single-file scan has
+/// nothing under it).
+pub fn under_root(root: &Path, path: &Path) -> bool {
+    path != root && path.starts_with(root) && root.is_dir()
+}
+
+/// The private skip for a file that is itself a deattributed copy.
+pub const ALREADY_A_COPY: &str = "already a deattributed copy";
+
+/// Build the deattribute plan for `req`. This reads every file (a deep sweep
+/// reads up to 256 MiB of one, and an archive is dry-run through its writer),
+/// so the view runs it on a worker. A panic while planning one file skips
+/// that file as an unsafe edit. A plan with nothing to blank is an error
+/// that names the first skip, never an empty confirm.
+pub fn plan_deattribute(req: &DeattributeRequest) -> Result<Plan, String> {
+    let mode = req.mode;
+    let mut items = Vec::new();
+    let mut private_skips = Vec::new();
+    let mut caveats: Vec<String> = Vec::new();
+    let mut replaces = Vec::new();
+    for report in &req.reports {
+        let shown = display_under(&req.root, &report.path);
+        if deattribute::is_deattributed(&report.path) {
+            private_skips.push(format!("{shown}: {ALREADY_A_COPY}"));
+            continue;
+        }
+        if let Some(kind) = deattribute::archive_kind(&report.path, report.format.as_deref()) {
+            if let Some(item) = archive_plan_item(&shown, report, kind, mode, &mut private_skips) {
+                if let Some(a) = &item.archive
+                    && exists(&a.dry_run.output)
+                {
+                    replaces.push(a.dry_run.output.clone());
+                }
+                items.push(item);
+            }
+            continue;
+        }
+        let Ok(view) = WindowedFile::open(&report.path) else {
+            private_skips.push(format!("{shown}: io error"));
+            continue;
+        };
+        let Ok(file_plan) =
+            crate::scan::guard::guarded(|| deattribute::plan_mode(report, &view, mode))
+        else {
+            private_skips.push(format!("{shown}: unsafe edit"));
+            continue;
+        };
+        for skipped in file_plan.skipped {
+            private_skips.push(format!(
+                "{shown}: {} ({})",
+                skipped.kind.slug(),
+                skipped.reason.slug()
+            ));
+        }
+        if file_plan.targets.is_empty() {
+            continue;
+        }
+        for caveat in file_plan.caveats {
+            let line = sentence(caveat.slug());
+            if !caveats.contains(&line) {
+                caveats.push(line);
+            }
+        }
+        let output = deattribute::deattributed_name(&report.path);
+        if exists(&output) {
+            replaces.push(output);
+        }
+        for target in file_plan.targets {
+            items.push(PlanItem {
+                path: report.path.clone(),
+                format: report.format.clone(),
+                size: report.size,
+                label: target.kind.slug().to_string(),
+                title: target.kind.slug().to_string(),
+                marker: target.marker,
+                risk: Risk::Safe,
+                expected_hash: Some(target.expected_hash),
+                replacement: target.replacement,
+                credit: Some(target.kind),
+                archive: None,
+            });
+        }
+    }
+    if items.is_empty() {
+        return Err(match private_skips.first() {
+            None => MSG_NOTHING.to_string(),
+            Some(first) => format!(
+                "Nothing to blank; {} skipped: {first}.",
+                thousands(private_skips.len())
+            ),
+        });
+    }
+    Ok(Plan {
+        kind: if mode == deattribute::Mode::Deep {
+            PlanKind::DeepDeattribute
+        } else {
+            PlanKind::Deattribute
+        },
+        items,
+        weak_left_out: 0,
+        private_skips,
+        caveats,
+        replaces,
+        scroll: 0,
+    })
+}
+
+/// Plan one archive as a single item meaning "the files inside": a dry run
+/// through the same writer counts the files that have something to blank,
+/// and the item keeps that dry run for the confirm and the write.
+fn archive_plan_item(
+    shown: &str,
+    report: &FileReport,
+    kind: deattribute::ArchiveKind,
+    mode: deattribute::Mode,
+    private_skips: &mut Vec<String>,
+) -> Option<PlanItem> {
+    let dry = crate::scan::guard::guarded(|| {
+        deattribute::deattribute_archive_mode(&report.path, kind, true, mode)
+    });
+    let outcome = match dry {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
+            private_skips.push(format!("{shown}: {}", edit_error_reason(&e)));
+            return None;
+        }
+        Err(()) => {
+            private_skips.push(format!("{shown}: unsafe edit"));
+            return None;
+        }
+    };
+    for (entry, reason) in &outcome.skipped {
+        private_skips.push(format!("{shown}:{}: {}", plain(entry), reason.slug()));
+    }
+    let n = outcome.entries_cleaned;
+    if n == 0 {
+        private_skips.push(format!("{shown}: {}", deattribute::NOTHING_INSIDE));
+        return None;
+    }
+    let label = format!("{} {} inside", thousands(n), plural(n, "file", "files"));
+    Some(PlanItem {
+        path: report.path.clone(),
+        format: report.format.clone(),
+        size: report.size,
+        title: label.clone(),
+        label,
+        marker: Marker::blank(Region::new(0, 0), ContainerKind::Raw),
+        risk: Risk::Safe,
+        expected_hash: None,
+        replacement: None,
+        credit: None,
+        archive: Some(ArchivePlan {
+            kind,
+            dry_run: outcome,
+        }),
+    })
+}
+
+/// Whether anything is at `path`, without following a link.
+fn exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// `s` as a sentence: a capital first letter and a closing period.
+fn sentence(s: &str) -> String {
+    let mut chars = s.chars();
+    let mut out: String = chars
+        .next()
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_default();
+    out.push_str(chars.as_str());
+    if !out.ends_with('.') {
+        out.push('.');
+    }
+    out
 }
 
 /// The marker a whole-file delete uses.
@@ -1604,7 +1913,9 @@ pub fn batch_status(kind: PlanKind, ok: usize, skipped: &[String], refused: &[St
             };
         }
         (PlanKind::Scrub, n) => format!("Scrubbed {n} {}", plural(n, "marker", "markers")),
-        (PlanKind::Deattribute, n) => format!("Cleaned {n} {}", plural(n, "marker", "markers")),
+        (PlanKind::Deattribute | PlanKind::DeepDeattribute, n) => {
+            format!("Cleaned {n} {}", plural(n, "marker", "markers"))
+        }
         (PlanKind::Delete, n) => {
             format!("Moved {n} {} to the trash", plural(n, "file", "files"))
         }
@@ -1647,7 +1958,10 @@ mod tests {
         let mut app = App::new(dir.path());
         app.push_reports(vec![report]);
         app.scan_done();
-        app.on_action(Key::Deattribute);
+        let Effect::PlanDeattribute(req) = app.on_action(Key::Deattribute) else {
+            panic!("the plan is built off the input thread");
+        };
+        app.plan_ready(plan_deattribute(&req));
         let Some(Overlay::Confirm(plan)) = &app.overlay else {
             panic!("confirm plan");
         };
@@ -1659,6 +1973,143 @@ mod tests {
                 .iter()
                 .all(|item| !item.label.contains("Invented") && !item.title.contains("Invented"))
         );
+    }
+
+    /// A small PE with an invented patch credit, scanned into a fresh view.
+    fn patched_view(dir: &Path, name: &str) -> App {
+        let path = dir.join(name);
+        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
+        bytes.resize(256, 0);
+        bytes.extend_from_slice(b"patched by Invented\0");
+        std::fs::write(&path, bytes).unwrap();
+        let report = crate::scan::scan_file(&path, &crate::parsers::registry());
+        let mut app = App::new(dir);
+        app.push_reports(vec![report]);
+        app.scan_done();
+        app
+    }
+
+    /// Render one frame, as the runtime does before reading more keys.
+    fn draw(app: &mut App) {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        crate::tui::ui::draw_into(&mut buf, area, app, &crate::tui::theme::Look::vivid());
+    }
+
+    #[test]
+    fn deep_key_plans_a_deep_deattribute_and_holds_edit_keys_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = patched_view(dir.path(), "invented.exe");
+        let Effect::PlanDeattribute(req) = app.on_action(Key::DeepDeattribute) else {
+            panic!("A plans off the input thread");
+        };
+        assert_eq!(req.mode, deattribute::Mode::Deep);
+        assert_eq!(app.busy, Some(Busy::Planning));
+        assert_eq!(app.status.as_ref().unwrap().text, "Planning...");
+        for k in [Key::Deattribute, Key::DeepDeattribute, Key::Scrub, Key::Yes] {
+            assert!(matches!(app.on_action(k), Effect::None), "{k:?}");
+        }
+        assert!(app.overlay.is_none(), "nothing opens while planning");
+
+        app.plan_ready(plan_deattribute(&req));
+        assert_eq!(app.busy, None);
+        let Some(Overlay::Confirm(plan)) = &app.overlay else {
+            panic!("confirm plan");
+        };
+        assert_eq!(plan.kind, PlanKind::DeepDeattribute);
+        assert!(
+            plan.title().starts_with("Deep deattribute "),
+            "{}",
+            plan.title()
+        );
+        assert!(plan.title().ends_with(" edits?") || plan.title().ends_with(" edit?"));
+    }
+
+    #[test]
+    fn yes_before_the_confirm_is_drawn_is_ignored() {
+        let mut app = sample();
+        press(&mut app, Key::End); // c/tool.exe
+        press(&mut app, Key::Scrub);
+        assert!(!app.confirm_drawn);
+        assert!(matches!(press(&mut app, Key::Yes), Effect::None));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Confirm(_))),
+            "a queued y leaves the modal up"
+        );
+        draw(&mut app);
+        assert!(app.confirm_drawn);
+        assert!(matches!(press(&mut app, Key::Yes), Effect::Apply(_)));
+
+        // A new confirm has to be drawn again.
+        press(&mut app, Key::Scrub);
+        assert!(!app.confirm_drawn);
+        assert!(matches!(press(&mut app, Key::Yes), Effect::None));
+    }
+
+    #[test]
+    fn copies_are_left_out_of_planning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = patched_view(dir.path(), "invented.deattributed.exe");
+        let copy = dir.path().join("invented.deattributed.exe");
+        assert!(
+            app.is_copy(&copy),
+            "named like a copy, so it wears the chip"
+        );
+        let err = app.deattribute_plan().unwrap_err();
+        assert_eq!(
+            err,
+            "Nothing to blank; 1 skipped: invented.deattributed.exe: already a deattributed copy."
+        );
+        let again = crate::scan::scan_file(&copy, &crate::parsers::registry());
+        app.push_reports(vec![again]);
+        assert_eq!(
+            app.reports().len(),
+            1,
+            "a path already listed is not added twice"
+        );
+    }
+
+    #[test]
+    fn a_plan_with_nothing_to_blank_says_so_instead_of_opening_a_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = patched_view(dir.path(), "invented.deattributed.exe");
+        let Effect::PlanDeattribute(req) = app.on_action(Key::Deattribute) else {
+            panic!("planned off the input thread");
+        };
+        let plan = plan_deattribute(&req);
+        assert!(plan.is_err(), "zero items is an error, not an empty plan");
+        app.plan_ready(plan);
+        assert!(app.overlay.is_none(), "no \"Deattribute 0 markers?\" modal");
+        assert!(app.busy.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Nothing to blank; 1 skipped: ")
+        );
+    }
+
+    #[test]
+    fn a_write_that_saved_nothing_says_so_in_the_bad_tone() {
+        let mut app = sample();
+        app.begin_busy(Busy::Writing);
+        app.copies_written(
+            &["b/photo.jpg: already a deattributed copy".to_string()],
+            CopiesOutcome {
+                failed: vec!["c/tool.exe: changed since scan".to_string()],
+                ..CopiesOutcome::default()
+            },
+        );
+        let s = app.status.as_ref().unwrap();
+        assert_eq!(
+            s.text,
+            "Saved nothing; skipped 2: c/tool.exe: changed since scan."
+        );
+        assert_eq!(s.tone, Tone::Bad);
+        assert!(app.busy.is_none());
     }
 
     #[test]
@@ -2121,6 +2572,7 @@ mod tests {
         press(&mut app, Key::No);
         assert!(app.overlay.is_none());
         press(&mut app, Key::Scrub);
+        draw(&mut app);
         match press(&mut app, Key::Yes) {
             Effect::Apply(plan) => assert_eq!(plan.runnable(), 2),
             other => panic!("{other:?}"),
@@ -2440,13 +2892,26 @@ mod tests {
         let mut app = App::new(dir.path());
         app.push_reports(vec![FileReport::new(original.clone(), 11)]);
         app.scan_done();
-        assert!(app.add_output_copy(&original, &copy));
+        assert!(app.add_output_copy(&original, FileReport::new(copy.clone(), 7)));
         assert!(app.has_report(&copy));
         assert_eq!(app.copy_of(&copy), Some(original.as_path()));
         let outside = tempfile::tempdir().unwrap();
         let far = outside.path().join("x.deattributed.exe");
-        assert!(!app.add_output_copy(&original, &far), "outside the root");
+        assert!(
+            !app.add_output_copy(&original, FileReport::new(far.clone(), 7)),
+            "outside the root"
+        );
         assert!(!app.has_report(&far));
+    }
+
+    #[test]
+    fn a_replaced_copy_sets_its_edit_count() {
+        let mut app = sample();
+        let tool = PathBuf::from("root/c/tool.exe");
+        let copy = PathBuf::from("root/c/tool.deattributed.exe");
+        app.mark_saved(&tool, SavedKind::Deattributed, copy.clone(), 3);
+        app.mark_saved(&tool, SavedKind::Deattributed, copy, 2);
+        assert_eq!(app.saved(&tool).unwrap().edits, 2, "the copy was replaced");
     }
 
     #[test]

@@ -31,15 +31,26 @@
 //! lock is held, the reason shows in the status line and the view stays
 //! read-only for that action; nothing crashes.
 //!
+//! Deattribute plans and copy writes read whole files (a deep sweep reads up
+//! to 256 MiB of one, and an archive is dry-run through its writer), so they
+//! run on a worker thread and come back over a channel, like the scan. While
+//! one runs the view keeps drawing, shows what it is waiting on, and ignores
+//! the edit keys. Keys typed while a plan was being built are dropped when it
+//! arrives, and `y` only confirms a modal that has been drawn, so nothing
+//! queued ahead of a confirm can answer it. A copy write still running at
+//! quit is waited for, so no copy is cut off halfway.
+//!
 //! The terminal is restored on every exit path: normal return, error return
-//! and panic (`ratatui::try_init` installs a restoring panic hook).
+//! and panic (`ratatui::try_init` installs a restoring panic hook). A panic
+//! the per-file guard catches is not a crash, so it leaves the screen alone.
 
 #![cfg(feature = "tui")]
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
@@ -50,9 +61,13 @@ use ratatui::crossterm::execute;
 
 use crate::edit::{EditEngine, EditError, Risk, UndoReport, deattribute};
 use crate::model::RemovalStrategy;
+use crate::scan::guard::{guarded, in_guard};
 use crate::scan::{self, FileView, Registry, ScanEvent, ScanOpts, WindowedFile};
 
-use super::app::{self, App, Effect, HexView, MSG_LOCKED, Plan, PlanKind, SavedItem, SavedKind};
+use super::app::{
+    self, App, Busy, CopiesOutcome, DeattributeRequest, Effect, HexView, MSG_LOCKED, Plan,
+    PlanItem, PlanKind, SavedItem, SavedKind,
+};
 use super::picker::Picker;
 use super::theme::{Look, Tone};
 use super::ui;
@@ -88,6 +103,7 @@ pub fn run(path: Option<&Path>) -> io::Result<()> {
     let mut terminal = init_terminal()?;
     let result = rt.event_loop(&mut terminal);
     restore_terminal();
+    rt.join_writer();
     result
 }
 
@@ -96,8 +112,41 @@ pub fn run(path: Option<&Path>) -> io::Result<()> {
 /// its paste arrives as keys.
 fn init_terminal() -> io::Result<DefaultTerminal> {
     let terminal = ratatui::try_init()?;
+    quiet_guarded_panics();
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     Ok(terminal)
+}
+
+/// `ratatui::try_init` wraps the panic hook so it restores the terminal
+/// before anything else runs, which would tear down the live view even for a
+/// panic the per-file guard catches. Wrap it once more so a guarded panic
+/// returns before that; a real panic still restores and reports.
+fn quiet_guarded_panics() {
+    let restore_and_report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if in_guard() {
+            return;
+        }
+        restore_and_report(info);
+    }));
+}
+
+/// Drop every key and event already queued, so none of them lands on a
+/// confirm that has not been drawn yet.
+fn flush_input() -> io::Result<()> {
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
+    Ok(())
+}
+
+/// A finished background job.
+enum Job {
+    Planned(Result<Plan, String>),
+    Wrote {
+        plan_skips: Vec<String>,
+        out: CopiesOutcome,
+    },
 }
 
 fn restore_terminal() {
@@ -116,6 +165,10 @@ struct Runtime {
     known: HashMap<PathBuf, PathBuf>,
     /// Where the recent picks are kept.
     recent_file: PathBuf,
+    /// The plan or copy write running off the input thread.
+    job_rx: Option<Receiver<Job>>,
+    /// The copy writer, joined at quit so a write is never cut off.
+    writer: Option<JoinHandle<()>>,
 }
 
 impl Runtime {
@@ -129,6 +182,8 @@ impl Runtime {
             registry: None,
             known: HashMap::new(),
             recent_file: crate::util::paths::state_dir().join(RECENT_FILE),
+            job_rx: None,
+            writer: None,
         }
     }
 
@@ -172,10 +227,12 @@ impl Runtime {
         self.app.open_picker(picker);
     }
 
-    /// The picker chose `path`: remember it and scan it.
+    /// The picker chose `path`: remember it and scan it. A plan or write
+    /// result for the old view has nowhere to land, so it is dropped.
     fn picked(&mut self, path: &Path) {
         let list = remember(&self.recent(), path);
         save_recent(&self.recent_file, &list);
+        self.job_rx = None;
         self.start_scan(path);
     }
 
@@ -184,6 +241,14 @@ impl Runtime {
         let mut last_frame = u64::MAX;
         loop {
             dirty |= self.drain_scan();
+            match self.drain_job() {
+                Some(true) => {
+                    flush_input()?;
+                    dirty = true;
+                }
+                Some(false) => dirty = true,
+                None => {}
+            }
             if let Some((path, offset)) = self.app.hex_request() {
                 self.load_hex(path, offset);
                 dirty = true;
@@ -267,6 +332,99 @@ impl Runtime {
         changed
     }
 
+    /// Take the result of a finished plan or copy write. `None` when nothing
+    /// arrived; `Some(true)` when a plan arrived, so the caller drops the
+    /// keys queued meanwhile before the confirm is drawn.
+    fn drain_job(&mut self) -> Option<bool> {
+        let job = match self.job_rx.as_ref()?.try_recv() {
+            Ok(job) => job,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                self.job_rx = None;
+                self.join_writer();
+                let was = self.app.busy.take();
+                self.app.set_status(
+                    "That action stopped on an internal error. Nothing changed.",
+                    Tone::Bad,
+                );
+                return Some(was == Some(Busy::Planning));
+            }
+        };
+        self.job_rx = None;
+        Some(match job {
+            Job::Planned(plan) => {
+                self.app.plan_ready(plan);
+                true
+            }
+            Job::Wrote { plan_skips, out } => {
+                self.join_writer();
+                self.app.copies_written(&plan_skips, out);
+                false
+            }
+        })
+    }
+
+    /// Build a deattribute plan on a worker; [`Runtime::drain_job`] offers it.
+    fn spawn_plan(&mut self, req: DeattributeRequest) {
+        let (tx, rx) = mpsc::channel();
+        let work = move || {
+            let plan = guarded(|| app::plan_deattribute(&req)).unwrap_or_else(|()| {
+                Err("Planning stopped on an internal error. Nothing changed.".to_string())
+            });
+            let _ = tx.send(Job::Planned(plan));
+        };
+        match thread::Builder::new()
+            .name("meownary-plan".into())
+            .spawn(work)
+        {
+            Ok(_) => self.job_rx = Some(rx),
+            Err(e) => self.app.plan_ready(Err(format!(
+                "Could not start planning ({e}). Nothing changed."
+            ))),
+        }
+    }
+
+    /// Write a confirmed deattribute plan's copies on a worker. The originals
+    /// are only read, so nothing goes through the edit engine or the undo
+    /// journal.
+    fn spawn_writer(&mut self, plan: Plan) {
+        self.join_writer();
+        self.app.begin_busy(Busy::Writing);
+        let root = self.app.root.clone();
+        let plan_skips = plan.private_skips.clone();
+        let (tx, rx) = mpsc::channel();
+        let work = move || {
+            let out = guarded(|| write_copies(&plan, &root)).unwrap_or_else(|()| CopiesOutcome {
+                failed: vec!["the copy writer stopped on an internal error".to_string()],
+                ..CopiesOutcome::default()
+            });
+            let _ = tx.send(Job::Wrote { plan_skips, out });
+        };
+        match thread::Builder::new()
+            .name("meownary-copies".into())
+            .spawn(work)
+        {
+            Ok(handle) => {
+                self.job_rx = Some(rx);
+                self.writer = Some(handle);
+            }
+            Err(e) => {
+                self.app.busy = None;
+                self.app.set_status(
+                    format!("Saved nothing: the copy writer could not start ({e})."),
+                    Tone::Bad,
+                );
+            }
+        }
+    }
+
+    /// Wait for the copy writer, if one ran.
+    fn join_writer(&mut self) {
+        if let Some(handle) = self.writer.take() {
+            let _ = handle.join();
+        }
+    }
+
     fn load_hex(&mut self, path: PathBuf, offset: u64) {
         let base = app::hex_base(offset);
         let read =
@@ -294,6 +452,7 @@ impl Runtime {
             Effect::None | Effect::Quit => {}
             Effect::LoadHex { path, offset } => self.load_hex(path, offset),
             Effect::Apply(plan) => self.apply_plan(plan),
+            Effect::PlanDeattribute(req) => self.spawn_plan(req),
             Effect::Edit(path) => return Some(path),
             Effect::Undo => self.undo(),
             Effect::Scan(path) => self.picked(&path),
@@ -340,8 +499,8 @@ impl Runtime {
     }
 
     fn apply_plan(&mut self, plan: Plan) {
-        if plan.kind == PlanKind::Deattribute {
-            self.write_copies(&plan);
+        if matches!(plan.kind, PlanKind::Deattribute | PlanKind::DeepDeattribute) {
+            self.spawn_writer(plan);
             return;
         }
         if !self.ready_engine() {
@@ -371,26 +530,6 @@ impl Runtime {
         }
         if plan.kind == PlanKind::Delete && out.ok > 0 {
             self.app.pane = app::Pane::Files;
-        }
-    }
-
-    /// Deattribute writes a blanked copy beside each original through the same
-    /// writer as `clean --deattribute`. The original is only read, so nothing
-    /// goes through the edit engine or the undo journal.
-    fn write_copies(&mut self, plan: &Plan) {
-        let (items, mut skipped) = write_copies(plan);
-        skipped.splice(0..0, plan.private_skips.iter().cloned());
-        self.app.clear_picks();
-        if items.is_empty() {
-            self.app.status = Some(app::batch_status(plan.kind, 0, &skipped, &[]));
-            return;
-        }
-        self.app
-            .record_saved(SavedKind::Deattributed, &items, &skipped, &[]);
-        for item in &items {
-            if self.app.add_output_copy(&item.path, &item.output) {
-                self.rescan(&item.output);
-            }
         }
     }
 
@@ -567,7 +706,7 @@ pub fn run_plan(engine: &mut EditEngine, plan: &Plan) -> BatchOutcome {
             item.format.as_deref(),
             item.size,
             item.expected_hash.as_deref(),
-            plan.kind != PlanKind::Deattribute,
+            !matches!(plan.kind, PlanKind::Deattribute | PlanKind::DeepDeattribute),
             &item.label,
         );
         if !out.touched.contains(&item.path) {
@@ -595,40 +734,70 @@ pub fn run_plan(engine: &mut EditEngine, plan: &Plan) -> BatchOutcome {
     out
 }
 
-/// The files a scrub batch saved, in the order they were first edited, each
-/// with how many of its edits landed.
-/// Write one deattributed copy per file in `plan`, returning what was saved and
-/// a generic reason for every file that was not.
-pub fn write_copies(plan: &Plan) -> (Vec<SavedItem>, Vec<String>) {
-    let mut saved = Vec::new();
-    let mut skipped = Vec::new();
-    let mut by_file: Vec<(&app::PlanItem, Vec<deattribute::Target>)> = Vec::new();
+/// Write one deattributed copy per file in `plan` through the same writer as
+/// `clean --deattribute`, and verify each copy written. An archive is
+/// rebuilt from the files inside it; the plan's dry run already found
+/// something to blank there, so a write that finds nothing means the archive
+/// changed since. Every failure names the file by its display path under
+/// `root`, and a panic in one file's write fails that file alone. Copies that
+/// land under `root` are scanned here, so the view lists them without
+/// reading anything on the input thread.
+pub fn write_copies(plan: &Plan, root: &Path) -> CopiesOutcome {
+    let mode = plan.mode();
+    let mut out = CopiesOutcome::default();
+    let mut registry: Option<Registry> = None;
+    let mut saved = |out: &mut CopiesOutcome, path: &Path, output: PathBuf, edits, ok: bool| {
+        if !ok {
+            out.unverified.push(app::display_under(root, &output));
+        }
+        if app::under_root(root, &output) {
+            let registry = registry.get_or_insert_with(crate::parsers::registry);
+            let report = scan::scan_file(&output, registry);
+            out.copies.push((path.to_path_buf(), report));
+        }
+        out.saved.push(SavedItem {
+            path: path.to_path_buf(),
+            output,
+            edits,
+        });
+    };
+    let mut by_file: Vec<(&PlanItem, Vec<deattribute::Target>)> = Vec::new();
     for item in &plan.items {
-        if let Some(kind) = item.archive {
-            match deattribute::deattribute_archive(&item.path, kind, false) {
-                Ok(out) if out.entries_cleaned > 0 => saved.push(SavedItem {
-                    path: item.path.clone(),
-                    output: out.output,
-                    edits: out.brand + out.patch,
-                }),
-                Ok(_) => skipped.push(deattribute::NOTHING_INSIDE.to_string()),
-                Err(e) => skipped.push(app::edit_error_reason(&e).to_string()),
+        let shown = app::display_under(root, &item.path);
+        if let Some(archive) = &item.archive {
+            let wrote = guarded(|| {
+                deattribute::deattribute_archive_mode(&item.path, archive.kind, false, mode)
+            });
+            match wrote {
+                Ok(Ok(done)) if done.entries_cleaned > 0 => {
+                    let ok = guarded(|| {
+                        deattribute::verify_archive_copy(&done.output, archive.kind, mode)
+                    })
+                    .is_ok_and(|v| v.ok());
+                    saved(
+                        &mut out,
+                        &item.path,
+                        done.output,
+                        done.brand + done.patch,
+                        ok,
+                    );
+                }
+                Ok(Ok(_)) => out.failed.push(format!("{shown}: changed since scan")),
+                Ok(Err(e)) => out
+                    .failed
+                    .push(format!("{shown}: {}", app::edit_error_reason(&e))),
+                Err(()) => out.failed.push(format!("{shown}: unsafe edit")),
             }
             continue;
         }
-        let Some(hash) = item.expected_hash.clone() else {
+        let (Some(hash), Some(kind)) = (item.expected_hash.clone(), item.credit) else {
             continue;
-        };
-        let kind = if item.label == deattribute::Kind::Patch.slug() {
-            deattribute::Kind::Patch
-        } else {
-            deattribute::Kind::Brand
         };
         let target = deattribute::Target {
             kind,
             marker: item.marker.clone(),
             expected_hash: hash,
-            replacement: None,
+            replacement: item.replacement.clone(),
         };
         match by_file
             .iter_mut()
@@ -639,25 +808,29 @@ pub fn write_copies(plan: &Plan) -> (Vec<SavedItem>, Vec<String>) {
         }
     }
     for (first, targets) in by_file {
-        match deattribute::write_deattributed(
-            &first.path,
-            first.format.as_deref(),
-            first.size,
-            &targets,
-        ) {
-            Ok(output) => saved.push(SavedItem {
-                path: first.path.clone(),
-                output,
-                edits: targets.len(),
-            }),
-            Err(EditError::Changed) => skipped.push("changed since scan".to_string()),
-            Err(EditError::Io(_)) => skipped.push("io error".to_string()),
-            Err(_) => skipped.push("unsafe edit".to_string()),
+        let shown = app::display_under(root, &first.path);
+        let format = first.format.as_deref();
+        let wrote =
+            guarded(|| deattribute::write_deattributed(&first.path, format, first.size, &targets));
+        match wrote {
+            Ok(Ok(output)) => {
+                let ok = guarded(|| {
+                    deattribute::verify_copy(&first.path, &output, format, &targets, mode)
+                })
+                .is_ok_and(|v| v.ok());
+                saved(&mut out, &first.path, output, targets.len(), ok);
+            }
+            Ok(Err(e)) => out
+                .failed
+                .push(format!("{shown}: {}", app::edit_error_reason(&e))),
+            Err(()) => out.failed.push(format!("{shown}: unsafe edit")),
         }
     }
-    (saved, skipped)
+    out
 }
 
+/// The files a scrub batch saved, in the order they were first edited, each
+/// with how many of its edits landed.
 pub fn scrub_items(out: &BatchOutcome) -> Vec<SavedItem> {
     let mut items: Vec<SavedItem> = Vec::new();
     for (_, path) in &out.applied {
@@ -731,8 +904,10 @@ mod tests {
         app.scan_done();
         let plan = app.deattribute_plan().unwrap();
 
-        let (saved, skipped) = write_copies(&plan);
-        assert!(skipped.is_empty(), "{skipped:?}");
+        let out = write_copies(&plan, dir.path());
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert!(out.unverified.is_empty(), "{:?}", out.unverified);
+        let saved = &out.saved;
         assert_eq!(saved.len(), 1);
         assert_eq!(
             saved[0].output,
@@ -742,6 +917,91 @@ mod tests {
         let copy = std::fs::read(&saved[0].output).unwrap();
         assert_eq!(copy.len(), bytes.len());
         assert!(!copy.windows(10).any(|w| w == b"patched by"));
+        assert_eq!(out.copies.len(), 1, "the copy is scanned on the worker");
+        assert_eq!(out.copies[0].0, path);
+        assert_eq!(out.copies[0].1.path, saved[0].output);
+    }
+
+    fn patched_exe(dir: &Path) -> (PathBuf, Vec<u8>) {
+        let path = dir.join("invented.exe");
+        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
+        bytes.resize(256, 0);
+        bytes.extend_from_slice(b"patched by Invented\0");
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    }
+
+    #[test]
+    fn a_replacement_target_writes_its_own_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, bytes) = patched_exe(dir.path());
+        let report = scan::scan_file(&path, &crate::parsers::registry());
+        let mut app = App::new(dir.path());
+        app.push_reports(vec![report]);
+        app.scan_done();
+        let mut plan = app.deattribute_plan().unwrap();
+        let item = &mut plan.items[0];
+        let region = item.marker.region;
+        let len = usize::try_from(region.len).unwrap();
+        item.replacement = Some(vec![b'Z'; len]);
+
+        let out = write_copies(&plan, dir.path());
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert_eq!(out.saved.len(), 1);
+        let copy = std::fs::read(&out.saved[0].output).unwrap();
+        let at = usize::try_from(region.offset).unwrap();
+        assert_eq!(&copy[at..at + len], vec![b'Z'; len].as_slice());
+        assert_eq!(copy.len(), bytes.len());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "original untouched");
+    }
+
+    /// Wait for the background job to land, as the frame loop does.
+    fn settle(rt: &mut Runtime) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if let Some(planned) = rt.drain_job() {
+                return planned;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the job finished");
+    }
+
+    #[test]
+    fn deattribute_plans_and_writes_off_the_input_thread() {
+        use ratatui::crossterm::event::KeyCode;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, bytes) = patched_exe(dir.path());
+        let report = scan::scan_file(&path, &crate::parsers::registry());
+        let mut app = App::new(dir.path());
+        app.push_reports(vec![report]);
+        app.scan_done();
+        let mut rt = Runtime::new(app, Look::vivid());
+
+        rt.key(KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(rt.app.busy, Some(Busy::Planning));
+        assert!(settle(&mut rt), "a plan arrived");
+        assert!(rt.app.busy.is_none());
+        assert_eq!(rt.app.context(), "confirm");
+        rt.key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(rt.app.context(), "confirm", "not drawn yet, so y waits");
+
+        rt.app.confirm_drawn = true;
+        rt.key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(rt.app.busy, Some(Busy::Writing));
+        assert_eq!(rt.app.status.as_ref().unwrap().text, "Writing copies...");
+        assert!(!settle(&mut rt), "the copies were written");
+        assert!(rt.app.busy.is_none());
+        let copy = dir.path().join("invented.deattributed.exe");
+        assert_eq!(
+            rt.app.status.as_ref().unwrap().text,
+            "Saved invented.deattributed.exe beside invented.exe."
+        );
+        assert_eq!(rt.app.saved(&path).unwrap().output, copy);
+        assert_eq!(rt.app.copy_of(&copy), Some(path.as_path()));
+        assert!(rt.app.has_report(&copy));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(rt.writer.is_none(), "the writer was joined");
     }
 
     fn finding(sig: &str, sev: Severity, marker: Marker) -> Finding {
@@ -902,6 +1162,8 @@ mod tests {
             risk: crate::edit::assess(None, 200, &m),
             marker: m,
             expected_hash: None,
+            replacement: None,
+            credit: None,
             archive: None,
         };
         let plan = Plan {
@@ -912,6 +1174,8 @@ mod tests {
             ],
             weak_left_out: 0,
             private_skips: Vec::new(),
+            caveats: Vec::new(),
+            replaces: Vec::new(),
             scroll: 0,
         };
         let out = run_plan(&mut engine, &plan);

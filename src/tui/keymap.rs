@@ -39,6 +39,7 @@ pub enum Key {
     Space,
     Scrub,
     Deattribute,
+    DeepDeattribute,
     Delete,
     Editor,
     Buckets,
@@ -54,7 +55,7 @@ pub enum Key {
 }
 
 impl Key {
-    pub const ALL: [Key; 26] = [
+    pub const ALL: [Key; 27] = [
         Key::Up,
         Key::Down,
         Key::Left,
@@ -69,6 +70,7 @@ impl Key {
         Key::Space,
         Key::Scrub,
         Key::Deattribute,
+        Key::DeepDeattribute,
         Key::Delete,
         Key::Editor,
         Key::Buckets,
@@ -100,6 +102,7 @@ impl Key {
             Key::Space => &["space"],
             Key::Scrub => &["d"],
             Key::Deattribute => &["a"],
+            Key::DeepDeattribute => &["A"],
             Key::Delete => &["D", "x"],
             Key::Editor => &["e"],
             Key::Buckets => &["b"],
@@ -135,6 +138,7 @@ impl Key {
             KeyCode::Char(' ') => Key::Space,
             KeyCode::Char('d') => Key::Scrub,
             KeyCode::Char('a') => Key::Deattribute,
+            KeyCode::Char('A') => Key::DeepDeattribute,
             KeyCode::Char('D') | KeyCode::Char('x') => Key::Delete,
             KeyCode::Char('e') => Key::Editor,
             KeyCode::Char('b') => Key::Buckets,
@@ -170,6 +174,7 @@ pub const HELP_GROUPS: &[(&str, &[Hint])] = &[
             h("space", "select"),
             h("d", "scrub markers"),
             h("a", "deattribute"),
+            h("A", "deep deattribute"),
             h("D / x", "delete file"),
             h("e", "open in editor"),
             h("u", "undo last"),
@@ -205,8 +210,9 @@ pub fn hint_names(key: &'static str) -> Vec<&'static str> {
 }
 
 /// The contextual footer for a view: `files` (or `scan`), `findings`,
-/// `detail`, `buckets`, `confirm`, `help`, `filter`, `picker`. Kept short;
-/// the rare keys live only in the cheatsheet. The picker reads raw events
+/// `detail`, `buckets`, `confirm`, `help`, `filter`, `picker`. Kept short:
+/// rare keys, such as `A` (deep deattribute, which may stop a copy loading),
+/// belong in the cheatsheet only. The picker reads raw events
 /// itself, like the filter, so its footer names keys rather than actions.
 pub fn footer_hints(view: &str) -> &'static [Hint] {
     const FILES: &[Hint] = &[
