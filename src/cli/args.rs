@@ -49,6 +49,7 @@ pub enum CleanSelector {
     Category(String),
     Signature(String),
     Deattribute,
+    DeepDeattribute,
 }
 
 /// The unit a clean acts on.
@@ -138,6 +139,7 @@ const CLEAN_FLAGS: &[Flag] = &[
     valued("--category"),
     valued("--signature"),
     switch("--deattribute"),
+    switch("--deep"),
     switch("--marker"),
     switch("--file"),
     switch("--dry-run"),
@@ -418,13 +420,18 @@ fn parse_clean(rest: &[&str]) -> Command {
     let mut dry_run = false;
     let mut force = false;
     let mut json = false;
+    let mut deep = false;
 
     for tok in toks {
         match tok {
             Tok::Flag("--dry-run", _) => dry_run = true,
             Tok::Flag("--force", _) => force = true,
             Tok::Flag("--json", _) => json = true,
+            Tok::Flag("--deep", _) => deep = true,
             Tok::Flag("--deattribute", _) => {
+                if selector == Some(CleanSelector::Deattribute) {
+                    return invalid("--deattribute given more than once");
+                }
                 if selector.is_some() {
                     return invalid("choose one --deattribute, --category, or --signature");
                 }
@@ -476,14 +483,29 @@ fn parse_clean(rest: &[&str]) -> Command {
     if path.is_empty() {
         return invalid("the path is empty");
     }
+    if deep && selector != Some(CleanSelector::Deattribute) {
+        return invalid("--deep requires --deattribute");
+    }
     let Some(selector) = selector else {
         return invalid("clean needs --deattribute, --category <slug>, or --signature <id>");
     };
-    if selector == CleanSelector::Deattribute && unit == Some(CleanUnit::File) {
-        return invalid("--deattribute cannot be combined with --file");
-    }
-    if selector == CleanSelector::Deattribute && force {
-        return invalid("--deattribute does not use --force");
+    let selector = if deep {
+        CleanSelector::DeepDeattribute
+    } else {
+        selector
+    };
+    if selector == CleanSelector::Deattribute || selector == CleanSelector::DeepDeattribute {
+        if let Some(unit) = unit {
+            let flag = if unit == CleanUnit::File {
+                "--file"
+            } else {
+                "--marker"
+            };
+            return invalid(&format!("--deattribute cannot be combined with {flag}"));
+        }
+        if force {
+            return invalid("--deattribute does not use --force");
+        }
     }
     Command::Clean {
         path: PathBuf::from(path),
@@ -542,7 +564,7 @@ usage
   meownary scan <path> [flags]      scan and report, no interactive view
   meownary clean <path> <select> [flags]
                                     remove matching markers in bulk
-  meownary clean <path> --deattribute [--dry-run] [--json]
+  meownary clean <path> --deattribute [--deep] [--dry-run] [--json]
                                     write a copy with brand labels and patch
                                     credits blanked, beside each file
   meownary undo [flags]             undo the last clean (or everything)
@@ -559,7 +581,7 @@ scan flags
                                     exit 1 when any finding reaches this
                                     severity, in any letter case (default: off)
 
-clean flags (<select> is one --category or one --signature)
+clean flags (<select> is --deattribute, one --category, or one --signature)
   --deattribute                     save <name>.deattributed.<ext> beside each
                                     file, with brand labels and patched-by
                                     credits blanked; the original is never
@@ -568,10 +590,15 @@ clean flags (<select> is one --category or one --signature)
                                     zip, tar and tar.gz: deattributes the
                                     files inside
                                     includes weak hits; exclusive with
-                                    --category, --signature, --file, --force
+                                    --category, --signature, --marker, --file,
+                                    --force
                                     prints paths, kinds, counts, and safe
                                     offsets; never matched text, titles,
                                     notes, evidence, or signature ids
+  --deep                            with --deattribute: also sweep data
+                                    strings (PE, ELF, Mach-O, text), the PE
+                                    export DLL name, PDB path, and timestamps;
+                                    may break loading or licensing
   --category <slug>                 select findings by category: identity,
                                     brand, integrity, tamper, deception,
                                     bundleware, junk
@@ -584,8 +611,9 @@ clean flags (<select> is one --category or one --signature)
   --force                           allow warn-level edits and weak findings;
                                     refused edits stay refused (default: off)
   --json                            JSON Lines: would_clean, cleaned, skipped,
-                                    done, plus would_save and saved with
-                                    --deattribute (default: human-readable text)
+                                    done, plus would_save, saved, and caveat
+                                    with --deattribute (default: human-readable
+                                    text)
 
 undo flags
   --last                            undo the most recent clean (default)
@@ -605,11 +633,14 @@ exit codes
   2    usage error: bad command, flag, or value, or a path that does not exist
   73   the state store could not be opened or created, or another meownary
        holds it (no edit attempted)
-  75   some files could not be fully scanned (partial results), unless 1 applies
+  75   some files could not be fully scanned (partial results); --deattribute
+       also counts a copy it could not write or verify, and there 75 wins
+       over 1 (elsewhere 1 wins)
   101  internal error (please report it)
   130  interrupted by Ctrl-C (as reported by the shell)
 
-every edit copies the original to meownary's trash first; `undo` puts it back.
+every scrub or delete copies the original to meownary's trash first; `undo`
+puts it back. --deattribute only writes copies, so it has nothing to undo.
 symbolic links are not followed; meownary's state directory is never scanned.
 ";
 
@@ -923,6 +954,58 @@ mod tests {
             .contains("unknown clean option")
         );
         assert!(why(p(&["clean", "dl", "--", "--category", "junk"])).contains("one path"));
+    }
+
+    #[test]
+    fn deep_needs_deattribute_in_either_order() {
+        for args in [
+            &["clean", "dl", "--deattribute", "--deep"][..],
+            &["clean", "dl", "--deep", "--deattribute"],
+        ] {
+            assert_eq!(
+                p(args),
+                Command::Clean {
+                    path: PathBuf::from("dl"),
+                    selector: CleanSelector::DeepDeattribute,
+                    unit: CleanUnit::Marker,
+                    dry_run: false,
+                    force: false,
+                    json: false
+                }
+            );
+        }
+        assert!(why(p(&["clean", "dl", "--deep"])).contains("--deep requires --deattribute"));
+        assert!(
+            why(p(&["clean", "dl", "--deep", "--category", "junk"]))
+                .contains("--deep requires --deattribute")
+        );
+        assert!(
+            why(p(&["clean", "dl", "--deep", "--deattribute", "--force"]))
+                .contains("does not use --force")
+        );
+        assert!(
+            why(p(&["clean", "dl", "--deep", "--deattribute", "--file"]))
+                .contains("cannot be combined with --file")
+        );
+    }
+
+    #[test]
+    fn deattribute_rejects_a_repeat_and_unit_flags() {
+        assert!(
+            why(p(&["clean", "dl", "--deattribute", "--deattribute"]))
+                .contains("--deattribute given more than once")
+        );
+        assert!(
+            why(p(&["clean", "dl", "--deattribute", "--marker"]))
+                .contains("cannot be combined with --marker")
+        );
+        assert!(
+            why(p(&["clean", "dl", "--file", "--deattribute"]))
+                .contains("cannot be combined with --file")
+        );
+        assert!(
+            why(p(&["clean", "dl", "--deattribute", "--category", "junk"])).contains("choose one")
+        );
     }
 
     #[test]

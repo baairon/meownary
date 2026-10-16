@@ -42,12 +42,12 @@ findings you select in place.
 |---|---|---|
 | For | software: who made it and with what | files: the metadata they carry |
 | Command | `clean <path> --deattribute` | `clean <path> --category <slug>` or `--signature <id>` |
-| Key in the view | `a` | `d` |
+| Key in the view | `a`, or `A` for deep | `d` |
 | Writes | a `.deattributed` copy beside the original | the original file |
 | Removes | `brand` labels and `patch` credits | any finding with a removable marker |
 | Occurrences | every match | the reported one |
-| Method | same-length blank | blank, truncate or structural rewrite |
-| File length | unchanged | may shrink |
+| Method | same-length blank or replacement | blank, truncate or structural rewrite |
+| File length | unchanged; a ZIP or tar.gz copy may differ | may shrink |
 | Weak findings | included | skipped unless `--force`, or scrubbed alone in the view |
 | Warn-level edits | never run | run with `--force`, or after the view's confirm |
 | Output names | paths, kinds, generic reasons | paths, signature ids, methods, reasons |
@@ -61,7 +61,7 @@ folder they walk once, recursively.
 ```sh
 meownary [<path>]
 meownary scan <path> [--json] [--no-color] [--fail-on <severity>]
-meownary clean <path> --deattribute [--dry-run] [--json]
+meownary clean <path> --deattribute [--deep] [--dry-run] [--json]
 meownary clean <path> --category <slug> [--marker | --file] [--dry-run] [--force] [--json]
 meownary clean <path> --signature <id> [--marker | --file] [--dry-run] [--force] [--json]
 meownary undo [--last | --all] [--json]
@@ -90,12 +90,14 @@ Deattribute writes a copy of each file with brand labels and `patched by`
 credits blanked at the same length, and never prints what it removed.
 
 ```sh
-meownary clean <path> --deattribute [--dry-run] [--json]
+meownary clean <path> --deattribute [--deep] [--dry-run] [--json]
 ```
 
 In the view, `a` plans with the same rules. It blanks vendor and copyright
 strings along with toolchain credits, so it is meant for software you build or
 are entitled to change.
+
+`--deep`, or `A` in the view, widens the sweep; see [Deep mode](#deep-mode).
 
 ### What it removes
 
@@ -123,6 +125,41 @@ Every blank is one of two kinds, `brand` or `patch`.
   to the end of its printable ASCII run, when that run ends within 80 bytes.
 - Other version keys, the numeric file version and every key name stay.
 
+### Deep mode
+
+`--deep`, or `A` in the view, runs a wider sweep on top of the basic one. It
+looks for copyrights, patch credits, build and install paths, licensing
+endpoints and messages, and product identifiers corroborated by exports or
+repeated class and UI strings. Deep edits can break loading, registration and
+licensing behavior, so inspect and test the copy before using it.
+
+| Format | Deep also changes |
+|---|---|
+| PE | strings in initialized data sections and resources, and the .NET `#US` heap; the export directory's DLL name, rewritten to a neutral same-length `module` name; COFF, export, resource and debug timestamps; the PDB path and RSDS GUID; POGO, VC feature and REPRO debug records; the Authenticode directory, cleared so the copy is cleanly unsigned |
+| ELF | strings in `.rodata`, `.data` and `.comment` |
+| Mach-O | strings in `__TEXT` `__cstring`, `__const`, `__ustring` and `__oslogstring`, and `__DATA` `__const` and `__data` |
+| Plain text | patch credits, copyright marks and build paths, filled with spaces up to the end of their line or quoted value, so quotes, tags and newlines stay put |
+| Anything else | patch credits, copyright marks and build paths in NUL-terminated strings, only where the bytes around them do not look compressed or encrypted |
+
+Deep never touches:
+
+- code sections;
+- PE import tables, the export address, name and ordinal tables, TLS,
+  relocations, load config, exception tables, resource directory nodes, RTTI
+  names, or .NET metadata other than the `#US` user string heap;
+- ELF `.dynstr`, `.symtab`, `.dynamic`, notes, unwind data or Go build info;
+- Mach-O `__LINKEDIT`, Objective-C class and selector names, or a section
+  holding instructions;
+- PE version and manifest resources, which the basic pass handles by key.
+
+A string is swept only when it stands alone between NUL bytes, so text
+embedded in a larger blob is left as it is. Matches are whole words:
+`dispatched by` is not a `patched by` credit. Licensing words such as
+`license` or `trial` count only beside a link in the same string. The sweep
+reads only the file's bytes, never its name, so the same file gives the same
+copy on disk, inside an archive and on a rerun, and a deep copy plans nothing
+more.
+
 ### Archives
 
 A ZIP, tar or tar.gz carries no attribution of its own, so deattribute cleans
@@ -133,11 +170,18 @@ beside the original.
   nothing to blank are copied byte for byte.
 - Office documents, JAR and APK files are ZIP containers but are treated as
   single files, not as archives.
-- Archives inside an archive are not opened.
+- Archives inside an archive are not opened; each is skipped as
+  `nested archive`.
+- A ZIP that is really a signed package (an APK or signed JAR the scan saw
+  only as a ZIP, a wheel, a NuGet package) is skipped as `signed package`,
+  since a copy would break the signature.
 - Encrypted entries, entries over 256 MiB and unsupported compression methods
   are skipped with a reason; an archive over 1 GiB uncompressed is refused.
-- A tar.gz copy is written as one gzip member without the original's stored
-  file name or comment.
+- When an archive stops being readable partway, everything after that point is
+  skipped once as `rest of the archive is unreadable`.
+- Each file inside keeps its length, but the archive's may change: a ZIP copy
+  re-deflates the entries it changed, and a tar.gz copy is recompressed as one
+  gzip member without the original's stored file name or comment.
 - An archive with nothing to blank inside gets no copy and reports
   `nothing to blank inside the archive`.
 
@@ -150,16 +194,23 @@ beside the original.
 - The copy is written to a temporary file, synced, then renamed into place. A
   copy from an earlier run is replaced, never stacked, and files that are
   already `.deattributed` copies are never deattributed again.
-- Every edit is a raw blank, so the copy keeps the original's size, layout and
-  offsets. Only blanks the safety check rates safe are planned, and none is
-  forced.
+- Every edit keeps its length, so a file's copy keeps the original's size,
+  layout and offsets. Basic mode writes raw blanks; deep mode can also write
+  same-length replacements. Only blanks the safety check rates safe are
+  planned, and none is forced.
+- A PE copy's checksum is recomputed when the original had one, in both
+  modes. A zero checksum stays zero.
 - A file with nothing to blank gets no copy. Deattribute never opens the state
   directory, so there is nothing to undo: delete the copy to discard it.
 
 ### What it skips
 
-A skip names one of five generic reasons: `load-bearing`,
-`no removable marker`, `unsafe edit`, `changed since scan` or `io error`.
+A skip names one generic reason. A file's credits are skipped as
+`load-bearing`, `no removable marker`, `unsafe edit`, `changed since scan` or
+`io error`. Inside an archive, an entry can also be skipped as
+`unsupported entry`, `entry too large`, `nested archive`, `signed package` or
+`rest of the archive is unreadable`, and an archive with nothing to change
+reports `nothing to blank inside the archive`.
 
 <details>
 <summary>What each reason covers</summary>
@@ -168,9 +219,14 @@ A skip names one of five generic reasons: `load-bearing`,
 |---|---|
 | `load-bearing` | the stamp is needed to load, unpack, install or play the file |
 | `no removable marker` | the label has no safe blank, or a text credit runs past 80 bytes |
-| `unsafe edit` | the blank is not rated safe, or it overlaps a blank with another fill |
+| `unsafe edit` | the blank is not rated safe, it overlaps a blank with another fill, planning failed internally, or the copy's path is a symbolic link or not a file |
 | `changed since scan` | the original's size or bytes changed after planning |
-| `io error` | the original could not be read or the copy could not be written |
+| `io error` | the walk could not read the file (a cloud-only placeholder is never opened), the original could not be opened, or the copy could not be written |
+| `unsupported entry` | an archive entry that is encrypted, ZIP64, corrupt or uses an unknown method |
+| `entry too large` | an archive entry over 256 MiB uncompressed |
+| `nested archive` | an archive inside the archive, which is never opened |
+| `signed package` | a signed package whose signature the copy would break |
+| `rest of the archive is unreadable` | the entries past a header that could not be read |
 
 Load-bearing stamps: packer markers and PE packer section names, .NET metadata
 and its runtime imports, Go build info and build ids, PyInstaller, Nuitka,
@@ -186,24 +242,31 @@ encryption info.
 - Each copy prints one line, `saved` with the copy's path, the original's name
   and its counts of `brand` and `patch` blanks, or `would save` in a dry run.
   A skip prints the path and its reason.
-- The summary counts the copies saved beside their originals and the skips by
-  reason. Offsets appear only in JSON.
+- A dry run checks the copy's path the way a real run does, so `would save`
+  means the copy can be written there.
+- A copy that loses something besides credits gets a caveat on stderr with the
+  original's path: a signed file's copy reports
+  `signature invalidated, re-sign to run`.
+- The summary counts the copies saved beside their originals, how many of them
+  are unverified, and the skips by reason. Offsets appear only in JSON.
 - Nothing printed names matched text, titles, notes, evidence or signature ids.
-- After writing, each copy is scanned and planned again. A partial scan or a
-  blank still planned prints `verification incomplete for an edited file` and
-  exits 75.
-- Exit 1 means something matched and no copy was written.
+- After writing, each copy is checked: it must be the original byte for byte
+  apart from the planned spans, keep its format, and plan nothing more in the
+  same mode. An archive copy must read as the same kind of archive and clean to
+  nothing more. A copy that fails prints `verification incomplete for <copy>`.
+- Exit 75 means some file was not fully read, planned, written or verified. It
+  wins over exit 1, which means something matched and no copy was written.
 
 ### What it never does
 
-- Write to the original, delete a file, or change the copy's length.
+- Write to the original, delete a file, or change a file's length in its copy.
 - Touch junk, tamper, integrity, identity, deception or bundleware findings,
   other than `patched by`, so other metadata stays in the copy.
-- Accept `--force`, `--file`, `--category` or `--signature`; each is a usage
-  error.
+- Accept `--force`, `--marker`, `--file`, `--category` or `--signature`; each
+  is a usage error.
 - Run a warn-level edit, or one the safety check refuses.
-- Re-sign an executable or update its PE checksum. The copy of a signed file
-  carries an invalid signature.
+- Re-sign an executable. The copy of a signed file carries a broken
+  signature, or none for a PE in deep mode, and the run reports the caveat.
 
 ## Scrub
 
@@ -389,11 +452,11 @@ them; `meownary` alone opens a picker first.
   home folder, the folder that holds every user's home, or a drive.
 - **Reopen**: `o` brings the picker back over the view; `esc` returns to the
   view unchanged.
-- **Saved marks**: a file you scrub, or the copy deattribute writes, gets a
-  `scrubbed` or `deattributed` chip in the list, and the status line names
-  what was saved.
+- **Saved marks**: a file you scrub gets a `scrubbed` chip in the list. After
+  deattribute, the original gets a `deattributed` chip and its copy a `copy`
+  chip. The status line names what was saved.
 
-| | `d` scrub | `a` deattribute | `D` or `x` delete |
+| | `d` scrub | `a` deattribute, `A` deep | `D` or `x` delete |
 |---|---|---|---|
 | Picks made with `space` | picked findings, and the filtered findings of picked files | picked files, and the files of picked findings | picked files, else the highlighted file |
 | Findings pane or detail | the highlighted finding | the highlighted file | the highlighted file |
@@ -406,6 +469,7 @@ them; `meownary` alone opens a picker first.
   Refused items never run.
 - **Force**: for scrub and delete the confirm stands in for `--force`;
   deattribute never forces.
+- **Deep**: `A` deattributes like `a`, in deep mode, the way `--deep` does.
 - **Undo**: `u` reverts the newest scrub or delete group, a `clean` run
   included.
 - **Editor**: `e` opens the highlighted file in `$VISUAL` or `$EDITOR`, else
@@ -432,19 +496,22 @@ ending with a `done` event that carries the exit code. `scan --json` prints
 
 | Field | Events | Value |
 |---|---|---|
-| `event` | all | `would_clean`, `cleaned`, `would_save`, `saved`, `skipped` or `done` |
+| `event` | all | `would_clean`, `cleaned`, `caveat`, `would_save`, `saved`, `skipped` or `done` |
 | `path` | per file | the original, as walked |
 | `output` | `would_clean`, `cleaned`, `would_save`, `saved` | the copy's path |
-| `kind` | `would_clean`, `cleaned`, `skipped` | `brand` or `patch` |
-| `op`, `offset`, `len` | `would_clean`, `cleaned` | `raw_blank` and the blanked region |
-| `edits` | `would_save`, `saved` | blanks in the copy |
+| `kind` | `would_clean`, `cleaned`, `skipped` | `brand` or `patch`; absent when a whole file or an archive entry is skipped |
+| `op`, `offset`, `len` | `would_clean`, `cleaned` | `raw_blank`, or `replace` for a same-length replacement, and the region |
+| `caveat` | `caveat` | what the copy loses besides credits: `signature invalidated, re-sign to run` |
+| `edits` | `would_save`, `saved` | edits in the copy |
 | `entries` | `would_save`, `saved` | for an archive, files inside that were cleaned |
+| `verified` | `saved` | whether the written copy checked out; `false` makes the run exit 75 |
 | `entry` | `skipped` | for an archive, the path inside it |
-| `reason` | `skipped` | one of the five reasons |
+| `reason` | `skipped` | one of the reasons under [What it skips](#what-it-skips) |
 | `cleaned`, `skipped`, `saved` | `done` | counts; a dry run counts what it would do |
 | `dry_run` | `done` | whether nothing was written |
-| `files`, `partial_files` | `done` | files walked, and files not fully read or verified |
+| `files`, `partial_files` | `done` | files walked, and files not fully read, planned, written or verified |
 | `exit` | `done` | the exit code |
+| `error` | `done` | why the run stopped before the walk, on a usage error |
 
 No event carries `title`, `note`, `signature`, `evidence` or `label`.
 
@@ -519,7 +586,7 @@ Every command exits with one of seven codes.
 | 1    | `scan --fail-on` was met; `clean` matched but changed nothing; `undo` failed; the view failed |
 | 2    | bad command, flag or value, a missing path, or a path that does not exist |
 | 73   | the state store could not be opened, or another meownary holds it; nothing was edited |
-| 75   | some files could not be fully read, or a deattributed copy could not be verified |
+| 75   | some files could not be fully read, or a deattributed copy could not be written or verified; for deattribute it wins over 1 |
 | 101  | internal error; meownary prints where to report it |
 | 130  | interrupted with Ctrl-C (Windows reports 0xC000013A instead) |
 

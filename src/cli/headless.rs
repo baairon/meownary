@@ -78,6 +78,12 @@ impl Sink {
         self.progress.tick(done);
     }
 
+    /// [`note`] after erasing the progress line, so the two never share a row.
+    fn note(&mut self, msg: &str) {
+        self.progress.clear();
+        note(msg);
+    }
+
     /// Erase the progress line and flush stdout.
     fn finish(&mut self) {
         self.progress.clear();
@@ -901,7 +907,7 @@ fn selector_matches(sel: &CleanSelector, f: &Finding) -> bool {
     match sel {
         CleanSelector::Category(slug) => f.category.slug() == slug.as_str(),
         CleanSelector::Signature(id) => f.signature_id == *id,
-        CleanSelector::Deattribute => false,
+        CleanSelector::Deattribute | CleanSelector::DeepDeattribute => false,
     }
 }
 
@@ -934,6 +940,17 @@ struct CopyEvent {
     edits: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     entries: Option<usize>,
+    /// Whether the written copy checked out; absent in a dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified: Option<bool>,
+}
+
+/// Something a saved copy loses that is not a skipped credit.
+#[derive(Serialize)]
+struct CaveatEvent {
+    event: &'static str,
+    path: String,
+    caveat: &'static str,
 }
 
 #[derive(Serialize)]
@@ -946,6 +963,38 @@ struct CreditDone {
     files: usize,
     partial_files: usize,
     exit: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+}
+
+/// The generic reason for a copy that could not be written.
+fn credit_reason(e: &EditError) -> CreditReason {
+    match e {
+        EditError::Changed => CreditReason::Changed,
+        EditError::Io(_) => CreditReason::Io,
+        _ => CreditReason::Unsafe,
+    }
+}
+
+/// What a real run would refuse at the copy's path: a symbolic link, or
+/// anything that is not a regular file. A missing path is fine. A dry run
+/// checks this so `would save` matches what a real run does.
+fn output_refused(output: &Path) -> Option<EditError> {
+    match fs::symlink_metadata(output) {
+        Ok(m) if m.file_type().is_symlink() => Some(EditError::Symlink(output.to_path_buf())),
+        Ok(m) if !m.is_file() => Some(EditError::Refused(
+            "the copy's path is taken by something that is not a file".into(),
+        )),
+        _ => None,
+    }
+}
+
+/// Whether the walk could not read this entry at all (unreadable, or a
+/// cloud-only placeholder). Such an entry is never opened, so a placeholder is
+/// never downloaded. A file whose scan only lost a probe to a panic was read
+/// and is planned as usual.
+fn walk_unreadable(item: &Scanned) -> bool {
+    item.report.partial && item.error.as_deref() != Some(scan::PROBE_PANICKED)
 }
 
 fn emit_credit_skip(
@@ -976,9 +1025,9 @@ fn emit_credit_skip(
     ))
 }
 
-/// Report one copy: per-region `would_clean`/`cleaned` events plus one
-/// `would_save`/`saved` event in JSON, or one `saved` line for people.
-fn emit_copy(
+/// Report the per-region `would_clean`/`cleaned` events of one copy. Nothing
+/// is printed for people; their one line comes from [`emit_copy`].
+fn emit_edits(
     sink: &mut Sink,
     original: &Path,
     output: &Path,
@@ -986,29 +1035,51 @@ fn emit_copy(
     dry_run: bool,
     json_out: bool,
 ) -> bool {
-    if json_out {
-        let event = if dry_run { "would_clean" } else { "cleaned" };
-        for target in targets {
-            if !sink.json(&CreditEvent {
-                event,
-                path: lossy(original),
-                entry: None,
-                kind: Some(target.kind.slug()),
-                reason: None,
-                output: Some(lossy(output)),
-                op: Some("raw_blank"),
-                offset: Some(target.marker.region.offset),
-                len: Some(target.marker.region.len),
-            }) {
-                return false;
-            }
+    if !json_out {
+        return true;
+    }
+    let event = if dry_run { "would_clean" } else { "cleaned" };
+    for target in targets {
+        if !sink.json(&CreditEvent {
+            event,
+            path: lossy(original),
+            entry: None,
+            kind: Some(target.kind.slug()),
+            reason: None,
+            output: Some(lossy(output)),
+            op: Some(if target.replacement.is_some() {
+                "replace"
+            } else {
+                "raw_blank"
+            }),
+            offset: Some(target.marker.region.offset),
+            len: Some(target.marker.region.len),
+        }) {
+            return false;
         }
+    }
+    true
+}
+
+/// Report one copy: a `would_save`/`saved` event in JSON, or one `saved` line
+/// for people. `verified` is `None` in a dry run.
+fn emit_copy(
+    sink: &mut Sink,
+    original: &Path,
+    output: &Path,
+    targets: &[deattribute::Target],
+    verified: Option<bool>,
+    json_out: bool,
+) -> bool {
+    let dry_run = verified.is_none();
+    if json_out {
         return sink.json(&CopyEvent {
             event: if dry_run { "would_save" } else { "saved" },
             path: lossy(original),
             output: lossy(output),
             edits: targets.len(),
             entries: None,
+            verified,
         });
     }
     let name = original
@@ -1029,10 +1100,42 @@ fn emit_copy(
     ))
 }
 
+/// Report each distinct caveat of one copy: a `caveat` event in JSON, or a
+/// note on stderr for people. Only the generic caveat is named, never what
+/// matched.
+fn emit_caveats(
+    sink: &mut Sink,
+    original: &Path,
+    caveats: &[deattribute::Caveat],
+    json_out: bool,
+) -> bool {
+    let mut seen: Vec<deattribute::Caveat> = Vec::new();
+    for caveat in caveats {
+        if seen.contains(caveat) {
+            continue;
+        }
+        seen.push(*caveat);
+        if json_out {
+            if !sink.json(&CaveatEvent {
+                event: "caveat",
+                path: lossy(original),
+                caveat: caveat.slug(),
+            }) {
+                return false;
+            }
+        } else {
+            sink.note(&format!("{}: {}", display_path(original), caveat.slug()));
+        }
+    }
+    true
+}
+
 /// The summary line: skips first, then the copies, so the line always ends
-/// with what was (or would be) saved.
+/// with what was (or would be) saved, and with how many of those copies could
+/// not be verified.
 fn deattribute_summary(
     saved: usize,
+    unverified: usize,
     skipped: usize,
     reasons: &BTreeMap<&'static str, usize>,
     dry_run: bool,
@@ -1059,24 +1162,43 @@ fn deattribute_summary(
             "beside their originals"
         };
         s.push_str(&format!("saved {saved} {copies} {beside}"));
+        if unverified > 0 {
+            s.push_str(&format!(", {unverified} unverified"));
+        }
     }
     s
 }
 
-/// What one archive added to the run's totals.
+/// What one walked file or archive added to the run's totals.
 #[derive(Default)]
-struct ArchiveStep {
+struct Step {
     matched: usize,
     cleaned: usize,
     saved: usize,
-    partial: usize,
+    /// A copy was written but did not check out.
+    unverified: usize,
+    /// The file could not be fully read, planned, written or verified.
+    partial: bool,
     /// One slug per skipped line printed.
     reasons: Vec<&'static str>,
     /// False once stdout is closed.
     open: bool,
 }
 
+impl Step {
+    /// A step that only skips the whole file with `reason`, no kind or entry.
+    fn whole_skip(sink: &mut Sink, path: &Path, reason: &'static str, json_out: bool) -> Self {
+        Self {
+            partial: true,
+            reasons: vec![reason],
+            open: emit_archive_skip(sink, path, None, reason, json_out),
+            ..Self::default()
+        }
+    }
+}
+
 /// One skip inside (or about) an archive: `entry` is the path inside it.
+/// Without an entry it is a skip of the whole file, and carries no kind.
 fn emit_archive_skip(
     sink: &mut Sink,
     archive: &Path,
@@ -1108,15 +1230,17 @@ fn emit_archive_skip(
     ))
 }
 
-/// Report a saved (or would-be-saved) archive copy.
+/// Report a saved (or would-be-saved) archive copy. `verified` is `None` in a
+/// dry run.
 fn emit_archive_copy(
     sink: &mut Sink,
     original: &Path,
     outcome: &deattribute::ArchiveOutcome,
     files: Option<usize>,
-    dry_run: bool,
+    verified: Option<bool>,
     json_out: bool,
 ) -> bool {
+    let dry_run = verified.is_none();
     let edits = outcome.brand + outcome.patch;
     if json_out {
         return sink.json(&CopyEvent {
@@ -1125,6 +1249,7 @@ fn emit_archive_copy(
             output: lossy(&outcome.output),
             edits,
             entries: Some(outcome.entries_cleaned),
+            verified,
         });
     }
     let name = original
@@ -1165,23 +1290,16 @@ fn deattribute_archive_file(
     kind: deattribute::ArchiveKind,
     dry_run: bool,
     json_out: bool,
-) -> ArchiveStep {
-    let mut step = ArchiveStep::default();
-    let outcome = match deattribute::deattribute_archive(path, kind, dry_run) {
+    mode: deattribute::Mode,
+) -> Step {
+    let outcome = match deattribute::deattribute_archive_mode(path, kind, dry_run, mode) {
         Ok(outcome) => outcome,
-        Err(e) => {
-            let reason = match e {
-                EditError::Changed => CreditReason::Changed,
-                EditError::Io(_) => CreditReason::Io,
-                _ => CreditReason::Unsafe,
-            };
-            step.partial = 1;
-            step.reasons.push(reason.slug());
-            step.open = emit_archive_skip(sink, path, None, reason.slug(), json_out);
-            return step;
-        }
+        Err(e) => return Step::whole_skip(sink, path, credit_reason(&e).slug(), json_out),
     };
-    step.open = true;
+    let mut step = Step {
+        open: true,
+        ..Step::default()
+    };
     for (entry, reason) in &outcome.skipped {
         step.reasons.push(reason.slug());
         if !matches!(
@@ -1200,11 +1318,116 @@ fn deattribute_archive_file(
         step.open = emit_archive_skip(sink, path, None, deattribute::NOTHING_INSIDE, json_out);
         return step;
     }
+    // A real run refuses these before writing; a dry run says so too.
+    if dry_run && let Some(e) = output_refused(&outcome.output) {
+        let reason = credit_reason(&e).slug();
+        step.partial = true;
+        step.reasons.push(reason);
+        step.open = emit_archive_skip(sink, path, None, reason, json_out);
+        return step;
+    }
+    let verified =
+        (!dry_run).then(|| deattribute::verify_archive_copy(&outcome.output, kind, mode).ok());
+    if verified == Some(false) {
+        step.partial = true;
+        step.unverified = 1;
+        sink.note(&format!(
+            "verification incomplete for {}",
+            display_path(&outcome.output)
+        ));
+    }
     let files = deattribute::archive_file_count(path, kind);
     step.saved = 1;
     step.cleaned = outcome.brand + outcome.patch;
     step.matched += step.cleaned;
-    step.open = emit_archive_copy(sink, path, &outcome, files, dry_run, json_out);
+    step.open = emit_archive_copy(sink, path, &outcome, files, verified, json_out);
+    step
+}
+
+/// Deattribute one plain file: plan it, write (or, in a dry run, check) its
+/// copy, verify the copy, and report the result.
+fn deattribute_plain_file(
+    sink: &mut Sink,
+    r: &FileReport,
+    dry_run: bool,
+    json_out: bool,
+    mode: deattribute::Mode,
+) -> Step {
+    let Ok(view) = scan::WindowedFile::open(&r.path) else {
+        return Step::whole_skip(sink, &r.path, CreditReason::Io.slug(), json_out);
+    };
+    let planned = scan::guard::guarded(|| deattribute::plan_mode(r, &view, mode));
+    drop(view);
+    let Ok(plan) = planned else {
+        return Step::whole_skip(sink, &r.path, CreditReason::Unsafe.slug(), json_out);
+    };
+    let mut step = Step {
+        matched: plan.targets.len() + plan.skipped.len(),
+        open: true,
+        ..Step::default()
+    };
+    for s in &plan.skipped {
+        step.reasons.push(s.reason.slug());
+        if !emit_credit_skip(sink, &r.path, s.kind, s.reason, json_out) {
+            step.open = false;
+            return step;
+        }
+    }
+    if plan.targets.is_empty() {
+        return step;
+    }
+    let outcome = if dry_run {
+        let output = deattribute::deattributed_name(&r.path);
+        match output_refused(&output) {
+            Some(e) => Err(e),
+            None => Ok(output),
+        }
+    } else {
+        deattribute::write_deattributed(&r.path, r.format.as_deref(), r.size, &plan.targets)
+    };
+    let output = match outcome {
+        Ok(output) => output,
+        Err(e) => {
+            let reason = credit_reason(&e);
+            step.partial = true;
+            let mut kinds: Vec<CreditKind> = Vec::new();
+            for target in &plan.targets {
+                if !kinds.contains(&target.kind) {
+                    kinds.push(target.kind);
+                }
+            }
+            for kind in kinds {
+                step.reasons.push(reason.slug());
+                if !emit_credit_skip(sink, &r.path, kind, reason, json_out) {
+                    step.open = false;
+                    return step;
+                }
+            }
+            return step;
+        }
+    };
+    step.saved = 1;
+    step.cleaned = plan.targets.len();
+    if !emit_edits(sink, &r.path, &output, &plan.targets, dry_run, json_out) {
+        step.open = false;
+        return step;
+    }
+    let verified = (!dry_run).then(|| {
+        deattribute::verify_copy(&r.path, &output, r.format.as_deref(), &plan.targets, mode).ok()
+    });
+    if verified == Some(false) {
+        step.partial = true;
+        step.unverified = 1;
+        sink.note(&format!(
+            "verification incomplete for {}",
+            display_path(&output)
+        ));
+    }
+    if !emit_caveats(sink, &r.path, &plan.caveats, json_out) {
+        step.open = false;
+        return step;
+    }
+    step.open = emit_copy(sink, &r.path, &output, &plan.targets, verified, json_out);
     step
 }
 
@@ -1215,14 +1438,34 @@ fn deattribute_archive_file(
 /// left out of the walk, so a rerun replaces each copy instead of stacking
 /// another. It deliberately has no access to audit labels in its output types,
 /// including error paths.
-fn run_deattribute(path: &Path, dry_run: bool, json_out: bool) -> i32 {
+///
+/// Exit 75 (some file not fully read, planned, written or verified) wins over
+/// exit 1 (something matched and no copy was saved).
+fn run_deattribute(path: &Path, dry_run: bool, json_out: bool, mode: deattribute::Mode) -> i32 {
+    let usage = |why: &'static str| {
+        note(why);
+        if json_out {
+            let mut sink = Sink::new(Progress::off());
+            sink.json(&CreditDone {
+                event: "done",
+                cleaned: 0,
+                saved: 0,
+                skipped: 0,
+                dry_run,
+                files: 0,
+                partial_files: 0,
+                exit: exit::USAGE,
+                error: Some(why),
+            });
+            sink.finish();
+        }
+        exit::USAGE
+    };
     if missing_path(path).is_some() {
-        note("path unavailable");
-        return exit::USAGE;
+        return usage("path unavailable");
     }
     if fs::metadata(path).is_ok_and(|m| m.is_file()) && deattribute::is_deattributed(path) {
-        note("the path is already a deattributed copy; run it on the original");
-        return exit::USAGE;
+        return usage("the path is already a deattributed copy; run it on the original");
     }
     let scan = scan::scan_ordered(path, ScanOpts::default());
     let mut sink = Sink::new(Progress::for_run(json_out, scan.total()));
@@ -1232,9 +1475,10 @@ fn run_deattribute(path: &Path, dry_run: bool, json_out: bool) -> i32 {
     let mut matched = 0usize;
     let mut cleaned = 0usize;
     let mut saved = 0usize;
+    let mut unverified = 0usize;
     let mut skipped = 0usize;
     let mut reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
-    'files: for item in scan {
+    for item in scan {
         seen += 1;
         let r = &item.report;
         // A copy from an earlier run is never a source: leave it out quietly.
@@ -1243,98 +1487,29 @@ fn run_deattribute(path: &Path, dry_run: bool, json_out: bool) -> i32 {
             continue;
         }
         files += 1;
-        if r.partial {
+        let step = if walk_unreadable(&item) {
+            // Never opened: opening a cloud-only placeholder downloads it.
+            Step::whole_skip(&mut sink, &r.path, CreditReason::Io.slug(), json_out)
+        } else if let Some(kind) = deattribute::archive_kind(&r.path, r.format.as_deref()) {
+            // An archive carries no attribution itself: it is cleaned through
+            // the files inside it.
+            deattribute_archive_file(&mut sink, &r.path, kind, dry_run, json_out, mode)
+        } else {
+            deattribute_plain_file(&mut sink, r, dry_run, json_out, mode)
+        };
+        matched += step.matched;
+        cleaned += step.cleaned;
+        saved += step.saved;
+        unverified += step.unverified;
+        if r.partial || step.partial {
             partial_files += 1;
         }
-        // An archive carries no attribution itself: it is cleaned through the
-        // files inside it.
-        if let Some(kind) = deattribute::archive_kind(&r.path, r.format.as_deref()) {
-            let step = deattribute_archive_file(&mut sink, &r.path, kind, dry_run, json_out);
-            matched += step.matched;
-            cleaned += step.cleaned;
-            saved += step.saved;
-            partial_files += step.partial;
-            skipped += step.reasons.len();
-            for reason in step.reasons {
-                *reasons.entry(reason).or_default() += 1;
-            }
-            if !step.open {
-                break 'files;
-            }
-            sink.tick(seen);
-            continue;
+        skipped += step.reasons.len();
+        for reason in step.reasons {
+            *reasons.entry(reason).or_default() += 1;
         }
-        let Ok(view) = scan::WindowedFile::open(&r.path) else {
-            if !r.partial {
-                partial_files += 1;
-            }
-            sink.tick(seen);
-            continue;
-        };
-        let plan = deattribute::plan(r, &view);
-        drop(view);
-        matched += plan.targets.len() + plan.skipped.len();
-        for s in &plan.skipped {
-            skipped += 1;
-            *reasons.entry(s.reason.slug()).or_default() += 1;
-            if !emit_credit_skip(&mut sink, &r.path, s.kind, s.reason, json_out) {
-                break 'files;
-            }
-        }
-        if plan.targets.is_empty() {
-            sink.tick(seen);
-            continue;
-        }
-        let outcome = if dry_run {
-            Ok(deattribute::deattributed_name(&r.path))
-        } else {
-            deattribute::write_deattributed(&r.path, r.format.as_deref(), r.size, &plan.targets)
-        };
-        match outcome {
-            Ok(output) => {
-                saved += 1;
-                cleaned += plan.targets.len();
-                if !emit_copy(
-                    &mut sink,
-                    &r.path,
-                    &output,
-                    &plan.targets,
-                    dry_run,
-                    json_out,
-                ) {
-                    break 'files;
-                }
-                if !dry_run {
-                    let again = scan::scan_file_detailed(&output, &crate::parsers::registry());
-                    let remaining = scan::WindowedFile::open(&output)
-                        .ok()
-                        .map(|v| deattribute::plan(&again.report, &v).targets.len());
-                    if again.report.partial || remaining.is_none_or(|n| n > 0) {
-                        partial_files += 1;
-                        note("verification incomplete for an edited file");
-                    }
-                }
-            }
-            Err(e) => {
-                let reason = match e {
-                    EditError::Changed => CreditReason::Changed,
-                    EditError::Io(_) => CreditReason::Io,
-                    _ => CreditReason::Unsafe,
-                };
-                let mut kinds: Vec<CreditKind> = Vec::new();
-                for target in &plan.targets {
-                    if !kinds.contains(&target.kind) {
-                        kinds.push(target.kind);
-                    }
-                }
-                for kind in kinds {
-                    skipped += 1;
-                    *reasons.entry(reason.slug()).or_default() += 1;
-                    if !emit_credit_skip(&mut sink, &r.path, kind, reason, json_out) {
-                        break 'files;
-                    }
-                }
-            }
+        if !step.open {
+            break;
         }
         sink.tick(seen);
     }
@@ -1355,9 +1530,12 @@ fn run_deattribute(path: &Path, dry_run: bool, json_out: bool) -> i32 {
             files,
             partial_files,
             exit: code,
+            error: None,
         });
     } else {
-        sink.line(&deattribute_summary(saved, skipped, &reasons, dry_run));
+        sink.line(&deattribute_summary(
+            saved, unverified, skipped, &reasons, dry_run,
+        ));
     }
     sink.finish();
     code
@@ -1372,8 +1550,16 @@ pub fn run_clean(
     force: bool,
     json_out: bool,
 ) -> i32 {
-    if matches!(selector, CleanSelector::Deattribute) {
-        return run_deattribute(path, dry_run, json_out);
+    if matches!(
+        selector,
+        CleanSelector::Deattribute | CleanSelector::DeepDeattribute
+    ) {
+        let mode = if matches!(selector, CleanSelector::DeepDeattribute) {
+            deattribute::Mode::Deep
+        } else {
+            deattribute::Mode::Basic
+        };
+        return run_deattribute(path, dry_run, json_out, mode);
     }
     if let Some(why) = missing_path(path) {
         note(&why);
