@@ -8,7 +8,9 @@
 //!
 //! `picker` is the first-run file browser. `listing` reads one folder from
 //! its directory listing alone, for the views that browse folders, and `bg`
-//! runs work that must not block the input thread. `tree` adds a scan's
+//! runs work that must not block the input thread. `views` holds the parts
+//! of the drawing split out of `ui`, one owner each, `progress` carries
+//! live progress from the workers to the activity row, `tree` adds a scan's
 //! reports up per folder, and `explorer` lays out the folder the files list
 //! shows.
 
@@ -22,11 +24,13 @@ pub mod listing;
 pub mod logo;
 pub mod picker;
 pub mod preview;
+pub mod progress;
 pub mod runtime;
 pub mod svg;
 pub mod theme;
 pub mod tree;
 pub mod ui;
+pub mod views;
 pub mod widgets;
 
 pub use app::run;

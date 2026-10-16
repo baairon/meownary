@@ -2,7 +2,9 @@
 //! `?` cheatsheet groups, and the contextual footer hints. Every key the app
 //! handles is a [`Key`] variant, and a test checks that each variant's names
 //! appear in [`HELP_GROUPS`] (and nothing else does), so the footer and the
-//! help overlay can never drift from what the app actually handles.
+//! help overlay can never drift from what the app actually handles. The
+//! picker reads raw keys, so its own sheet, [`PICKER_HELP`], names keys
+//! rather than [`Key`]s; [`help_groups`] picks the sheet for a context.
 //!
 //! Key names in hints are plain words: `up/dn j/k` lists four names. A hint
 //! key is split on spaces and `/`, except the lone `/` (the filter key).
@@ -155,7 +157,9 @@ impl Key {
     }
 }
 
-/// The full `?` cheatsheet, grouped.
+/// The main view's `?` cheatsheet, grouped. It is exactly as tall as an
+/// 80x24 terminal allows in two columns, so a new hint means another one
+/// goes, or the group it joins gets shorter.
 pub const HELP_GROUPS: &[(&str, &[Hint])] = &[
     (
         "move",
@@ -163,8 +167,9 @@ pub const HELP_GROUPS: &[(&str, &[Hint])] = &[
             h("up/dn j/k", "move"),
             h("pgup/pgdn", "page"),
             h("home/end g/G", "top / bottom"),
-            h("tab left/right h/l", "switch pane"),
-            h("enter", "open"),
+            h("enter right/l", "open"),
+            h("left/h backspace", "up a folder"),
+            h("tab", "switch pane"),
             h("esc", "back"),
         ],
     ),
@@ -190,16 +195,119 @@ pub const HELP_GROUPS: &[(&str, &[Hint])] = &[
             h("q / ctrl+c", "quit"),
         ],
     ),
-    ("confirm", &[h("y", "confirm"), h("n / esc", "cancel")]),
     (
-        "filter",
+        "prompts",
         &[
+            h("y", "confirm"),
+            h("n / esc", "cancel or clear"),
+            h("enter", "keep the filter"),
             h("backspace", "erase"),
-            h("enter", "keep"),
-            h("esc", "clear"),
         ],
     ),
 ];
+
+/// The picker's `?` cheatsheet. The picker reads raw keys, so these name
+/// keys from [`PICKER_KEYS`] rather than [`Key`]s.
+pub const PICKER_HELP: &[(&str, &[Hint])] = &[
+    (
+        "move",
+        &[
+            h("up/dn j/k", "move"),
+            h("pgup/pgdn", "page"),
+            h("home/end g/G", "first / last"),
+        ],
+    ),
+    (
+        "open",
+        &[
+            h("enter right l", "open or scan"),
+            h("left h backspace", "up a folder"),
+            h("s", "scan this folder"),
+            h("~", "home folder"),
+        ],
+    ),
+    (
+        "type",
+        &[
+            h("/", "filter or path"),
+            h("tab", "complete"),
+            h("ctrl+u ctrl+w", "erase"),
+            h("enter", "keep"),
+        ],
+    ),
+    (
+        "leave",
+        &[
+            h("esc", "cancel or leave"),
+            h("ctrl+c", "quit"),
+            h("?", "keys"),
+        ],
+    ),
+];
+
+/// Every key name the picker handles. Its footers and its sheet name only
+/// these, and its sheet names every one.
+pub const PICKER_KEYS: &[&str] = &[
+    "up",
+    "dn",
+    "j",
+    "k",
+    "pgup",
+    "pgdn",
+    "home",
+    "end",
+    "g",
+    "G",
+    "enter",
+    "right",
+    "l",
+    "left",
+    "h",
+    "backspace",
+    "s",
+    "~",
+    "/",
+    "tab",
+    "ctrl+u",
+    "ctrl+w",
+    "esc",
+    "ctrl+c",
+    "?",
+];
+
+/// The picker's footer while it browses a folder. The view swaps the esc
+/// label for the state: quit, back, clear or cancel.
+pub const PICKER_FOLDER_HINTS: &[Hint] = &[
+    h("up/dn", "move"),
+    h("enter", "open"),
+    h("left", "up"),
+    h("s", "scan here"),
+    h("/", "filter"),
+    h("?", "keys"),
+    h("esc", "quit"),
+];
+
+/// The picker's footer at the top level, among recent picks and places.
+pub const PICKER_PLACES_HINTS: &[Hint] = &[
+    h("up/dn", "move"),
+    h("enter", "open"),
+    h("/", "path"),
+    h("?", "keys"),
+    h("esc", "quit"),
+];
+
+/// The picker's footer while its prompt is open.
+pub const PICKER_PROMPT_HINTS: &[Hint] =
+    &[h("enter", "keep"), h("tab", "complete"), h("esc", "cancel")];
+
+/// The `?` cheatsheet for a context: the picker's own, or the main view's.
+pub fn help_groups(ctx: &str) -> &'static [(&'static str, &'static [Hint])] {
+    if ctx == "picker" {
+        PICKER_HELP
+    } else {
+        HELP_GROUPS
+    }
+}
 
 /// The key names a hint lists.
 pub fn hint_names(key: &'static str) -> Vec<&'static str> {
@@ -256,14 +364,6 @@ pub fn footer_hints(view: &str) -> &'static [Hint] {
     const CONFIRM: &[Hint] = &[h("y", "confirm"), h("n", "cancel"), h("up/dn", "scroll")];
     const HELP: &[Hint] = &[h("esc", "close")];
     const FILTER: &[Hint] = &[h("enter", "keep"), h("esc", "clear")];
-    const PICKER: &[Hint] = &[
-        h("up/dn", "move"),
-        h("right", "open"),
-        h("left", "back"),
-        h("enter", "scan"),
-        h("tab", "complete"),
-        h("esc", "quit"),
-    ];
     match view {
         "findings" => FINDINGS,
         "detail" => DETAIL,
@@ -271,7 +371,7 @@ pub fn footer_hints(view: &str) -> &'static [Hint] {
         "confirm" => CONFIRM,
         "help" => HELP,
         "filter" => FILTER,
-        "picker" => PICKER,
+        "picker" => PICKER_FOLDER_HINTS,
         _ => FILES,
     }
 }
@@ -310,7 +410,7 @@ mod tests {
     fn footers_only_name_real_keys() {
         let keys = key_names();
         for view in [
-            "files", "findings", "detail", "buckets", "confirm", "help", "filter", "picker",
+            "files", "findings", "detail", "buckets", "confirm", "help", "filter",
         ] {
             for hint in footer_hints(view) {
                 for n in hint_names(hint.key) {
@@ -318,12 +418,49 @@ mod tests {
                 }
             }
         }
+        // The picker reads raw keys: its footers name its own keys.
+        let picker = [
+            footer_hints("picker"),
+            PICKER_FOLDER_HINTS,
+            PICKER_PLACES_HINTS,
+            PICKER_PROMPT_HINTS,
+        ];
+        for hint in picker.iter().flat_map(|hints| hints.iter()) {
+            for n in hint_names(hint.key) {
+                assert!(PICKER_KEYS.contains(&n), "picker footer names {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn picker_help_covers_every_picker_key_and_nothing_else() {
+        let help: BTreeSet<&str> = PICKER_HELP
+            .iter()
+            .flat_map(|(_, hints)| hints.iter())
+            .flat_map(|hint| hint_names(hint.key))
+            .collect();
+        let keys: BTreeSet<&str> = PICKER_KEYS.iter().copied().collect();
+        let missing: Vec<_> = keys.difference(&help).collect();
+        let extra: Vec<_> = help.difference(&keys).collect();
+        assert!(
+            missing.is_empty(),
+            "picker keys missing from help: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "picker help lists unhandled keys: {extra:?}"
+        );
+        assert!(!keys.contains("q"), "q is never a picker key");
     }
 
     #[test]
     fn picker_footer_lists_its_keys_in_order() {
         let keys: Vec<&str> = footer_hints("picker").iter().map(|h| h.key).collect();
-        assert_eq!(keys, ["up/dn", "right", "left", "enter", "tab", "esc"]);
+        assert_eq!(keys, ["up/dn", "enter", "left", "s", "/", "?", "esc"]);
+        let keys: Vec<&str> = PICKER_PLACES_HINTS.iter().map(|h| h.key).collect();
+        assert_eq!(keys, ["up/dn", "enter", "/", "?", "esc"]);
+        let keys: Vec<&str> = PICKER_PROMPT_HINTS.iter().map(|h| h.key).collect();
+        assert_eq!(keys, ["enter", "tab", "esc"]);
         assert!(footer_hints("files").iter().any(|h| h.key == "o"));
     }
 
@@ -359,7 +496,15 @@ mod tests {
 
     #[test]
     fn hints_are_ascii() {
-        for (title, hints) in HELP_GROUPS {
+        let footers = [
+            PICKER_FOLDER_HINTS,
+            PICKER_PLACES_HINTS,
+            PICKER_PROMPT_HINTS,
+        ];
+        for hint in footers.iter().flat_map(|f| f.iter()) {
+            assert!(hint.key.is_ascii() && hint.label.is_ascii(), "{}", hint.key);
+        }
+        for (title, hints) in HELP_GROUPS.iter().chain(PICKER_HELP) {
             assert!(title.is_ascii());
             for hint in *hints {
                 assert!(hint.key.is_ascii() && hint.label.is_ascii(), "{}", hint.key);

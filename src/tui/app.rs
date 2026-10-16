@@ -15,23 +15,28 @@
 
 #![cfg(feature = "tui")]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::edit::deattribute;
 use crate::edit::{self, Risk};
 use crate::model::{
     Bucket, BucketBy, Confidence, ContainerKind, FileReport, Finding, Marker, Region,
-    RemovalStrategy, Severity, bucketize,
+    RemovalStrategy, bucketize,
 };
-use crate::scan::WindowedFile;
+use crate::scan::walk::CountDelta;
+use crate::scan::{Scanned, WindowedFile};
 
+use super::explorer::{self, Explorer, FolderState, Row, find_report};
 use super::keymap::Key;
+use super::listing::Listing;
 use super::picker::{PickOutcome, Picker};
+use super::progress::{Activity, Progress, Silent};
 use super::theme::Tone;
+use super::tree::{Tree, subtree};
 
 /// Run the interactive view. With a path it scans that folder right away;
 /// without one it opens on the folder picker. Sets up and tears down the
@@ -46,6 +51,8 @@ pub const MSG_MAGIC: &str = "Refused: this edit would overwrite the file's magic
 pub const MSG_LOCKED: &str = "Another meownary process is editing. Try again when it finishes.";
 pub const MSG_QUIT_ARMED: &str = "Press Esc again to quit, or press q.";
 pub const MSG_NEVER_MIND: &str = "Cancelled. Nothing changed.";
+pub const MSG_UNDO_RUNS: &str = "Undo cannot be stopped. It finishes on its own.";
+pub const MSG_QUIT_AFTER_UNDO: &str = "Quitting when the undo finishes.";
 
 /// Which list has focus on the main screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +238,9 @@ pub enum Effect {
     /// Suspend and open this file in the external editor.
     Edit(PathBuf),
     Undo,
+    /// Ask the work running off the input thread to stop: a plan is dropped
+    /// at once, copies and edits end after the file they are on.
+    Stop,
 }
 
 /// Bytes around a finding, read for the detail view.
@@ -297,8 +307,16 @@ pub struct SavedItem {
 /// a key typed meanwhile never acts on a plan nobody has seen yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Busy {
+    /// Building a deattribute plan.
     Planning,
+    /// Writing a confirmed plan's deattributed copies.
     Writing,
+    /// Scrubbing confirmed markers.
+    Scrubbing,
+    /// Moving confirmed files to the trash.
+    Deleting,
+    /// Undoing the last batch.
+    Undoing,
 }
 
 impl Busy {
@@ -307,8 +325,25 @@ impl Busy {
         match self {
             Busy::Planning => "Planning...",
             Busy::Writing => "Writing copies...",
+            Busy::Scrubbing => "Scrubbing...",
+            Busy::Deleting => "Deleting...",
+            Busy::Undoing => "Undoing...",
         }
     }
+
+    /// Whether Esc can stop this work. An undo always runs to the end.
+    pub fn stoppable(self) -> bool {
+        self != Busy::Undoing
+    }
+}
+
+/// A copy of the picks, taken when a job starts, so only those are cleared
+/// when it ends.
+#[derive(Debug, Clone, Default)]
+struct Picks {
+    files: BTreeSet<PathBuf>,
+    findings: BTreeSet<(PathBuf, usize)>,
+    dirs: BTreeSet<PathBuf>,
 }
 
 /// Everything a deattribute plan is built from, so it can be built on a
@@ -333,6 +368,10 @@ pub struct CopiesOutcome {
     /// Fresh reports for copies under the scanned root, each with the
     /// original it was made from.
     pub copies: Vec<(PathBuf, FileReport)>,
+    /// Writing stopped early at the user's request.
+    pub stopped: bool,
+    /// Files whose copies a stop left unwritten.
+    pub not_written: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -341,6 +380,21 @@ pub struct Stats {
     pub removable: usize,
     pub alerts: usize,
 }
+
+/// The most common signatures under a folder, as last worked out.
+#[derive(Debug, Clone)]
+struct Signatures {
+    path: PathBuf,
+    stamp: u64,
+    at: u64,
+    top: Vec<(String, usize)>,
+}
+
+/// How often the buckets regroup while the scan streams in.
+const BUCKETS_EVERY_MS: u64 = 500;
+/// How often a folder's signatures are counted again while the scan streams
+/// in.
+const SIGNATURES_EVERY_MS: u64 = 300;
 
 /// The whole interactive state.
 pub struct App {
@@ -353,14 +407,24 @@ pub struct App {
     pub pane: Pane,
     pub overlay: Option<Overlay>,
     pub filter: Filter,
-    visible: Vec<usize>,
-    stats: Stats,
     pub file_cursor: usize,
     pub file_offset: usize,
     pub finding_cursor: usize,
     pub finding_offset: usize,
     pub picked_files: BTreeSet<PathBuf>,
     pub picked_findings: BTreeSet<(PathBuf, usize)>,
+    /// Folders picked in the files list: an action covers every file under
+    /// them.
+    pub picked_dirs: BTreeSet<PathBuf>,
+    /// Every folder holding scanned files, with what is under it added up.
+    tree: Tree,
+    /// The folder the files list shows, and its rows.
+    explorer: Explorer,
+    /// The most common signatures under the highlighted folder, kept until
+    /// that folder changes.
+    signatures: Option<Signatures>,
+    /// When the buckets were last regrouped, on the animation clock.
+    buckets_at: Option<u64>,
     pub bucket_by: BucketBy,
     buckets: Vec<Bucket>,
     pub bucket_cursor: usize,
@@ -396,12 +460,29 @@ pub struct App {
     /// nothing before that, so a key queued ahead of the modal cannot
     /// confirm it.
     pub confirm_drawn: bool,
+    /// What the running job last reported, for the activity row.
+    pub activity: Option<Activity>,
+    /// When the running job started, on the animation clock.
+    pub busy_since: u64,
+    /// The running job was asked to stop after its current item.
+    pub stopping: bool,
+    /// Quit once the running job has ended.
+    pub quit_after: bool,
+    /// Why Esc did not stop the running job, for the activity row.
+    pub busy_note: Option<&'static str>,
+    /// The picks the running job (or the plan awaiting its confirm) was
+    /// built from.
+    job_picks: Option<Picks>,
+    /// Caveats for the deattribute plan being built: folders that were
+    /// still being scanned when it was asked for.
+    pub plan_caveats: Vec<String>,
 }
 
 impl App {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            root: root.clone(),
             reports: Vec::new(),
             scanning: true,
             total: None,
@@ -409,14 +490,17 @@ impl App {
             pane: Pane::Files,
             overlay: None,
             filter: Filter::None,
-            visible: Vec::new(),
-            stats: Stats::default(),
             file_cursor: 0,
             file_offset: 0,
             finding_cursor: 0,
             finding_offset: 0,
             picked_files: BTreeSet::new(),
             picked_findings: BTreeSet::new(),
+            picked_dirs: BTreeSet::new(),
+            tree: Tree::new(&root),
+            explorer: Explorer::new(&root),
+            signatures: None,
+            buckets_at: None,
             bucket_by: BucketBy::Category,
             buckets: Vec::new(),
             bucket_cursor: 0,
@@ -437,6 +521,13 @@ impl App {
             copies: HashMap::new(),
             busy: None,
             confirm_drawn: false,
+            activity: None,
+            busy_since: 0,
+            stopping: false,
+            quit_after: false,
+            busy_note: None,
+            job_picks: None,
+            plan_caveats: Vec::new(),
         }
     }
 
@@ -462,6 +553,21 @@ impl App {
         self.picker.is_some()
     }
 
+    /// Text the picker takes in one piece: a bracketed paste, or (with
+    /// `burst`) keys that came too fast to be typed by hand, which become
+    /// prompt text instead of commands. A key sheet over the picker closes.
+    pub fn picker_text(&mut self, text: &str, burst: bool) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        self.overlay = None;
+        if burst {
+            picker.on_burst(text);
+        } else {
+            picker.on_paste(text);
+        }
+    }
+
     /// Leave the picker for a fresh main view over `root`: picks, filter and
     /// old reports are dropped. Only the animation clock carries over.
     fn begin(&mut self, root: PathBuf) {
@@ -472,60 +578,149 @@ impl App {
 
     // ---- data in -------------------------------------------------------
 
-    /// Add freshly scanned reports (one drained batch). The list stays sorted
-    /// by path while the scan streams in, so nothing reshuffles at the end.
-    /// A path already listed keeps its report: a copy written and rescanned
-    /// while the scan streams would otherwise show up twice.
-    pub fn push_reports(&mut self, mut batch: Vec<FileReport>) {
-        batch.sort_by(|a, b| a.path.cmp(&b.path));
-        batch.dedup_by(|a, b| a.path == b.path);
-        batch.retain(|r| {
-            self.reports
-                .binary_search_by(|have| have.path.cmp(&r.path))
-                .is_err()
-        });
+    /// Add freshly scanned reports (one drained batch), as
+    /// [`App::push_scanned`] does without reasons.
+    pub fn push_reports(&mut self, batch: Vec<FileReport>) {
+        let batch = batch
+            .into_iter()
+            .map(|report| Scanned {
+                report,
+                error: None,
+            })
+            .collect();
+        self.push_scanned(batch);
+    }
+
+    /// Add one drained batch of scanned entries. Every entry moves the
+    /// scan's progress and frontier, repeats included (the walk counted
+    /// them), and a folder that could not be listed goes to its folder row,
+    /// never the files. The list stays sorted by path while the scan
+    /// streams in, so nothing reshuffles at the end. A path already listed
+    /// keeps its report: a copy written and rescanned while the scan streams
+    /// would otherwise show up twice.
+    pub fn push_scanned(&mut self, batch: Vec<Scanned>) {
         if batch.is_empty() {
             return;
         }
-        self.reports.extend(batch);
-        // Two sorted runs: the stable sort merges them in linear time.
-        self.reports.sort_by(|a, b| a.path.cmp(&b.path));
-        self.refresh();
+        let keep = self.cursor_path();
+        let mut created = Vec::new();
+        for s in &batch {
+            self.tree.entry(&s.report.path, &mut created);
+        }
+        let mut files = Vec::with_capacity(batch.len());
+        for s in batch {
+            match s.error.as_deref() {
+                Some(why) if s.report.partial && is_folder_reason(why) => {
+                    self.tree.add_unreadable(&s.report.path, why, &mut created)
+                }
+                _ => files.push(s),
+            }
+        }
+        files.sort_by(|a, b| a.report.path.cmp(&b.report.path));
+        files.dedup_by(|a, b| a.report.path == b.report.path);
+        files.retain(|s| find_report(&self.reports, &s.report.path).is_none());
+        for s in &files {
+            self.tree.add(&s.report, s.error.as_deref(), &mut created);
+        }
+        let paths: Vec<PathBuf> = files.iter().map(|s| s.report.path.clone()).collect();
+        // The walk hands files over in path order, so a batch nearly always
+        // sorts after everything listed; otherwise the stable sort merges the
+        // two sorted runs in linear time.
+        let appends = match (self.reports.last(), paths.first()) {
+            (Some(last), Some(first)) => *first > last.path,
+            _ => true,
+        };
+        self.reports.extend(files.into_iter().map(|s| s.report));
+        if !appends {
+            self.reports.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        let added: Vec<&FileReport> = paths
+            .iter()
+            .filter_map(|p| find_report(&self.reports, p))
+            .collect();
+        self.explorer
+            .absorb(&self.tree, &created, &added, &self.filter);
+        self.refresh(keep);
     }
 
-    /// The scan finished: sort by path, keeping the cursor on its file.
+    /// Fold in one of the walk's count deltas.
+    pub fn counted(&mut self, delta: &CountDelta) {
+        self.tree.counted(delta);
+    }
+
+    /// The scan finished: every folder is complete.
     pub fn scan_done(&mut self) {
+        let keep = self.cursor_path();
         self.scanning = false;
         self.reports.sort_by(|a, b| a.path.cmp(&b.path));
-        self.refresh();
+        self.buckets_at = None;
+        self.refresh(keep);
     }
 
-    /// Replace the report for `new.path` in place (or add it).
+    /// Replace the report for `new.path` in place (or add it). Not a scanned
+    /// entry, so the scan's progress stays where it is.
     pub fn replace_report(&mut self, new: FileReport) {
+        let keep = self.cursor_path();
         self.picked_findings.retain(|(p, _)| *p != new.path);
-        match self.reports.iter_mut().find(|r| r.path == new.path) {
-            Some(slot) => *slot = new,
-            None => {
-                let at = self
-                    .reports
-                    .binary_search_by(|r| r.path.cmp(&new.path))
-                    .unwrap_or_else(|i| i);
-                self.reports.insert(at.min(self.reports.len()), new);
+        match self.reports.binary_search_by(|r| r.path.cmp(&new.path)) {
+            Ok(at) => {
+                self.tree.replace(&self.reports[at], &new);
+                self.reports[at] = new;
+                self.explorer.recheck(&self.reports[at], &self.filter);
+            }
+            Err(at) => {
+                let mut created = Vec::new();
+                self.tree.add(&new, None, &mut created);
+                self.reports.insert(at, new);
+                let added = [&self.reports[at]];
+                self.explorer
+                    .absorb(&self.tree, &created, &added, &self.filter);
             }
         }
         self.hex = None;
-        self.refresh();
+        self.refresh(keep);
     }
 
     /// Drop the report for `path` (its file went to the trash).
     pub fn remove_report(&mut self, path: &Path) {
+        let keep = self.cursor_path();
         self.saved.remove(path);
         self.copies.remove(path);
-        self.reports.retain(|r| r.path != path);
+        if let Ok(at) = self
+            .reports
+            .binary_search_by(|r| r.path.as_path().cmp(path))
+        {
+            let gone = self.reports.remove(at);
+            self.tree.remove(&gone);
+        }
+        self.explorer.forget(&self.tree, path);
         self.picked_files.remove(path);
         self.picked_findings.retain(|(p, _)| p != path);
         self.hex = None;
-        self.refresh();
+        self.refresh(keep);
+    }
+
+    /// The folder whose listing the files list still lacks, for the runtime
+    /// to read off the input thread.
+    pub fn listing_request(&self) -> Option<PathBuf> {
+        if self.is_picking() {
+            return None;
+        }
+        self.explorer.listing_request().map(Path::to_path_buf)
+    }
+
+    /// A folder listing the runtime read.
+    pub fn listing_ready(&mut self, listing: Listing) {
+        if self.explorer.listing_ready(listing) {
+            let keep = self.cursor_path();
+            self.rebuild_rows();
+            self.refresh(keep);
+        }
+    }
+
+    /// The listing of `at` could not be read at all.
+    pub fn listing_failed(&mut self, at: &Path) {
+        self.explorer.listing_failed(at);
     }
 
     pub fn reports(&self) -> &[FileReport] {
@@ -533,12 +728,15 @@ impl App {
     }
 
     pub fn has_report(&self, path: &Path) -> bool {
-        self.reports.iter().any(|r| r.path == path)
+        self.reports
+            .binary_search_by(|r| r.path.as_path().cmp(path))
+            .is_ok()
     }
 
     pub fn clear_picks(&mut self) {
         self.picked_files.clear();
         self.picked_findings.clear();
+        self.picked_dirs.clear();
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, tone: Tone) {
@@ -618,27 +816,117 @@ impl App {
         self.copies.contains_key(path) || deattribute::is_deattributed(path)
     }
 
-    /// Start waiting on `work`: edit keys are ignored until it finishes.
+    /// Start waiting on `work`: edit keys are ignored until it finishes. The
+    /// picks a plan or batch is built from are noted, so only those are
+    /// cleared when it ends and picks made meanwhile survive.
     pub fn begin_busy(&mut self, work: Busy) {
+        if work != Busy::Undoing && self.job_picks.is_none() {
+            self.job_picks = Some(Picks {
+                files: self.picked_files.clone(),
+                findings: self.picked_findings.clone(),
+                dirs: self.picked_dirs.clone(),
+            });
+        }
         self.busy = Some(work);
+        self.activity = None;
+        self.stopping = false;
+        self.busy_note = None;
+        self.busy_since = self.anim_ms;
         self.set_status(work.status(), Tone::Info);
+    }
+
+    /// The work running off the input thread ended, whatever its outcome:
+    /// the edit keys work again. A quit asked for while it ran happens now.
+    pub fn end_busy(&mut self) {
+        self.busy = None;
+        self.activity = None;
+        self.stopping = false;
+        self.busy_note = None;
+        if self.quit_after {
+            self.should_quit = true;
+        }
+    }
+
+    /// Clear the picks the ended job was built from; picks made while it ran
+    /// stay.
+    pub fn clear_job_picks(&mut self) {
+        if let Some(p) = self.job_picks.take() {
+            self.picked_files.retain(|f| !p.files.contains(f));
+            self.picked_findings.retain(|f| !p.findings.contains(f));
+            self.picked_dirs.retain(|d| !p.dirs.contains(d));
+        }
+    }
+
+    /// Whether Esc stops the running work now: it can stop, has not been
+    /// asked to yet, and is not rescanning what it changed.
+    pub fn can_stop(&self) -> bool {
+        self.busy.is_some_and(Busy::stoppable)
+            && !self.stopping
+            && !self.activity.as_ref().is_some_and(|a| a.rescanning)
+    }
+
+    /// The work could not run (the trash store would not open, or another
+    /// meownary process holds the lock): say why. Nothing changed, so the
+    /// picks stay.
+    pub fn job_refused(&mut self, text: impl Into<String>, tone: Tone) {
+        self.job_picks = None;
+        self.end_busy();
+        self.set_status(text, tone);
+    }
+
+    /// The work ended without a result: it stopped on an internal error.
+    pub fn job_failed(&mut self) {
+        let Some(work) = self.busy else {
+            return;
+        };
+        self.job_picks = None;
+        self.end_busy();
+        let text = match work {
+            Busy::Planning => "Planning stopped on an internal error. Nothing changed.",
+            Busy::Writing => {
+                "Writing copies stopped on an internal error. The originals are unchanged."
+            }
+            Busy::Scrubbing | Busy::Deleting => {
+                "That action stopped on an internal error. Press u to undo any part that landed."
+            }
+            Busy::Undoing => "Undo stopped on an internal error.",
+        };
+        self.set_status(text, Tone::Bad);
     }
 
     /// A deattribute plan finished building: offer it, or say why not.
     pub fn plan_ready(&mut self, plan: Result<Plan, String>) {
-        self.busy = None;
+        self.end_busy();
         self.status = None;
+        if plan.is_err() {
+            self.job_picks = None;
+        }
+        let caveats = std::mem::take(&mut self.plan_caveats);
+        let plan = plan.map(|mut plan| {
+            plan.caveats.splice(0..0, caveats);
+            plan
+        });
         self.offer(plan);
     }
 
-    /// The copies of a confirmed deattribute plan were written (or not).
-    /// Write failures are listed before the plan's own skips.
+    /// The copies of a confirmed deattribute plan were written (or not), or
+    /// writing stopped early. Write failures are listed before the plan's
+    /// own skips.
     pub fn copies_written(&mut self, plan_skips: &[String], out: CopiesOutcome) {
-        self.busy = None;
-        self.clear_picks();
+        self.end_busy();
+        self.clear_job_picks();
         let mut skipped = out.failed;
         skipped.extend(plan_skips.iter().cloned());
         self.record_saved(SavedKind::Deattributed, &out.saved, &skipped, &[]);
+        if out.stopped {
+            self.status = Some(stopped_status(
+                PlanKind::Deattribute,
+                out.saved.len(),
+                out.not_written,
+                &skipped,
+                &[],
+            ));
+        }
         if let (Some(first), Some(status)) = (out.unverified.first(), self.status.as_mut()) {
             if status.text.ends_with('.') {
                 status.text.pop();
@@ -746,34 +1034,36 @@ impl App {
         Status { text, tone }
     }
 
-    fn refresh(&mut self) {
-        let keep = self.current_file().map(|r| r.path.clone());
-        self.visible = (0..self.reports.len())
-            .filter(|&i| file_match(&self.filter, &self.reports[i]) != Match::None)
-            .collect();
-        if let Some(p) = keep
-            && let Some(pos) = self.visible.iter().position(|&i| self.reports[i].path == p)
+    /// The highlighted row's path. A change to the rows captures it first,
+    /// while the cursor still points where it did, and hands it to
+    /// [`App::refresh`], so an insert or removal above never moves the
+    /// highlight.
+    fn cursor_path(&self) -> Option<PathBuf> {
+        self.rows().get(self.file_cursor).map(|r| r.path.clone())
+    }
+
+    fn refresh(&mut self, keep: Option<PathBuf>) {
+        // A row asked for on entering a folder wins once it shows up.
+        let wanted = self
+            .explorer
+            .want
+            .clone()
+            .filter(|w| self.rows().iter().any(|r| r.path == *w));
+        if wanted.is_some() {
+            self.explorer.want = None;
+        }
+        if let Some(p) = wanted.or(keep)
+            && let Some(pos) = self.rows().iter().position(|r| r.path == p)
         {
             self.file_cursor = pos;
         }
-        self.file_cursor = clamp(self.file_cursor, self.visible.len());
+        self.file_cursor = clamp(self.file_cursor, self.rows().len());
         let n = self.current_findings().len();
         self.finding_cursor = clamp(self.finding_cursor, n);
-        self.stats = Stats::default();
-        for r in &self.reports {
-            if !r.findings.is_empty() {
-                self.stats.flagged += 1;
-            }
-            self.stats.removable += r.findings.iter().filter(|f| f.is_removable()).count();
-            self.stats.alerts += r
-                .findings
-                .iter()
-                .filter(|f| f.severity == Severity::Alert)
-                .count();
-        }
-        // Buckets are only kept current while their screen is up.
-        if self.screen == Screen::Buckets {
-            self.buckets = bucketize(&self.reports, self.bucket_by);
+        // Buckets are only kept current while their screen is up, and at
+        // most twice a second while the scan streams in.
+        if self.screen == Screen::Buckets && self.buckets_due() {
+            self.regroup();
         }
         self.bucket_cursor = clamp(self.bucket_cursor, self.buckets.len());
         if self.screen == Screen::Detail && self.current_finding().is_none() {
@@ -781,21 +1071,194 @@ impl App {
         }
     }
 
-    // ---- queries -------------------------------------------------------
-
-    pub fn stats(&self) -> Stats {
-        self.stats
+    fn buckets_due(&self) -> bool {
+        !self.scanning
+            || self
+                .buckets_at
+                .is_none_or(|at| self.anim_ms >= at.saturating_add(BUCKETS_EVERY_MS))
     }
 
-    /// Indices into `reports()` of the files the filter lets through.
-    pub fn visible(&self) -> &[usize] {
-        &self.visible
+    /// Group the findings under the cwd into buckets again.
+    fn regroup(&mut self) {
+        let range = self.range_of(self.explorer.cwd());
+        self.buckets = bucketize(&self.reports[range], self.bucket_by);
+        self.buckets_at = Some(self.anim_ms);
+    }
+
+    /// Lay the files list out again for the cwd and the filter.
+    fn rebuild_rows(&mut self) {
+        self.explorer
+            .rebuild(&self.tree, &self.reports, &self.filter);
+    }
+
+    // ---- queries -------------------------------------------------------
+
+    /// Counts for the whole scan, from the tree's root.
+    pub fn stats(&self) -> Stats {
+        let a = self.tree.root_agg();
+        Stats {
+            flagged: a.flagged,
+            removable: a.removable,
+            alerts: a.alerts(),
+        }
+    }
+
+    /// The rows of the files list: the cwd's folders and files, or with a
+    /// filter on, the matching files under it.
+    pub fn rows(&self) -> &[Row] {
+        self.explorer.rows()
+    }
+
+    pub fn current_row(&self) -> Option<&Row> {
+        self.rows().get(self.file_cursor)
+    }
+
+    /// The highlighted folder, when a folder row is highlighted.
+    pub fn current_folder(&self) -> Option<&Path> {
+        self.current_row()
+            .filter(|r| r.dir)
+            .map(|r| r.path.as_path())
+    }
+
+    /// The report at `path`.
+    pub fn report(&self, path: &Path) -> Option<&FileReport> {
+        find_report(&self.reports, path)
     }
 
     pub fn current_file(&self) -> Option<&FileReport> {
-        self.visible
-            .get(self.file_cursor)
-            .and_then(|&i| self.reports.get(i))
+        let row = self.current_row().filter(|r| !r.dir)?;
+        self.report(&row.path)
+    }
+
+    /// The folder the files list shows.
+    pub fn cwd(&self) -> &Path {
+        self.explorer.cwd()
+    }
+
+    pub fn at_root(&self) -> bool {
+        self.explorer.at_root()
+    }
+
+    pub fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    /// The reports under `dir`: a contiguous run, or every report at the
+    /// root.
+    fn range_of(&self, dir: &Path) -> std::ops::Range<usize> {
+        if dir == self.root {
+            0..self.reports.len()
+        } else {
+            subtree(&self.reports, dir)
+        }
+    }
+
+    /// Files under the cwd, at any depth.
+    pub fn cwd_files(&self) -> usize {
+        if self.at_root() {
+            return self.tree.root_agg().files;
+        }
+        self.tree
+            .find(self.cwd())
+            .map_or(0, |i| self.tree.node(i).agg.files)
+    }
+
+    /// The state a folder row shows.
+    pub fn folder_state(&self, row: &Row) -> FolderState {
+        explorer::folder_state(&self.tree, &row.path, row.listed, self.scanning)
+    }
+
+    /// Whether the scan is done with `path`, so a listed entry it never
+    /// delivered was left out.
+    pub fn is_final(&self, path: &Path) -> bool {
+        explorer::is_final(&self.tree, path, self.scanning)
+    }
+
+    /// Whether the scan has yet to finish `dir`.
+    pub fn still_scanning(&self, dir: &Path) -> bool {
+        !self.is_final(dir)
+    }
+
+    /// Why the cwd could not be listed, when it could not.
+    pub fn cwd_unreadable(&self) -> Option<&str> {
+        let i = self.tree.find(self.cwd())?;
+        self.tree.node(i).unreadable.as_deref()
+    }
+
+    /// Whether the root has subfolders, so the idle hint can point at Enter.
+    pub fn has_subfolders(&self) -> bool {
+        !self.tree.node(0).children.is_empty() || self.explorer.lists_folders(&self.root)
+    }
+
+    /// The path from the root down to the cwd, as the files pane titles it.
+    pub fn breadcrumb(&self) -> String {
+        let base = explorer::name_of(&self.root);
+        match self.cwd().strip_prefix(&self.root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => {
+                format!("{base}{}{}", std::path::MAIN_SEPARATOR, rel.display())
+            }
+            _ => base,
+        }
+    }
+
+    /// The cwd's own name.
+    pub fn cwd_name(&self) -> String {
+        explorer::name_of(self.cwd())
+    }
+
+    /// The scan's progress: entries delivered, out of how many, and whether
+    /// that count is final. `None` until the walk has counted anything.
+    pub fn scan_progress(&self) -> Option<(usize, usize, bool)> {
+        let done = self.tree.scanned();
+        if let Some(t) = self.total {
+            return Some((done, t.max(done), true));
+        }
+        let counted = self.tree.counts().total() as usize;
+        (counted > 0).then_some((done, counted.max(done), false))
+    }
+
+    /// The folder the scan is in, as shown.
+    pub fn scanning_folder(&self) -> Option<String> {
+        let f = self.tree.frontier()?;
+        let dir = if f == self.root {
+            f
+        } else {
+            f.parent().unwrap_or(f)
+        };
+        Some(self.display_path(dir))
+    }
+
+    /// The five most common signatures under `dir`, each with its count.
+    /// Kept per folder until something under it changes, and while the scan
+    /// streams in, worked out again at most every 300 ms.
+    pub fn folder_signatures(&mut self, dir: &Path) -> Vec<(String, usize)> {
+        let stamp = self.tree.find(dir).map_or(0, |i| self.tree.node(i).stamp());
+        if let Some(c) = &self.signatures
+            && c.path == dir
+            && (c.stamp == stamp
+                || (self.scanning && self.anim_ms < c.at.saturating_add(SIGNATURES_EVERY_MS)))
+        {
+            return c.top.clone();
+        }
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for r in &self.reports[self.range_of(dir)] {
+            for f in &r.findings {
+                *counts.entry(f.signature_id.as_str()).or_default() += 1;
+            }
+        }
+        let mut top: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(s, n)| (s.to_string(), n))
+            .collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top.truncate(5);
+        self.signatures = Some(Signatures {
+            path: dir.to_path_buf(),
+            stamp,
+            at: self.anim_ms,
+            top: top.clone(),
+        });
+        top
     }
 
     /// Indices into the current file's findings that the filter lets
@@ -832,11 +1295,15 @@ impl App {
     }
 
     pub fn picked(&self) -> usize {
-        self.picked_files.len() + self.picked_findings.len()
+        self.picked_files.len() + self.picked_findings.len() + self.picked_dirs.len()
     }
 
     pub fn is_file_picked(&self, p: &Path) -> bool {
         self.picked_files.contains(p)
+    }
+
+    pub fn is_dir_picked(&self, p: &Path) -> bool {
+        self.picked_dirs.contains(p)
     }
 
     pub fn is_finding_picked(&self, p: &Path, idx: usize) -> bool {
@@ -850,18 +1317,19 @@ impl App {
 
     /// The scan line: progress while scanning, a summary after.
     pub fn scan_line(&self) -> String {
-        let n = self.reports.len();
+        let n = self.tree.scanned();
         let shown = thousands(n);
         if self.scanning {
-            return match self.total {
-                Some(t) => format!("Scanning {shown} of {} files...", thousands(t)),
+            return match self.scan_progress() {
+                Some((_, of, true)) => format!("Scanning {shown} of {} files", thousands(of)),
+                Some((_, of, false)) => format!("Scanning {shown} of {}+ files", thousands(of)),
                 None => format!("Scanning {shown} {}...", plural(n, "file", "files")),
             };
         }
         if n == 0 {
             return "No files to scan.".to_string();
         }
-        let s = self.stats;
+        let s = self.stats();
         if s.flagged == 0 {
             return format!(
                 "Scanned {shown} {}. No findings.",
@@ -901,8 +1369,24 @@ impl App {
     /// Handle one key event.
     pub fn on_key(&mut self, ev: KeyEvent) -> Effect {
         if let Some(picker) = self.picker.as_mut() {
+            if ev.kind == KeyEventKind::Release {
+                return Effect::None;
+            }
+            if matches!(self.overlay, Some(Overlay::Help)) {
+                // Any key closes the picker's key sheet; ctrl+c still quits.
+                let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+                if ctrl && ev.code == KeyCode::Char('c') {
+                    return self.quit();
+                }
+                self.overlay = None;
+                return Effect::None;
+            }
             return match picker.on_key(ev) {
                 PickOutcome::Stay => Effect::None,
+                PickOutcome::Help => {
+                    self.overlay = Some(Overlay::Help);
+                    Effect::None
+                }
                 PickOutcome::Quit => self.quit(),
                 PickOutcome::Back => {
                     // Reopened over a view: that view, and any scan still
@@ -935,7 +1419,7 @@ impl App {
             _ => String::new(),
         };
         match ev.code {
-            KeyCode::Char('c') if ctrl => return self.quit(),
+            KeyCode::Char('c') if ctrl => return self.stop_or_quit(),
             KeyCode::Enter => {
                 self.overlay = None;
                 return Effect::None;
@@ -970,12 +1454,19 @@ impl App {
             self.quit_armed = false;
         }
         if key == Key::Interrupt {
-            return self.quit();
+            return self.stop_or_quit();
         }
         if let Some(work) = self.busy
             && matches!(
                 key,
-                Key::Scrub | Key::Deattribute | Key::DeepDeattribute | Key::Delete | Key::Yes
+                Key::Scrub
+                    | Key::Deattribute
+                    | Key::DeepDeattribute
+                    | Key::Delete
+                    | Key::Yes
+                    | Key::Undo
+                    | Key::Editor
+                    | Key::Open
             )
         {
             self.set_status(work.status(), Tone::Info);
@@ -998,6 +1489,7 @@ impl App {
                     }
                     Key::No | Key::Esc | Key::Quit => {
                         self.overlay = None;
+                        self.job_picks = None;
                         self.set_status(MSG_NEVER_MIND, Tone::Info);
                     }
                     Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => {
@@ -1024,17 +1516,11 @@ impl App {
                 }
                 Effect::None
             }
-            Key::Left | Key::Right => {
-                if self.screen == Screen::Main {
-                    self.pane = if key == Key::Left {
-                        Pane::Files
-                    } else {
-                        Pane::Findings
-                    };
-                }
+            Key::Left | Key::Backspace => {
+                self.left();
                 Effect::None
             }
-            Key::Enter => self.enter(),
+            Key::Right | Key::Enter => self.enter(),
             Key::Esc => self.back(),
             Key::Space => {
                 self.toggle_pick();
@@ -1078,14 +1564,63 @@ impl App {
                 self.overlay = Some(Overlay::Help);
                 Effect::None
             }
-            Key::Quit | Key::Interrupt => self.quit(),
-            Key::Yes | Key::No | Key::Backspace => Effect::None,
+            Key::Quit | Key::Interrupt => self.stop_or_quit(),
+            Key::Yes | Key::No => Effect::None,
         }
     }
 
     fn quit(&mut self) -> Effect {
         self.should_quit = true;
         Effect::Quit
+    }
+
+    /// Ask the work running off the input thread to stop; with `quit`, the
+    /// view ends once it has. `Some` carries what the runtime must do, and the
+    /// key then does nothing else; `None` means nothing was running.
+    ///
+    /// A plan is dropped at once: nothing is written while planning. Copies
+    /// and edits end after the file they are on, so none is left half done.
+    /// An undo always runs to the end, and says so. A second quit request
+    /// while waiting leaves at once, without waiting for the work.
+    pub fn stop_request(&mut self, quit: bool) -> Option<Effect> {
+        let work = self.busy?;
+        if quit && self.quit_after {
+            return Some(self.quit());
+        }
+        self.quit_after |= quit;
+        match work {
+            Busy::Planning => {
+                self.job_picks = None;
+                self.end_busy();
+                self.set_status(MSG_NEVER_MIND, Tone::Info);
+                Some(Effect::Stop)
+            }
+            Busy::Undoing => {
+                self.busy_note = Some(if self.quit_after {
+                    MSG_QUIT_AFTER_UNDO
+                } else {
+                    MSG_UNDO_RUNS
+                });
+                Some(Effect::None)
+            }
+            Busy::Writing | Busy::Scrubbing | Busy::Deleting => {
+                self.stopping = true;
+                Some(Effect::Stop)
+            }
+        }
+    }
+
+    /// Stop what is running and quit afterwards, or quit now.
+    fn stop_or_quit(&mut self) -> Effect {
+        match self.stop_request(true) {
+            Some(effect) => effect,
+            None => self.quit(),
+        }
+    }
+
+    /// Where `o` opens the picker: the folder the view is showing.
+    pub fn reopen_target(&self) -> &Path {
+        self.explorer.cwd()
     }
 
     fn navigate(&mut self, key: Key) {
@@ -1101,7 +1636,8 @@ impl App {
             Screen::Main => match self.pane {
                 Pane::Files => {
                     let before = self.file_cursor;
-                    self.file_cursor = step(self.file_cursor, self.visible.len(), key, page);
+                    self.file_cursor = step(self.file_cursor, self.rows().len(), key, page);
+                    self.explorer.want = None;
                     if self.file_cursor != before {
                         self.finding_cursor = 0;
                         self.finding_offset = 0;
@@ -1116,21 +1652,30 @@ impl App {
         }
     }
 
+    /// Enter, Right and `l`: open the highlighted folder, focus a file's
+    /// findings, open a finding's detail, or show a bucket.
     fn enter(&mut self) -> Effect {
         match self.screen {
-            Screen::Main => match self.pane {
-                Pane::Files => {
-                    if self.current_findings().is_empty() {
-                        if self.current_file().is_some() {
-                            self.set_status("This file has no findings.", Tone::Good);
-                        }
-                    } else {
-                        self.pane = Pane::Findings;
-                    }
-                    Effect::None
+            Screen::Main => {
+                if let Some(dir) = self.current_folder().map(Path::to_path_buf) {
+                    self.open_folder(&dir);
+                    self.pane = Pane::Files;
+                    return Effect::None;
                 }
-                Pane::Findings => self.open_detail(),
-            },
+                match self.pane {
+                    Pane::Files => {
+                        if !self.current_findings().is_empty() {
+                            self.pane = Pane::Findings;
+                        } else if self.current_file().is_some() {
+                            self.set_status("This file has no findings.", Tone::Good);
+                        } else if self.current_row().is_some() {
+                            self.set_status("This file has not been scanned.", Tone::Info);
+                        }
+                        Effect::None
+                    }
+                    Pane::Findings => self.open_detail(),
+                }
+            }
             Screen::Buckets => {
                 if let Some(b) = self.buckets.get(self.bucket_cursor).cloned() {
                     self.screen = Screen::Main;
@@ -1145,6 +1690,73 @@ impl App {
             }
             Screen::Detail => Effect::None,
         }
+    }
+
+    /// Left, `h` and Backspace: back out of the detail or the buckets, back
+    /// to the files from the findings, or up a folder in the files.
+    fn left(&mut self) {
+        match self.screen {
+            Screen::Detail | Screen::Buckets => self.screen = Screen::Main,
+            Screen::Main if self.pane == Pane::Findings => self.pane = Pane::Files,
+            Screen::Main => self.go_up(),
+        }
+    }
+
+    /// Show `dir` in the files list, highlighting the row it last had.
+    pub fn open_folder(&mut self, dir: &Path) {
+        if let Some(here) = self.cursor_path() {
+            let cwd = self.explorer.cwd().to_path_buf();
+            self.explorer.remember(&cwd, &here);
+        }
+        let back = self.explorer.remembered(dir).map(Path::to_path_buf);
+        self.explorer.set_cwd(dir);
+        self.rebuild_rows();
+        self.file_cursor = 0;
+        self.file_offset = 0;
+        self.finding_cursor = 0;
+        self.finding_offset = 0;
+        self.hex = None;
+        if let Some(p) = back {
+            match self.rows().iter().position(|r| r.path == p) {
+                Some(pos) => self.file_cursor = pos,
+                None => self.explorer.want = Some(p),
+            }
+        }
+        self.refresh(None);
+    }
+
+    /// Go up a folder, highlighting the one just left. Nothing happens at
+    /// the root, or in a single-file scan.
+    pub fn go_up(&mut self) {
+        let from = self.explorer.cwd().to_path_buf();
+        if from == self.root || !from.starts_with(&self.root) {
+            return;
+        }
+        let Some(parent) = from.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        self.explorer.remember(&parent, &from);
+        self.open_folder(&parent);
+    }
+
+    /// Show the file at `path` in its own folder, highlighted, with every
+    /// folder on the way remembering the step down.
+    fn reveal(&mut self, path: &Path) {
+        let Some(dir) = path.parent().filter(|d| d.starts_with(&self.root)) else {
+            return;
+        };
+        let mut at = path;
+        while let Some(up) = at.parent() {
+            self.explorer.remember(up, at);
+            if up == self.root || !up.starts_with(&self.root) {
+                break;
+            }
+            at = up;
+        }
+        self.explorer.set_cwd(dir);
+        self.rebuild_rows();
+        self.file_offset = 0;
+        self.file_cursor = self.rows().iter().position(|r| r.path == path).unwrap_or(0);
     }
 
     fn open_detail(&mut self) -> Effect {
@@ -1174,6 +1786,9 @@ impl App {
             self.pane = Pane::Files;
             return Effect::None;
         }
+        if let Some(effect) = self.stop_request(false) {
+            return effect;
+        }
         if self.quit_armed {
             return self.quit();
         }
@@ -1183,6 +1798,14 @@ impl App {
     }
 
     fn toggle_pick(&mut self) {
+        if self.screen == Screen::Main
+            && let Some(dir) = self.current_folder().map(Path::to_path_buf)
+        {
+            if !self.picked_dirs.remove(&dir) {
+                self.picked_dirs.insert(dir);
+            }
+            return;
+        }
         let on_file = self.screen == Screen::Main && self.pane == Pane::Files;
         if on_file {
             if let Some(p) = self.current_file().map(|r| r.path.clone())
@@ -1211,7 +1834,7 @@ impl App {
                 self.bucket_by = by;
                 self.bucket_cursor = 0;
                 self.bucket_offset = 0;
-                self.buckets = bucketize(&self.reports, by);
+                self.regroup();
             }
             None => {
                 self.screen = Screen::Main;
@@ -1220,10 +1843,17 @@ impl App {
         }
     }
 
-    /// Replace the filter and re-derive the visible list.
+    /// Replace the filter and lay the files list out again. Clearing a
+    /// filter shows the highlighted match in its own folder.
     pub fn set_filter(&mut self, f: Filter) {
+        let keep = self.cursor_path();
+        let reveal = self.filter.is_active() && !f.is_active();
         self.filter = f;
-        self.refresh();
+        self.rebuild_rows();
+        if reveal && let Some(p) = &keep {
+            self.reveal(p);
+        }
+        self.refresh(keep);
     }
 
     fn offer(&mut self, plan: Result<Plan, String>) -> Effect {
@@ -1241,6 +1871,9 @@ impl App {
     fn request_plan(&mut self, mode: deattribute::Mode) -> Effect {
         match self.deattribute_request(mode) {
             Ok(req) => {
+                // Folders still being scanned are named on the confirm, as
+                // they stood when the plan was asked for.
+                self.plan_caveats = self.scan_caveats(&self.selected_folders());
                 self.begin_busy(Busy::Planning);
                 Effect::PlanDeattribute(req)
             }
@@ -1253,7 +1886,8 @@ impl App {
 
     // ---- plans ---------------------------------------------------------
 
-    /// The scrub batch for the current picks, or the highlighted item.
+    /// The scrub batch for the current picks, or the highlighted item. A
+    /// folder covers every removable, non-weak finding under it.
     pub fn scrub_plan(&self) -> Result<Plan, String> {
         let index: HashMap<&Path, usize> = self
             .reports
@@ -1263,6 +1897,7 @@ impl App {
             .collect();
         let mut picks: Vec<(usize, usize)> = Vec::new();
         let mut weak = 0usize;
+        let mut dirs: Vec<&Path> = Vec::new();
         let mut push = |ri: usize, fi: usize, allow_weak: bool, picks: &mut Vec<(usize, usize)>| {
             let Some(f) = self.reports.get(ri).and_then(|r| r.findings.get(fi)) else {
                 return;
@@ -1290,6 +1925,11 @@ impl App {
                     }
                 }
             }
+            dirs.extend(self.picked_dirs.iter().map(PathBuf::as_path));
+        } else if self.screen == Screen::Main
+            && let Some(dir) = self.current_folder()
+        {
+            dirs.push(dir);
         } else if self.screen == Screen::Detail || self.pane == Pane::Findings {
             let Some((r, fi, f)) = self.current_finding() else {
                 return Err(MSG_NOTHING.to_string());
@@ -1307,18 +1947,55 @@ impl App {
                 push(ri, fi, false, &mut picks);
             }
         }
-        self.build_scrub(picks, weak)
+        for dir in &dirs {
+            for ri in self.range_of(dir) {
+                for fi in finding_indices(&self.filter, &self.reports[ri]) {
+                    push(ri, fi, false, &mut picks);
+                }
+            }
+        }
+        let mut plan = self.build_scrub(picks, weak)?;
+        plan.caveats = self.scan_caveats(&dirs);
+        Ok(plan)
     }
 
-    /// Every removable, non-weak member of the highlighted bucket.
+    /// A line for each of `dirs` the scan has yet to finish: files it finds
+    /// there later are not part of an action started now.
+    pub fn scan_caveats(&self, dirs: &[&Path]) -> Vec<String> {
+        dirs.iter()
+            .filter(|d| self.still_scanning(d))
+            .map(|d| {
+                format!(
+                    "{} is still being scanned; files found later are not included.",
+                    self.display_path(d)
+                )
+            })
+            .collect()
+    }
+
+    /// The folders a deattribute would cover: the picked ones, or the
+    /// highlighted one. W2's planner can hand [`App::scan_caveats`] of
+    /// these to the confirm.
+    pub fn selected_folders(&self) -> Vec<&Path> {
+        if !self.picked_dirs.is_empty() {
+            return self.picked_dirs.iter().map(PathBuf::as_path).collect();
+        }
+        if self.picked() == 0 && self.screen == Screen::Main {
+            return self.current_folder().into_iter().collect();
+        }
+        Vec::new()
+    }
+
+    /// Every removable, non-weak member of the highlighted bucket, under the
+    /// cwd.
     pub fn bucket_plan(&self) -> Result<Plan, String> {
         let Some(b) = self.buckets.get(self.bucket_cursor) else {
             return Err(MSG_NOTHING.to_string());
         };
         let mut picks = Vec::new();
         let mut weak = 0;
-        for (ri, r) in self.reports.iter().enumerate() {
-            for (fi, f) in r.findings.iter().enumerate() {
+        for ri in self.range_of(self.cwd()) {
+            for (fi, f) in self.reports[ri].findings.iter().enumerate() {
                 if !f.is_removable() || bucket_key(b.by, f).as_deref() != Some(b.key.as_str()) {
                     continue;
                 }
@@ -1337,14 +2014,18 @@ impl App {
         // (it covers the later ones), and run length-preserving edits first so
         // their offsets stay valid.
         let mut per_file: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut slot: HashMap<usize, usize> = HashMap::new();
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
         for (ri, fi) in picks {
-            match per_file.iter_mut().find(|(r, _)| *r == ri) {
-                Some((_, list)) => {
-                    if !list.contains(&fi) {
-                        list.push(fi);
-                    }
+            if !seen.insert((ri, fi)) {
+                continue;
+            }
+            match slot.get(&ri) {
+                Some(&k) => per_file[k].1.push(fi),
+                None => {
+                    slot.insert(ri, per_file.len());
+                    per_file.push((ri, vec![fi]));
                 }
-                None => per_file.push((ri, vec![fi])),
             }
         }
         let mut items = Vec::new();
@@ -1425,50 +2106,64 @@ impl App {
         plan_deattribute(&self.deattribute_request(mode)?)
     }
 
-    /// The files a deattribute in `mode` would cover: the picks, the
-    /// highlighted bucket's files, or the highlighted file. Only the reports
-    /// are gathered here; reading the files is left to [`plan_deattribute`].
+    /// The files a deattribute in `mode` would cover: the picks (a folder
+    /// covers every file under it, since a deattribute finds credits even
+    /// in files with no findings), the highlighted bucket's files under the
+    /// cwd, or the highlighted folder or file. Only the reports are gathered
+    /// here; reading the files is left to [`plan_deattribute`].
     pub fn deattribute_request(
         &self,
         mode: deattribute::Mode,
     ) -> Result<DeattributeRequest, String> {
-        let mut paths = BTreeSet::new();
-        paths.extend(self.picked_files.iter().cloned());
-        paths.extend(self.picked_findings.iter().map(|(path, _)| path.clone()));
-        if paths.is_empty() {
+        let mut picked: BTreeSet<usize> = BTreeSet::new();
+        let at = |p: &Path| {
+            self.reports
+                .binary_search_by(|r| r.path.as_path().cmp(p))
+                .ok()
+        };
+        picked.extend(self.picked_files.iter().filter_map(|p| at(p)));
+        picked.extend(self.picked_findings.iter().filter_map(|(p, _)| at(p)));
+        let dirs = self.selected_folders();
+        if picked.is_empty() && dirs.is_empty() {
             if self.screen == Screen::Buckets {
                 if let Some(bucket) = self.buckets.get(self.bucket_cursor) {
-                    for report in &self.reports {
-                        if report.findings.iter().any(|finding| {
+                    for ri in self.range_of(self.cwd()) {
+                        if self.reports[ri].findings.iter().any(|finding| {
                             bucket_key(bucket.by, finding).as_deref() == Some(bucket.key.as_str())
                         }) {
-                            paths.insert(report.path.clone());
+                            picked.insert(ri);
                         }
                     }
                 }
             } else if let Some(report) = self.current_file() {
-                paths.insert(report.path.clone());
+                picked.extend(at(&report.path));
             }
         }
-        if paths.is_empty() {
+        for dir in &dirs {
+            picked.extend(self.range_of(dir));
+        }
+        if picked.is_empty() {
             return Err(MSG_NOTHING.to_string());
         }
         Ok(DeattributeRequest {
             root: self.root.clone(),
             mode,
-            reports: self
-                .reports
-                .iter()
-                .filter(|report| paths.contains(&report.path))
-                .cloned()
+            reports: picked
+                .into_iter()
+                .map(|i| self.reports[i].clone())
                 .collect(),
         })
     }
 
-    /// Delete the picked files, or the highlighted one.
+    /// Delete the picked files, or the highlighted one. Folders are never
+    /// deleted whole.
     pub fn delete_plan(&self) -> Result<Plan, String> {
         if self.screen == Screen::Buckets {
             return Err("Select files in the file list to delete them.".to_string());
+        }
+        let on_folder = self.picked_files.is_empty() && self.current_folder().is_some();
+        if !self.picked_dirs.is_empty() || on_folder {
+            return Err("Delete works on files only. Open the folder to pick files.".to_string());
         }
         let targets: Vec<&FileReport> = if self.picked_files.is_empty() {
             self.current_file().into_iter().collect()
@@ -1510,6 +2205,12 @@ impl App {
             scroll: 0,
         })
     }
+}
+
+/// Whether a partial entry's reason says it is a folder that could not be
+/// listed (see `scan::walk`).
+fn is_folder_reason(why: &str) -> bool {
+    why.starts_with("cannot list directory")
 }
 
 /// An archive entry's name made safe to show: control characters become `?`.
@@ -1558,12 +2259,51 @@ pub const ALREADY_A_COPY: &str = "already a deattributed copy";
 /// that file as an unsafe edit. A plan with nothing to blank is an error
 /// that names the first skip, never an empty confirm.
 pub fn plan_deattribute(req: &DeattributeRequest) -> Result<Plan, String> {
+    plan_deattribute_with(req, &mut Silent)
+}
+
+/// How much of a plain file a basic plan reads at most, for its weight on
+/// the activity bar; a deep sweep reads up to [`DEEP_READ`].
+const BASIC_READ: u64 = 16 << 20;
+const DEEP_READ: u64 = 256 << 20;
+
+/// What planning `report` weighs on the activity bar: an archive is dry-run
+/// whole, a plain file read up to what its mode reads, and a copy is skipped.
+fn plan_weight(report: &FileReport, mode: deattribute::Mode) -> u64 {
+    if deattribute::is_deattributed(&report.path) {
+        return 0;
+    }
+    if matches!(report.format.as_deref(), Some("zip" | "tar" | "gzip")) {
+        return report.size;
+    }
+    let cap = if mode == deattribute::Mode::Deep {
+        DEEP_READ
+    } else {
+        BASIC_READ
+    };
+    report.size.min(cap)
+}
+
+/// [`plan_deattribute`], reporting each file to `progress` as it is read. A
+/// stop request abandons the plan between files: the view has already
+/// dropped it, so the result says only that nothing changed.
+pub fn plan_deattribute_with(
+    req: &DeattributeRequest,
+    progress: &mut dyn Progress,
+) -> Result<Plan, String> {
     let mode = req.mode;
     let mut items = Vec::new();
     let mut private_skips = Vec::new();
     let mut caveats: Vec<String> = Vec::new();
     let mut replaces = Vec::new();
-    for report in &req.reports {
+    let weights: Vec<u64> = req.reports.iter().map(|r| plan_weight(r, mode)).collect();
+    let total = weights.iter().fold(0u64, |a, &w| a.saturating_add(w));
+    progress.begin(req.reports.len(), total);
+    for (report, &weight) in req.reports.iter().zip(&weights) {
+        if progress.stop_requested() {
+            return Err(MSG_NEVER_MIND.to_string());
+        }
+        progress.item(&report.path, weight);
         let shown = display_under(&req.root, &report.path);
         if deattribute::is_deattributed(&report.path) {
             private_skips.push(format!("{shown}: {ALREADY_A_COPY}"));
@@ -1626,6 +2366,7 @@ pub fn plan_deattribute(req: &DeattributeRequest) -> Result<Plan, String> {
             });
         }
     }
+    progress.end();
     if items.is_empty() {
         return Err(match private_skips.first() {
             None => MSG_NOTHING.to_string(),
@@ -1888,6 +2629,68 @@ pub fn container_slug(c: ContainerKind) -> &'static str {
     }
 }
 
+/// The status after a job stopped early: `done` items landed and `left`
+/// were never tried. `skipped` and `refused` carry reasons, as in
+/// [`batch_status`]; `done` counts copies for a deattribute.
+pub fn stopped_status(
+    kind: PlanKind,
+    done: usize,
+    left: usize,
+    skipped: &[String],
+    refused: &[String],
+) -> Status {
+    let copies = matches!(kind, PlanKind::Deattribute | PlanKind::DeepDeattribute);
+    if done == 0 {
+        let text = if copies {
+            "Stopped. No copies were written."
+        } else {
+            "Stopped. Nothing changed."
+        };
+        return Status {
+            text: text.to_string(),
+            tone: Tone::Info,
+        };
+    }
+    let (n, left) = (thousands(done), thousands(left));
+    let mut text = match kind {
+        PlanKind::Scrub => format!(
+            "Stopped: scrubbed {n} {}; {left} left in place",
+            plural(done, "marker", "markers")
+        ),
+        PlanKind::Deattribute | PlanKind::DeepDeattribute => format!(
+            "Stopped: saved {n} {}; {left} not written",
+            plural(done, "copy", "copies")
+        ),
+        PlanKind::Delete => format!(
+            "Stopped: moved {n} {} to the trash; {left} left in place",
+            plural(done, "file", "files")
+        ),
+    };
+    if !skipped.is_empty() {
+        text.push_str(&format!(
+            "; skipped {}: {}",
+            thousands(skipped.len()),
+            skipped[0]
+        ));
+    }
+    if !refused.is_empty() {
+        text.push_str(&format!("; refused {}", thousands(refused.len())));
+    }
+    text.push('.');
+    match kind {
+        PlanKind::Scrub => text.push_str(" Press u to undo."),
+        PlanKind::Delete => text.push_str(&format!(
+            " Press u to restore {}.",
+            plural(done, "it", "them")
+        )),
+        PlanKind::Deattribute | PlanKind::DeepDeattribute => {}
+    }
+    Status {
+        text,
+        tone: Tone::Warn,
+    }
+}
+
 /// The status after an edit batch. `skipped` and `refused` carry reasons.
 pub fn batch_status(kind: PlanKind, ok: usize, skipped: &[String], refused: &[String]) -> Status {
     let mut text = match (kind, ok) {
@@ -2030,7 +2833,7 @@ mod tests {
     #[test]
     fn yes_before_the_confirm_is_drawn_is_ignored() {
         let mut app = sample();
-        press(&mut app, Key::End); // c/tool.exe
+        press(&mut app, Key::End); // tool.exe
         press(&mut app, Key::Scrub);
         assert!(!app.confirm_drawn);
         assert!(matches!(press(&mut app, Key::Yes), Effect::None));
@@ -2097,16 +2900,16 @@ mod tests {
         let mut app = sample();
         app.begin_busy(Busy::Writing);
         app.copies_written(
-            &["b/photo.jpg: already a deattributed copy".to_string()],
+            &["photo.jpg: already a deattributed copy".to_string()],
             CopiesOutcome {
-                failed: vec!["c/tool.exe: changed since scan".to_string()],
+                failed: vec!["tool.exe: changed since scan".to_string()],
                 ..CopiesOutcome::default()
             },
         );
         let s = app.status.as_ref().unwrap();
         assert_eq!(
             s.text,
-            "Saved nothing; skipped 2: c/tool.exe: changed since scan."
+            "Saved nothing; skipped 2: tool.exe: changed since scan."
         );
         assert_eq!(s.tone, Tone::Bad);
         assert!(app.busy.is_none());
@@ -2156,6 +2959,15 @@ mod tests {
             ("ui.rs", include_str!("ui.rs")),
             ("keymap.rs", include_str!("keymap.rs")),
             ("logo.rs", include_str!("logo.rs")),
+            ("views/files.rs", include_str!("views/files.rs")),
+            ("views/picker.rs", include_str!("views/picker.rs")),
+            ("picker.rs", include_str!("picker.rs")),
+            ("views/status.rs", include_str!("views/status.rs")),
+            ("listing.rs", include_str!("listing.rs")),
+            ("bg.rs", include_str!("bg.rs")),
+            ("progress.rs", include_str!("progress.rs")),
+            ("tree.rs", include_str!("tree.rs")),
+            ("explorer.rs", include_str!("explorer.rs")),
         ];
         for (name, src) in sources {
             let code = src.split("#[cfg(test)]").next().unwrap_or(src);
@@ -2173,7 +2985,8 @@ mod tests {
                     .collect();
                 for (k, w) in words.iter().enumerate() {
                     if *w == "u" {
-                        let named = k > 0 && words[k - 1] == "press";
+                        // The undo key, or the ctrl+u key: never "you".
+                        let named = k > 0 && matches!(words[k - 1], "press" | "ctrl");
                         assert!(named, "{name}: {lit:?} uses \"u\" as a word");
                     }
                 }
@@ -2247,7 +3060,7 @@ mod tests {
         let mut app = App::new("root");
         app.push_reports(vec![
             report(
-                "b/photo.jpg",
+                "photo.jpg",
                 "jpeg",
                 vec![
                     finding(
@@ -2266,9 +3079,9 @@ mod tests {
                     ),
                 ],
             ),
-            report("a/clean.png", "png", vec![]),
+            report("clean.png", "png", vec![]),
             report(
-                "c/tool.exe",
+                "tool.exe",
                 "pe",
                 vec![
                     finding(
@@ -2310,18 +3123,32 @@ mod tests {
     }
 
     #[test]
-    fn left_and_right_focus_the_pane_on_their_side() {
+    fn right_opens_like_enter_and_left_backs_out() {
         let mut app = sample();
+        // clean.png has no findings: right says so, like enter.
         press(&mut app, Key::Right);
-        assert_eq!(app.pane, Pane::Findings);
-        press(&mut app, Key::Right);
-        assert_eq!(app.pane, Pane::Findings, "right stays on the right pane");
-        app.on_key(KeyEvent::from(KeyCode::Char('h')));
         assert_eq!(app.pane, Pane::Files);
-        app.on_key(KeyEvent::from(KeyCode::Left));
-        assert_eq!(app.pane, Pane::Files, "left stays on the left pane");
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "This file has no findings."
+        );
+        press(&mut app, Key::End);
         app.on_key(KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(app.pane, Pane::Findings);
+        assert!(matches!(
+            press(&mut app, Key::Right),
+            Effect::LoadHex { .. }
+        ));
+        assert_eq!(app.screen, Screen::Detail);
+        app.on_key(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.screen, Screen::Main, "left closes the detail");
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.pane, Pane::Files, "then goes back to the files");
+        app.on_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(app.pane, Pane::Files, "the root has no folder above");
+        assert_eq!(app.cwd(), Path::new("root"));
+        press(&mut app, Key::Tab);
+        assert_eq!(app.pane, Pane::Findings, "tab switches panes");
 
         // The filter still takes h and l as text.
         press(&mut app, Key::Filter);
@@ -2333,10 +3160,10 @@ mod tests {
     #[test]
     fn navigation_is_bounded() {
         let mut app = sample();
-        assert_eq!(app.visible().len(), 3);
+        assert_eq!(app.rows().len(), 3);
         assert_eq!(
             app.current_file().unwrap().path,
-            PathBuf::from("root/a/clean.png")
+            PathBuf::from("root/clean.png")
         );
         press(&mut app, Key::Up);
         assert_eq!(app.file_cursor, 0);
@@ -2379,7 +3206,7 @@ mod tests {
         assert_eq!(app.pane, Pane::Findings);
         match press(&mut app, Key::Enter) {
             Effect::LoadHex { path, offset } => {
-                assert_eq!(path, PathBuf::from("root/c/tool.exe"));
+                assert_eq!(path, PathBuf::from("root/tool.exe"));
                 assert_eq!(offset, 40);
             }
             other => panic!("{other:?}"),
@@ -2407,7 +3234,7 @@ mod tests {
     fn selection_toggles() {
         let mut app = sample();
         press(&mut app, Key::Space);
-        assert!(app.is_file_picked(Path::new("root/a/clean.png")));
+        assert!(app.is_file_picked(Path::new("root/clean.png")));
         press(&mut app, Key::Space);
         assert_eq!(app.picked(), 0);
 
@@ -2426,7 +3253,7 @@ mod tests {
     #[test]
     fn filter_matches_path_format_signature_and_title() {
         let mut app = sample();
-        let n = |app: &App| app.visible().len();
+        let n = |app: &App| app.rows().len();
         press(&mut app, Key::Filter);
         assert!(matches!(app.overlay, Some(Overlay::Filter)));
         type_text(&mut app, "PHOTO");
@@ -2488,7 +3315,7 @@ mod tests {
         assert_eq!(app.buckets()[0].key, "tamper");
         press(&mut app, Key::Enter);
         assert_eq!(app.screen, Screen::Main);
-        assert_eq!(app.visible().len(), 1);
+        assert_eq!(app.rows().len(), 1);
         assert_eq!(app.filter.describe().as_deref(), Some("category=tamper"));
     }
 
@@ -2538,7 +3365,7 @@ mod tests {
     #[test]
     fn scrub_plans_skip_weak_in_bulk_but_not_alone() {
         let mut app = sample();
-        press(&mut app, Key::Down); // b/photo.jpg
+        press(&mut app, Key::Down); // photo.jpg
         let plan = app.scrub_plan().unwrap();
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.weak_left_out, 1);
@@ -2557,7 +3384,7 @@ mod tests {
     #[test]
     fn scrub_plan_orders_blanks_before_truncates_and_offers_a_confirm() {
         let mut app = sample();
-        press(&mut app, Key::End); // c/tool.exe
+        press(&mut app, Key::End); // tool.exe
         let plan = app.scrub_plan().unwrap();
         let labels: Vec<_> = plan.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["pe.pdb_path", "tamper.overlay"]);
@@ -2641,24 +3468,53 @@ mod tests {
         press(&mut app, Key::End);
         press(&mut app, Key::Tab);
         press(&mut app, Key::Space);
-        let mut fresh = report("c/tool.exe", "pe", vec![]);
+        let mut fresh = report("tool.exe", "pe", vec![]);
         fresh.size = 2048;
         app.replace_report(fresh);
-        assert_eq!(app.visible().len(), 3);
+        assert_eq!(app.rows().len(), 3);
         assert_eq!(
             app.current_file().unwrap().size,
             2048,
             "cursor stays on the file"
         );
         assert_eq!(app.picked(), 0, "stale finding picks dropped");
-        app.remove_report(Path::new("root/c/tool.exe"));
-        assert_eq!(app.visible().len(), 2);
-        app.replace_report(report("c/tool.exe", "pe", vec![]));
+        app.remove_report(Path::new("root/tool.exe"));
+        assert_eq!(app.rows().len(), 2);
+        app.replace_report(report("tool.exe", "pe", vec![]));
         assert_eq!(
             app.reports()[2].path,
-            PathBuf::from("root/c/tool.exe"),
+            PathBuf::from("root/tool.exe"),
             "sorted insert"
         );
+    }
+
+    #[test]
+    fn the_highlight_stays_when_files_appear_or_go_above_it() {
+        let mut app = sample();
+        press(&mut app, Key::End);
+        let here = || PathBuf::from("root/tool.exe");
+        assert_eq!(app.current_file().unwrap().path, here());
+        // A deattributed copy sorts right above its original.
+        app.replace_report(report("tool.deattributed.exe", "pe", vec![]));
+        assert_eq!(
+            app.current_file().unwrap().path,
+            here(),
+            "copy inserted above"
+        );
+        app.push_reports(vec![report("aaa.bin", "pe", vec![])]);
+        assert_eq!(
+            app.current_file().unwrap().path,
+            here(),
+            "batch merged above"
+        );
+        app.remove_report(Path::new("root/clean.png"));
+        assert_eq!(
+            app.current_file().unwrap().path,
+            here(),
+            "file removed above"
+        );
+        app.set_filter(Filter::Text("tool".into()));
+        assert_eq!(app.current_file().unwrap().path, here(), "filter narrowed");
     }
 
     #[test]
@@ -2666,7 +3522,7 @@ mod tests {
         let mut app = App::new("root");
         app.total = Some(400);
         app.push_reports(vec![report("x", "pe", vec![])]);
-        assert_eq!(app.scan_line(), "Scanning 1 of 400 files...");
+        assert_eq!(app.scan_line(), "Scanning 1 of 400 files");
         app.total = None;
         assert_eq!(app.scan_line(), "Scanning 1 file...");
         app.total = Some(400);
@@ -2701,7 +3557,7 @@ mod tests {
         app.push_reports(batch);
         assert_eq!(app.scan_line(), "Scanning 1,234 files...");
         app.total = Some(1_101_278);
-        assert_eq!(app.scan_line(), "Scanning 1,234 of 1,101,278 files...");
+        assert_eq!(app.scan_line(), "Scanning 1,234 of 1,101,278 files");
         app.scan_done();
         assert_eq!(app.scan_line(), "Scanned 1,234 files. No findings.");
     }
@@ -2712,14 +3568,41 @@ mod tests {
             .collect()
     }
 
+    /// Answer the picker's listings and lookups synchronously, the way the
+    /// runtime's workers do.
+    fn serve_picker(app: &mut App) {
+        use crate::tui::listing::{Listing, MAX_READ};
+        use crate::tui::picker::{Request, stat};
+        for _ in 0..8 {
+            let Some(p) = app.picker.as_mut() else {
+                return;
+            };
+            for r in p.take_requests() {
+                match r {
+                    Request::List(dir) => p.on_listing(Listing::read(&dir, MAX_READ)),
+                    Request::Stat(path) => {
+                        let found = stat(&path);
+                        p.on_stat(&path, found);
+                    }
+                    Request::Count(_) | Request::StopCount => {}
+                }
+            }
+        }
+    }
+
+    /// A picker with no places, so nothing reads the user's own folders.
+    fn quiet_picker() -> Picker {
+        Picker::with_suggestions(Vec::new(), Vec::new()).with_home(None)
+    }
+
     #[test]
     fn picker_mode_scans_nothing_until_a_folder_is_chosen() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::picking(Picker::new(None, Vec::new()));
+        let mut app = App::picking(quiet_picker());
         assert!(app.is_picking());
         assert!(!app.scanning, "no scan before a folder is chosen");
         assert_eq!(app.context(), "picker");
-        // Mapped keys are inert here; q is text for the picker, not quit.
+        // Mapped keys are inert here, and q never quits the picker.
         for k in Key::ALL {
             if k != Key::Interrupt {
                 assert!(matches!(app.on_action(k), Effect::None), "{k:?}");
@@ -2727,17 +3610,15 @@ mod tests {
         }
         let typed = type_raw(&mut app, "q");
         assert!(matches!(typed[..], [Effect::None]));
-        assert!(!app.should_quit, "q is typed, not quit");
-        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(!app.should_quit, "q is not a picker key");
 
-        // A trailing separator lists the folder itself, with its
-        // "Scan this folder" row highlighted first.
-        let typed = format!("{}{}", dir.path().display(), std::path::MAIN_SEPARATOR);
-        type_raw(&mut app, &typed);
+        // A pasted folder opens; s scans it.
+        app.picker_text(&dir.path().display().to_string(), false);
+        serve_picker(&mut app);
         app.anim_ms = 777;
-        let effect = app.on_key(KeyEvent::from(KeyCode::Enter));
+        let effect = app.on_key(KeyEvent::from(KeyCode::Char('s')));
         let Effect::Scan(chosen) = effect else {
-            panic!("enter on a small folder scans it: {effect:?}");
+            panic!("s on a small folder scans it: {effect:?}");
         };
         assert_eq!(
             chosen.file_name(),
@@ -2760,19 +3641,14 @@ mod tests {
         assert!(matches!(press(&mut app, Key::Open), Effect::Pick));
         assert!(!app.is_picking(), "the runtime builds the picker");
         let root = app.root.clone();
-        app.open_picker(Picker::reopen(None, Vec::new(), &root));
+        app.open_picker(quiet_picker().reopened_at(&root));
         assert!(app.is_picking());
         assert_eq!(app.context(), "picker");
-        for _ in 0..8 {
-            if !app.is_picking() {
-                break;
-            }
-            assert!(matches!(
-                app.on_key(KeyEvent::from(KeyCode::Esc)),
-                Effect::None
-            ));
-        }
-        assert!(!app.is_picking(), "esc backs out of a reopened picker");
+        assert!(matches!(
+            app.on_key(KeyEvent::from(KeyCode::Esc)),
+            Effect::None
+        ));
+        assert!(!app.is_picking(), "one esc backs out of a reopened picker");
         assert!(!app.should_quit, "backing out never quits");
         assert_eq!(app.reports().len(), 3, "the old view is unchanged");
         assert_eq!(app.picked(), 1);
@@ -2787,12 +3663,11 @@ mod tests {
         press(&mut app, Key::Space);
         app.set_filter(Filter::Text("exe".into()));
         let root = app.root.clone();
-        app.open_picker(Picker::reopen(None, Vec::new(), &root));
-        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        let typed = format!("{}{}", dir.path().display(), std::path::MAIN_SEPARATOR);
-        type_raw(&mut app, &typed);
-        let Effect::Scan(chosen) = app.on_key(KeyEvent::from(KeyCode::Enter)) else {
-            panic!("enter scans the typed folder");
+        app.open_picker(quiet_picker().reopened_at(&root));
+        app.picker_text(&dir.path().display().to_string(), false);
+        serve_picker(&mut app);
+        let Effect::Scan(chosen) = app.on_key(KeyEvent::from(KeyCode::Char('s'))) else {
+            panic!("s scans the pasted folder");
         };
         assert_eq!(app.root, chosen);
         assert!(app.reports().is_empty(), "old reports dropped");
@@ -2812,26 +3687,26 @@ mod tests {
     #[test]
     fn saved_status_names_what_was_saved() {
         let app = sample();
-        let one = [item("root/c/tool.exe", "root/c/tool.exe", 3)];
+        let one = [item("root/tool.exe", "root/tool.exe", 3)];
         let s = app.saved_status(SavedKind::Scrubbed, &one, &[], &[]);
-        assert_eq!(s.text, "Saved c/tool.exe (3 edits). Press u to undo.");
+        assert_eq!(s.text, "Saved tool.exe (3 edits). Press u to undo.");
         assert_eq!(s.tone, Tone::Good);
 
         let three = [
-            item("root/c/tool.exe", "root/c/tool.exe", 1),
-            item("root/b/photo.jpg", "root/b/photo.jpg", 2),
-            item("root/a/clean.png", "root/a/clean.png", 1),
+            item("root/tool.exe", "root/tool.exe", 1),
+            item("root/photo.jpg", "root/photo.jpg", 2),
+            item("root/clean.png", "root/clean.png", 1),
         ];
         let s = app.saved_status(SavedKind::Scrubbed, &three, &[], &["magic".into()]);
         assert_eq!(
             s.text,
-            "Saved c/tool.exe (1 edit) +2 more; refused 1. Press u to undo."
+            "Saved tool.exe (1 edit) +2 more; refused 1. Press u to undo."
         );
         assert_eq!(s.tone, Tone::Warn);
 
         let copy = [item(
-            "root/c/setup-tool.exe",
-            "root/c/setup-tool.deattributed.exe",
+            "root/setup-tool.exe",
+            "root/setup-tool.deattributed.exe",
             4,
         )];
         let s = app.saved_status(SavedKind::Deattributed, &copy, &[], &[]);
@@ -2846,11 +3721,11 @@ mod tests {
     #[test]
     fn saved_marks_survive_rescans_and_undo_clears_scrubs() {
         let mut app = sample();
-        let tool = PathBuf::from("root/c/tool.exe");
-        let photo = PathBuf::from("root/b/photo.jpg");
+        let tool = PathBuf::from("root/tool.exe");
+        let photo = PathBuf::from("root/photo.jpg");
         app.record_saved(
             SavedKind::Scrubbed,
-            &[item("root/c/tool.exe", "root/c/tool.exe", 2)],
+            &[item("root/tool.exe", "root/tool.exe", 2)],
             &[],
             &[],
         );
@@ -2859,19 +3734,19 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .text
-                .starts_with("Saved c/tool.exe")
+                .starts_with("Saved tool.exe")
         );
         app.mark_saved(&tool, SavedKind::Scrubbed, tool.clone(), 1);
         assert_eq!(app.saved(&tool).unwrap().edits, 3, "a second scrub adds up");
         app.mark_saved(
             &photo,
             SavedKind::Deattributed,
-            PathBuf::from("root/b/photo.deattributed.jpg"),
+            PathBuf::from("root/photo.deattributed.jpg"),
             1,
         );
 
         // The rescan after an edit replaces the report; the mark stays.
-        app.replace_report(report("c/tool.exe", "pe", vec![]));
+        app.replace_report(report("tool.exe", "pe", vec![]));
         assert_eq!(app.saved(&tool).unwrap().kind, SavedKind::Scrubbed);
 
         app.clear_scrubbed(&tool);
@@ -2907,8 +3782,8 @@ mod tests {
     #[test]
     fn a_replaced_copy_sets_its_edit_count() {
         let mut app = sample();
-        let tool = PathBuf::from("root/c/tool.exe");
-        let copy = PathBuf::from("root/c/tool.deattributed.exe");
+        let tool = PathBuf::from("root/tool.exe");
+        let copy = PathBuf::from("root/tool.deattributed.exe");
         app.mark_saved(&tool, SavedKind::Deattributed, copy.clone(), 3);
         app.mark_saved(&tool, SavedKind::Deattributed, copy, 2);
         assert_eq!(app.saved(&tool).unwrap().edits, 2, "the copy was replaced");
@@ -2916,18 +3791,203 @@ mod tests {
 
     #[test]
     fn esc_in_the_picker_quits() {
-        let mut app = App::picking(Picker::new(None, Vec::new()));
-        let mut last = Effect::None;
-        for _ in 0..8 {
-            last = app.on_key(KeyEvent::from(KeyCode::Esc));
-            if app.should_quit {
-                break;
-            }
-        }
-        assert!(matches!(last, Effect::Quit), "{last:?}");
+        let mut app = App::picking(quiet_picker());
+        let last = app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(last, Effect::Quit), "one esc: {last:?}");
         assert!(app.should_quit);
-        let mut app = App::picking(Picker::new(None, Vec::new()));
+        let mut app = App::picking(quiet_picker());
         assert!(matches!(app.on_action(Key::Interrupt), Effect::Quit));
+    }
+
+    #[test]
+    fn planning_reports_each_file_and_stops_between_them() {
+        use crate::tui::progress::testing::StopAfter;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = patched_view(dir.path(), "a.exe");
+        let more = patched_view(dir.path(), "b.exe");
+        app.push_reports(more.reports().to_vec());
+        press(&mut app, Key::Space);
+        press(&mut app, Key::Down);
+        press(&mut app, Key::Space);
+        let req = app.deattribute_request(deattribute::Mode::Basic).unwrap();
+        let mut all = StopAfter::new(usize::MAX);
+        assert!(plan_deattribute_with(&req, &mut all).is_ok());
+        let size = req.reports[0].size;
+        assert_eq!(all.began, Some((2, 2 * size)));
+        assert_eq!((all.items.len(), all.ends), (2, 1));
+        let mut one = StopAfter::new(1);
+        let abandoned = plan_deattribute_with(&req, &mut one);
+        assert_eq!(abandoned.unwrap_err(), MSG_NEVER_MIND);
+        assert_eq!(one.items.len(), 1);
+    }
+
+    #[test]
+    fn esc_while_busy_stops_in_the_files_pane_but_goes_back_from_detail() {
+        let mut app = sample();
+        press(&mut app, Key::End);
+        press(&mut app, Key::Enter);
+        press(&mut app, Key::Enter);
+        assert_eq!(app.screen, Screen::Detail);
+        app.begin_busy(Busy::Writing);
+        assert!(matches!(press(&mut app, Key::Esc), Effect::None));
+        assert_eq!(app.screen, Screen::Main);
+        press(&mut app, Key::Esc);
+        assert_eq!(app.pane, Pane::Files);
+        assert!(!app.stopping);
+        assert!(matches!(press(&mut app, Key::Esc), Effect::Stop));
+        assert!(app.stopping && !app.can_stop());
+        assert!(!app.should_quit, "esc never arms quit while busy");
+    }
+
+    #[test]
+    fn a_plan_is_dropped_at_once() {
+        let mut app = sample();
+        app.begin_busy(Busy::Planning);
+        assert!(matches!(press(&mut app, Key::Esc), Effect::Stop));
+        assert!(app.busy.is_none());
+        assert_eq!(app.status.as_ref().unwrap().text, MSG_NEVER_MIND);
+        app.begin_busy(Busy::Planning);
+        assert!(matches!(press(&mut app, Key::Interrupt), Effect::Stop));
+        assert!(app.should_quit, "ctrl+c drops the plan and quits");
+    }
+
+    #[test]
+    fn quit_while_busy_stops_first_and_a_second_quit_forces() {
+        let mut app = sample();
+        app.begin_busy(Busy::Writing);
+        assert!(matches!(press(&mut app, Key::Quit), Effect::Stop));
+        assert!(app.stopping && app.quit_after && !app.should_quit);
+        assert!(matches!(press(&mut app, Key::Interrupt), Effect::Quit));
+        assert!(app.should_quit);
+
+        let mut app = sample();
+        app.begin_busy(Busy::Writing);
+        press(&mut app, Key::Quit);
+        app.copies_written(
+            &[],
+            CopiesOutcome {
+                stopped: true,
+                not_written: 2,
+                ..CopiesOutcome::default()
+            },
+        );
+        assert!(app.should_quit, "quits once the job lands");
+
+        // Ctrl+C in the filter prompt stops first too.
+        let mut app = sample();
+        app.begin_busy(Busy::Scrubbing);
+        press(&mut app, Key::Filter);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.stopping && !app.should_quit);
+    }
+
+    #[test]
+    fn undo_cannot_stop_and_says_so() {
+        let mut app = sample();
+        app.begin_busy(Busy::Undoing);
+        assert!(!app.can_stop());
+        assert!(matches!(press(&mut app, Key::Esc), Effect::None));
+        assert_eq!(app.busy_note, Some(MSG_UNDO_RUNS));
+        assert!(!app.stopping);
+        press(&mut app, Key::Quit);
+        assert_eq!(app.busy_note, Some(MSG_QUIT_AFTER_UNDO));
+        assert!(!app.should_quit);
+        app.end_busy();
+        assert!(app.should_quit, "quits when the undo finishes");
+    }
+
+    #[test]
+    fn the_keys_that_need_the_engine_wait_while_busy() {
+        let mut app = sample();
+        press(&mut app, Key::End);
+        app.begin_busy(Busy::Deleting);
+        for k in [
+            Key::Undo,
+            Key::Editor,
+            Key::Open,
+            Key::Scrub,
+            Key::Delete,
+            Key::Deattribute,
+        ] {
+            assert!(matches!(press(&mut app, k), Effect::None), "{k:?}");
+            assert_eq!(app.status.as_ref().unwrap().text, "Deleting...");
+        }
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn picks_made_during_a_job_survive_it() {
+        let mut app = sample();
+        press(&mut app, Key::Down);
+        press(&mut app, Key::Space); // photo.jpg
+        app.begin_busy(Busy::Writing);
+        press(&mut app, Key::Down);
+        press(&mut app, Key::Space); // tool.exe, picked meanwhile
+        app.copies_written(&[], CopiesOutcome::default());
+        assert!(!app.is_file_picked(Path::new("root/photo.jpg")));
+        assert!(app.is_file_picked(Path::new("root/tool.exe")));
+
+        // A cancelled confirm forgets its snapshot.
+        app.begin_busy(Busy::Planning);
+        app.plan_ready(Err("Nothing to blank.".into()));
+        app.begin_busy(Busy::Undoing);
+        app.end_busy();
+        app.clear_job_picks();
+        assert!(
+            app.is_file_picked(Path::new("root/tool.exe")),
+            "undo takes no picks"
+        );
+    }
+
+    #[test]
+    fn stopped_statuses_read_right() {
+        let s = stopped_status(PlanKind::Deattribute, 3, 4, &[], &[]);
+        assert_eq!(s.text, "Stopped: saved 3 copies; 4 not written.");
+        assert_eq!(s.tone, Tone::Warn);
+        let s = stopped_status(PlanKind::Delete, 1, 2, &[], &[]);
+        assert_eq!(
+            s.text,
+            "Stopped: moved 1 file to the trash; 2 left in place. Press u to restore it."
+        );
+        let s = stopped_status(PlanKind::Scrub, 0, 5, &[], &[]);
+        assert_eq!(s.text, "Stopped. Nothing changed.");
+        let s = stopped_status(PlanKind::DeepDeattribute, 0, 5, &[], &[]);
+        assert_eq!(s.text, "Stopped. No copies were written.");
+        let mut app = sample();
+        app.begin_busy(Busy::Writing);
+        app.copies_written(
+            &[],
+            CopiesOutcome {
+                stopped: true,
+                not_written: 4,
+                ..CopiesOutcome::default()
+            },
+        );
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Stopped. No copies were written."
+        );
+    }
+
+    #[test]
+    fn question_mark_shows_the_pickers_keys_and_any_key_closes_them() {
+        let mut app = App::picking(quiet_picker());
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(matches!(app.overlay, Some(Overlay::Help)));
+        assert!(app.is_picking());
+        // The key that closes the sheet does nothing else: esc does not quit.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+        assert!(!app.should_quit);
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        let effect = app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(matches!(effect, Effect::Quit), "ctrl+c still quits");
+        // A paste closes the sheet too.
+        let mut app = App::picking(quiet_picker());
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        app.picker_text("abc", true);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.picker.as_ref().unwrap().prompt(), Some("abc"));
     }
 
     #[test]
@@ -2951,5 +4011,412 @@ mod tests {
         for k in Key::ALL {
             let _ = empty.on_action(k);
         }
+    }
+
+    // ---- the folder view ---------------------------------------------------
+
+    /// `root` joined with a `/`-separated relative path.
+    fn at(rel: &str) -> PathBuf {
+        rel.split('/')
+            .fold(PathBuf::from("root"), |p, part| p.join(part))
+    }
+
+    fn report_at(rel: &str, findings: Vec<Finding>) -> FileReport {
+        let mut r = FileReport::new(at(rel), 4096);
+        r.format = Some("pe".to_string());
+        r.findings = findings;
+        r
+    }
+
+    fn removable(sig: &str, conf: Confidence, sev: Severity) -> Finding {
+        finding(sig, sig, conf, sev, blank(64))
+    }
+
+    /// root/
+    ///   a.txt
+    ///   b/x/deep.exe   (an alert)
+    ///   b/y.bin        (a notice and a weak notice)
+    ///   b-c/z.bin
+    ///   b.txt          (a notice)
+    fn nested_reports() -> Vec<FileReport> {
+        vec![
+            report_at("a.txt", vec![]),
+            report_at(
+                "b/x/deep.exe",
+                vec![removable("pe.overlay", Confidence::Strong, Severity::Alert)],
+            ),
+            report_at(
+                "b/y.bin",
+                vec![
+                    removable("jpeg.exif", Confidence::Strong, Severity::Notice),
+                    removable("jpeg.xmp", Confidence::Weak, Severity::Notice),
+                ],
+            ),
+            report_at("b-c/z.bin", vec![]),
+            report_at(
+                "b.txt",
+                vec![removable("jpeg.exif", Confidence::Strong, Severity::Notice)],
+            ),
+        ]
+    }
+
+    fn nested() -> App {
+        let mut app = App::new("root");
+        app.push_reports(nested_reports());
+        app.scan_done();
+        app
+    }
+
+    fn row_names(app: &App) -> Vec<&str> {
+        app.rows().iter().map(|r| r.name.as_str()).collect()
+    }
+
+    fn highlight(app: &mut App, name: &str) {
+        let pos = app
+            .rows()
+            .iter()
+            .position(|r| r.name == name)
+            .unwrap_or_else(|| panic!("{name} in {:?}", row_names(app)));
+        app.file_cursor = pos;
+    }
+
+    #[test]
+    fn folders_come_first_and_open_with_a_remembered_highlight() {
+        let mut app = nested();
+        assert_eq!(row_names(&app), ["b", "b-c", "a.txt", "b.txt"]);
+        assert!(app.has_subfolders());
+        assert_eq!(app.current_folder(), Some(at("b").as_path()));
+        press(&mut app, Key::Enter);
+        assert_eq!(app.cwd(), at("b"));
+        assert_eq!(row_names(&app), ["x", "y.bin"]);
+        assert_eq!(
+            app.breadcrumb(),
+            format!("root{}b", std::path::MAIN_SEPARATOR)
+        );
+        assert_eq!(app.reopen_target(), at("b"), "o reopens the picker here");
+        let mut hints = crate::tui::keymap::footer_hints("files").to_vec();
+        crate::tui::views::files::explorer_hints(&app, "files", &mut hints);
+        assert_eq!(hints[1].key, "left", "a subfolder offers the way up");
+
+        press(&mut app, Key::Down); // y.bin
+        app.on_key(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.cwd(), Path::new("root"));
+        assert_eq!(
+            app.current_folder(),
+            Some(at("b").as_path()),
+            "the folder left"
+        );
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(
+            app.current_file().unwrap().path,
+            at("b/y.bin"),
+            "remembered"
+        );
+
+        // Esc never goes up: it backs out of panes, then arms quit.
+        press(&mut app, Key::Esc);
+        assert_eq!(app.cwd(), at("b"));
+        assert_eq!(app.status.as_ref().unwrap().text, MSG_QUIT_ARMED);
+        press(&mut app, Key::Backspace);
+        assert_eq!(app.cwd(), Path::new("root"));
+    }
+
+    #[test]
+    fn folder_picks_expand_into_plans_and_delete_refuses_them() {
+        let mut app = nested();
+        highlight(&mut app, "b");
+        let plan = app.scrub_plan().unwrap();
+        let labels: Vec<&str> = plan.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["pe.overlay", "jpeg.exif"]);
+        assert_eq!(
+            plan.weak_left_out, 1,
+            "weak findings stay out of bulk scrubs"
+        );
+        assert!(plan.caveats.is_empty(), "the scan is done");
+
+        let req = app.deattribute_request(deattribute::Mode::Basic).unwrap();
+        let paths: Vec<PathBuf> = req.reports.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [at("b/x/deep.exe"), at("b/y.bin")],
+            "every file under it"
+        );
+
+        assert_eq!(
+            app.delete_plan().unwrap_err(),
+            "Delete works on files only. Open the folder to pick files."
+        );
+        assert!(matches!(press(&mut app, Key::Editor), Effect::None));
+        assert_eq!(app.status.as_ref().unwrap().text, "Select a file first.");
+
+        press(&mut app, Key::Space);
+        assert!(app.is_dir_picked(&at("b")));
+        highlight(&mut app, "b.txt");
+        press(&mut app, Key::Space);
+        assert_eq!(app.picked(), 2);
+        let req = app.deattribute_request(deattribute::Mode::Basic).unwrap();
+        assert_eq!(
+            req.reports.len(),
+            3,
+            "the folder's files and the picked file"
+        );
+        assert!(
+            app.delete_plan().is_err(),
+            "a picked folder is never deleted"
+        );
+    }
+
+    #[test]
+    fn a_folder_still_being_scanned_adds_a_caveat() {
+        let mut app = App::new("root");
+        let mut reports = nested_reports();
+        reports.sort_by(|a, b| a.path.cmp(&b.path));
+        // Walk order: a.txt, b/x/deep.exe, b/y.bin, ...; stop inside b.
+        app.push_reports(reports[..2].to_vec());
+        highlight(&mut app, "b");
+        assert!(matches!(
+            app.folder_state(app.current_row().unwrap()),
+            explorer::FolderState::Scanning { scanned: 1, .. }
+        ));
+        let plan = app.scrub_plan().unwrap();
+        assert_eq!(
+            plan.caveats,
+            ["b is still being scanned; files found later are not included."]
+        );
+        assert_eq!(app.scan_caveats(&app.selected_folders()), plan.caveats);
+    }
+
+    #[test]
+    fn a_filter_lists_matches_under_the_folder_and_clearing_it_reveals() {
+        let mut app = nested();
+        app.set_filter(Filter::Text("deep".into()));
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(row_names(&app), [format!("b{sep}x{sep}deep.exe")]);
+        press(&mut app, Key::Esc);
+        assert_eq!(app.filter, Filter::None);
+        assert_eq!(app.cwd(), at("b/x"), "the match, shown in its folder");
+        assert_eq!(app.current_file().unwrap().path, at("b/x/deep.exe"));
+        press(&mut app, Key::Left);
+        assert_eq!(app.current_folder(), Some(at("b/x").as_path()));
+
+        // Scoped to the cwd: b holds y.bin, but b.txt at the root is out.
+        app.set_filter(Filter::Text("exif".into()));
+        assert_eq!(row_names(&app), ["y.bin"]);
+        press(&mut app, Key::Buckets);
+        let total: usize = app.buckets().iter().map(|b| b.members).sum();
+        assert_eq!(total, 3, "buckets count only the findings under b");
+    }
+
+    fn brute_stats(app: &App) -> Stats {
+        let mut s = Stats::default();
+        for r in app.reports() {
+            s.flagged += usize::from(!r.findings.is_empty());
+            s.removable += r.findings.iter().filter(|f| f.is_removable()).count();
+            s.alerts += r
+                .findings
+                .iter()
+                .filter(|f| f.severity == Severity::Alert)
+                .count();
+        }
+        s
+    }
+
+    #[test]
+    fn header_stats_match_a_brute_force_count() {
+        let mut app = nested();
+        assert_eq!(app.stats(), brute_stats(&app));
+        app.replace_report(report_at("b/x/deep.exe", vec![]));
+        assert_eq!(app.stats(), brute_stats(&app));
+        app.replace_report(report_at(
+            "b/new.exe",
+            vec![removable("x.y", Confidence::Strong, Severity::Alert)],
+        ));
+        assert_eq!(app.stats(), brute_stats(&app));
+        app.remove_report(&at("b.txt"));
+        assert_eq!(app.stats(), brute_stats(&app));
+        assert_eq!(app.stats().alerts, 1);
+    }
+
+    #[test]
+    fn rows_never_reorder_while_a_scan_streams_in() {
+        let mut reports = nested_reports();
+        reports.push(report_at("aa/q.bin", vec![]));
+        reports.push(report_at("zz.bin", vec![]));
+        reports.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut app = App::new("root");
+        let mut before: Vec<PathBuf> = Vec::new();
+        for r in reports {
+            app.push_reports(vec![r]);
+            let now: Vec<PathBuf> = app.rows().iter().map(|r| r.path.clone()).collect();
+            let kept: Vec<&PathBuf> = now.iter().filter(|p| before.contains(p)).collect();
+            assert_eq!(
+                kept,
+                before.iter().collect::<Vec<_>>(),
+                "rows kept their order"
+            );
+            let mut fresh = app.explorer.clone();
+            fresh.rebuild(&app.tree, &app.reports, &app.filter);
+            assert_eq!(fresh.rows(), app.rows(), "merging matches a full rebuild");
+            before = now;
+        }
+        assert_eq!(app.tree().scanned(), 7);
+        assert_eq!(app.tree().frontier(), Some(at("zz.bin").as_path()));
+    }
+
+    fn listed(rel: &str, dir: bool, link: bool) -> crate::tui::listing::Item {
+        crate::tui::listing::Item {
+            name: rel.to_string(),
+            path: at(rel),
+            dir,
+            cloud: false,
+            link,
+            hidden: false,
+            size: None,
+        }
+    }
+
+    #[test]
+    fn a_listing_adds_rows_the_scan_never_delivers() {
+        let mut app = App::new("root");
+        app.listing_ready(Listing {
+            location: PathBuf::from("root"),
+            items: vec![
+                listed("a.txt", false, false),
+                listed("b", true, false),
+                listed("empty", true, false),
+                listed("late.txt", false, false),
+                listed("link", true, true),
+                listed("locked", true, false),
+                listed("zz.txt", false, false),
+            ],
+            error: None,
+            truncated: false,
+        });
+        assert_eq!(app.listing_request(), None, "the root is listed");
+        assert_eq!(
+            row_names(&app),
+            [
+                "b", "empty", "link", "locked", "a.txt", "late.txt", "zz.txt"
+            ]
+        );
+        let mut locked =
+            Scanned::unreadable(&at("locked"), "cannot list directory: permission denied");
+        locked.report.partial = true;
+        app.push_scanned(vec![
+            Scanned {
+                report: report_at("a.txt", vec![]),
+                error: None,
+            },
+            Scanned {
+                report: report_at("b/y.bin", vec![]),
+                error: None,
+            },
+            locked,
+        ]);
+        let state = |app: &App, name: &str| {
+            let row = app.rows().iter().find(|r| r.name == name).unwrap();
+            app.folder_state(row)
+        };
+        use explorer::FolderState::*;
+        assert_eq!(state(&app, "b"), Done);
+        assert_eq!(state(&app, "empty"), Empty);
+        assert_eq!(state(&app, "link"), NotScanned);
+        assert_eq!(
+            state(&app, "locked"),
+            Unreadable("cannot list directory: permission denied".into())
+        );
+        assert!(!app.has_report(&at("locked")), "never a file");
+        assert_eq!(
+            app.rows().len(),
+            7,
+            "no extra row for the unreadable folder"
+        );
+        assert!(app.is_final(&at("late.txt")), "passed, so never scanned");
+        assert!(!app.is_final(&at("zz.txt")), "not reached yet");
+        assert_eq!(
+            app.tree().scanned(),
+            3,
+            "every entry counts toward progress"
+        );
+    }
+
+    #[test]
+    fn folder_states_follow_the_frontier() {
+        use explorer::FolderState::*;
+        let mut app = App::new("root");
+        app.counted(&{
+            let mut t = crate::scan::walk::Tally::new(Path::new("root"));
+            for rel in ["b/x/1.bin", "b/x/2.bin", "b-c/z.bin", "b.txt"] {
+                t.add(&at(rel));
+            }
+            t.finish(false)
+        });
+        let state =
+            |app: &App, rel: &str| explorer::folder_state(&app.tree, &at(rel), None, app.scanning);
+        assert_eq!(
+            state(&app, "b"),
+            Pending {
+                expected: Some(2),
+                exact: true
+            }
+        );
+        app.push_reports(vec![report_at("b/x/1.bin", vec![])]);
+        assert!(matches!(
+            state(&app, "b"),
+            Scanning {
+                scanned: 1,
+                expected: Some(2),
+                ..
+            }
+        ));
+        assert!(
+            matches!(state(&app, "b-c"), Pending { .. }),
+            "b/x sorts before b-c"
+        );
+        app.push_reports(vec![
+            report_at("b/x/2.bin", vec![]),
+            report_at("b-c/z.bin", vec![]),
+        ]);
+        assert_eq!(state(&app, "b"), Done);
+        assert_eq!(state(&app, "b/x"), Done);
+        assert!(matches!(state(&app, "b-c"), Scanning { .. }));
+        assert!(!app.is_final(&at("b.txt")));
+        app.scan_done();
+        assert_eq!(state(&app, "b-c"), Done);
+        assert_eq!(state(&app, "never"), Empty, "the end completes everything");
+    }
+
+    #[test]
+    fn a_single_file_scan_keeps_one_row() {
+        let mut app = App::new("dir/only.bin");
+        let mut r = FileReport::new(PathBuf::from("dir/only.bin"), 9);
+        r.findings = vec![removable("x.y", Confidence::Strong, Severity::Notice)];
+        app.push_reports(vec![r]);
+        app.scan_done();
+        assert_eq!(row_names(&app), ["only.bin"]);
+        press(&mut app, Key::Left);
+        assert_eq!(app.cwd(), Path::new("dir/only.bin"), "left does nothing");
+        assert!(!app.has_subfolders());
+        assert_eq!(
+            app.scan_line(),
+            "Scanned 1 file: 1 with findings, 1 removable marker."
+        );
+    }
+
+    #[test]
+    fn a_drive_root_holds_its_folders() {
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        let mut app = App::new(root);
+        let file = Path::new(root).join("Users").join("x.bin");
+        app.push_reports(vec![FileReport::new(file, 1)]);
+        assert_eq!(row_names(&app), ["Users"]);
+        assert!(matches!(
+            app.folder_state(&app.rows()[0]),
+            explorer::FolderState::Scanning { .. }
+        ));
+        press(&mut app, Key::Enter);
+        assert_eq!(row_names(&app), ["x.bin"]);
+        press(&mut app, Key::Left);
+        assert_eq!(app.cwd(), Path::new(root));
     }
 }

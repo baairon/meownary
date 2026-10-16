@@ -16,13 +16,21 @@ use std::path::{Path, PathBuf};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+use crate::scan::walk::Tally;
+
 use crate::model::{
     BrandKind, Category, Confidence, ContainerKind, Evidence, FileReport, Finding, JunkKind,
     Marker, Region, RemovalStrategy, Severity, SignatureStatus, TamperKind,
 };
 
-use super::app::{App, Pane};
+use super::app::{App, Busy, Pane};
 use super::keymap::Key;
+use super::progress::Activity;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+use crate::scan::CountDelta;
+
+use super::listing::{Item, Listing, natural_cmp};
 use super::picker::{Picker, Suggestion};
 use super::svg;
 use super::theme::Look;
@@ -30,7 +38,7 @@ use super::ui;
 
 /// The interactive view as an animated SVG, `width` by `height` cells.
 pub fn render_preview_svg(width: u16, height: u16) -> String {
-    let mut app = demo_app();
+    let mut app = demo_working();
     render_svg(&mut app, width, height, "meownary interactive view")
 }
 
@@ -41,7 +49,7 @@ pub fn render_help_svg(width: u16, height: u16) -> String {
     render_svg(&mut app, width, height, "meownary keys")
 }
 
-/// The picker a bare `meownary` opens on, showing its places.
+/// The picker a bare `meownary` opens on, browsing Downloads while it counts.
 pub fn render_picker_svg(width: u16, height: u16) -> String {
     let mut app = demo_picker();
     render_svg(&mut app, width, height, "meownary picker")
@@ -49,12 +57,16 @@ pub fn render_picker_svg(width: u16, height: u16) -> String {
 
 /// The picker over invented places. Recent picks are left out: the picker
 /// only lists ones that exist, and a preview must not depend on the disk.
-pub fn demo_picker() -> App {
+pub fn demo_places() -> App {
+    App::picking(demo_place_picker())
+}
+
+fn demo_place_picker() -> Picker {
     let place = |label: &str, path: &str| Suggestion {
         label: label.to_string(),
         path: PathBuf::from(path),
     };
-    App::picking(Picker::with_suggestions(
+    Picker::with_suggestions(
         vec![
             place("Downloads", r"C:\Users\you\Downloads"),
             place("Desktop", r"C:\Users\you\Desktop"),
@@ -65,23 +77,93 @@ pub fn demo_picker() -> App {
             place("Home", r"C:\Users\you"),
         ],
         Vec::new(),
-    ))
+    )
+    .with_home(Some(PathBuf::from(r"C:\Users\you")))
 }
 
-/// A scan of an invented downloads folder: an installer with a PDB path and
-/// an overlay, a photo with EXIF, a PDF with producer and author, a zip with
-/// a comment, an executable posing as a photo, and some clean files. The
+/// The picker inside an invented Downloads folder while it counts: the
+/// scene a bare `meownary` shows once a place is opened. Nothing touches
+/// the disk; the listing and the counts are made up and handed in the way
+/// the runtime would.
+pub fn demo_picker() -> App {
+    let mut picker = demo_place_picker();
+    picker.on_key(KeyEvent::from(KeyCode::Enter));
+    let _ = picker.take_requests();
+    let dir = PathBuf::from(r"C:\Users\you\Downloads");
+    picker.on_listing(demo_listing(&dir));
+    let counted = [
+        ("Games", 1_030),
+        ("Installers", 612),
+        ("Mods", 2_264),
+        ("Music", 0),
+    ];
+    let dirs: Vec<(PathBuf, u32)> = counted
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(name, n)| (dir.join(name).join("inner"), *n))
+        .chain(std::iter::once((dir.clone(), 6)))
+        .collect();
+    let delta = CountDelta {
+        dirs,
+        frontier: Some(dir.join("Mods").join("inner").join("x")),
+        done: false,
+        stopped: false,
+    };
+    picker.on_count(&dir, &delta);
+    App::picking(picker)
+}
+
+/// An invented Downloads listing in natural order, as `Listing::read` sorts.
+fn demo_listing(dir: &Path) -> Listing {
+    let item = |name: &str, folder: bool, size: u64| Item {
+        name: name.to_string(),
+        path: dir.join(name),
+        dir: folder,
+        cloud: false,
+        link: false,
+        hidden: name.starts_with('.') || name == "desktop.ini",
+        size: (!folder).then_some(size),
+    };
+    let mut items = vec![
+        item("Games", true, 0),
+        item("Installers", true, 0),
+        item("Mods", true, 0),
+        item("Music", true, 0),
+        item("Photos", true, 0),
+        item("Work", true, 0),
+        item("game-patch.zip", false, 8_388_608),
+        item("setup-tool-2.4.1.exe", false, 2_412_544),
+        item("beach-day.jpg", false, 3_145_728),
+        item("lease-draft.pdf", false, 184_320),
+        item("notes.txt", false, 1_204),
+        item("desktop.ini", false, 282),
+    ];
+    items.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+    Listing {
+        location: dir.to_path_buf(),
+        items,
+        error: None,
+        truncated: false,
+    }
+}
+
+/// A scan of an invented downloads folder: a few subfolders (photos,
+/// media, games, documents) over an installer with a PDB path and an
+/// overlay, a photo with EXIF, a PDF with producer and author, a zip with a
+/// comment, an executable posing as a photo, and some clean files. The
 /// installer is highlighted, its findings pane focused, one finding picked.
 pub fn demo_app() -> App {
     let root = PathBuf::from("downloads");
+    let reports = demo_reports(&root);
     let mut app = App::new(&root);
-    app.total = Some(16);
-    app.push_reports(demo_reports(&root));
+    app.counted(&tally(&root, &reports));
+    app.total = Some(reports.len());
+    app.push_reports(reports);
     app.scan_done();
     if let Some(pos) = app
-        .visible()
+        .rows()
         .iter()
-        .position(|&i| app.reports()[i].path.ends_with("setup-tool-2.4.1.exe"))
+        .position(|r| r.path.ends_with("setup-tool-2.4.1.exe"))
     {
         app.file_cursor = pos;
     }
@@ -91,6 +173,86 @@ pub fn demo_app() -> App {
     app.on_action(Key::Up);
     debug_assert_eq!(app.pane, Pane::Findings);
     app
+}
+
+/// The demo folder while a deattribute writes its copies: four of five
+/// done and the big archive in flight, so the activity row shows its bar.
+pub fn demo_working() -> App {
+    let mut app = demo_app();
+    let root = PathBuf::from("downloads");
+    app.busy = Some(Busy::Writing);
+    let mut activity = Activity::default();
+    activity.begin(5, 50 * 1024 * 1024);
+    for (name, mb) in [
+        ("setup-tool-2.4.1.exe", 12),
+        ("photo.jpg", 8),
+        ("invoice-0425.pdf", 6),
+        ("lease-draft.pdf", 4),
+    ] {
+        activity.item(&root.join(name), mb * 1024 * 1024);
+    }
+    activity.item(&root.join("Games").join("game-patch.zip"), 20 * 1024 * 1024);
+    app.activity = Some(activity);
+    app
+}
+
+/// The same folder part way through its scan: the walk has counted
+/// everything, the scan is inside `Media`, and the root's listing is in, so
+/// the folders and files the scan has yet to reach show as waiting.
+pub fn demo_scanning() -> App {
+    let root = PathBuf::from("downloads");
+    let mut reports = demo_reports(&root);
+    reports.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut app = App::new(&root);
+    app.counted(&tally(&root, &reports));
+    app.total = Some(reports.len());
+    let mut items: Vec<Item> = Vec::new();
+    for r in &reports {
+        let Ok(rel) = r.path.strip_prefix(&root) else {
+            continue;
+        };
+        let Some(first) = rel.components().next() else {
+            continue;
+        };
+        let path = root.join(first);
+        if items.iter().any(|i| i.path == path) {
+            continue;
+        }
+        let dir = rel.components().count() > 1;
+        items.push(Item {
+            name: first.as_os_str().to_string_lossy().into_owned(),
+            path,
+            dir,
+            cloud: false,
+            link: false,
+            hidden: false,
+            size: (!dir).then_some(r.size),
+        });
+    }
+    app.listing_ready(Listing {
+        location: root.clone(),
+        items,
+        error: None,
+        truncated: false,
+    });
+    let upto = reports
+        .iter()
+        .position(|r| r.path.ends_with("voice-memo.mp3"))
+        .unwrap_or(reports.len());
+    app.push_reports(reports[..upto].to_vec());
+    app.anim_ms = 0;
+    app
+}
+
+/// The walk's count of `reports`, as one finished delta.
+fn tally(root: &Path, reports: &[FileReport]) -> crate::scan::CountDelta {
+    let mut paths: Vec<&Path> = reports.iter().map(|r| r.path.as_path()).collect();
+    paths.sort();
+    let mut t = Tally::new(root);
+    for p in paths {
+        t.add(p);
+    }
+    t.finish(false)
 }
 
 fn finding(
@@ -138,7 +300,10 @@ fn report(
     size: u64,
     findings: Vec<Finding>,
 ) -> FileReport {
-    let mut r = FileReport::new(root.join(name), size);
+    let path = name
+        .split('/')
+        .fold(root.to_path_buf(), |p, part| p.join(part));
+    let mut r = FileReport::new(path, size);
     r.format = format.map(str::to_string);
     r.findings = findings;
     r
@@ -206,7 +371,7 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
         ),
         report(
             root,
-            "beach-day.jpg",
+            "Photos/beach-day.jpg",
             Some("jpeg"),
             3_145_728,
             vec![
@@ -310,7 +475,7 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
         report(root, "icon.png", Some("png"), 4_096, vec![]),
         report(
             root,
-            "voice-memo.mp3",
+            "Media/voice-memo.mp3",
             Some("mp3"),
             1_048_576,
             vec![finding(
@@ -341,7 +506,7 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
         ),
         report(
             root,
-            "portrait.png",
+            "Photos/portrait.png",
             Some("png"),
             612_004,
             vec![finding(
@@ -356,7 +521,7 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
         ),
         report(
             root,
-            "game-patch.zip",
+            "Games/game-patch.zip",
             Some("zip"),
             8_388_608,
             vec![finding(
@@ -371,7 +536,7 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
         ),
         report(
             root,
-            "clip-0193.mp4",
+            "Media/clip-0193.mp4",
             Some("mp4"),
             24_117_248,
             vec![finding(
@@ -386,7 +551,7 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
         ),
         report(
             root,
-            "report-final.docx",
+            "Documents/report-final.docx",
             Some("ooxml"),
             41_230,
             vec![finding(
@@ -399,8 +564,8 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
                 None,
             )],
         ),
-        report(root, "fonts.7z", Some("7z"), 3_407_872, vec![]),
-        report(root, "wallpaper.webp", Some("webp"), 288_340, vec![]),
+        report(root, "Games/fonts.7z", Some("7z"), 3_407_872, vec![]),
+        report(root, "Photos/wallpaper.webp", Some("webp"), 288_340, vec![]),
         report(root, "notes.txt", None, 1_204, vec![]),
     ]
 }
@@ -423,7 +588,7 @@ fn render_svg(app: &mut App, width: u16, height: u16, title: &str) -> String {
 mod tests {
     use super::*;
     use crate::tui::keymap::HELP_GROUPS;
-    use crate::tui::svg::{ANIM_STEPS, FONT_STACK, rainbow_values};
+    use crate::tui::svg::{ANIM_STEPS, FONT_STACK, gauge_values, rainbow_values};
     use ratatui::buffer::Buffer;
     use ratatui::style::Color;
 
@@ -437,9 +602,14 @@ mod tests {
         })
     }
 
-    fn values_of(svg: &str) -> Vec<Vec<String>> {
-        svg.split("values=\"")
+    /// The `values` of every animation of `attr` (`fill` for the wordmark,
+    /// `stop-color` for a progress bar), in document order.
+    fn values_of(svg: &str, attr: &str) -> Vec<Vec<String>> {
+        let key = format!("attributeName=\"{attr}\"");
+        svg.split("<animate ")
             .skip(1)
+            .filter(|anim| anim.starts_with(&key))
+            .filter_map(|anim| anim.split("values=\"").nth(1))
             .map(|rest| {
                 rest.split('"')
                     .next()
@@ -468,9 +638,8 @@ mod tests {
         }
         assert!(help.contains("<title>meownary keys</title>"));
 
-        assert_eq!(preview.matches("<animate").count(), 4);
-        let vals = values_of(&preview);
-        assert_eq!(vals.len(), 4);
+        let vals = values_of(&preview, "fill");
+        assert_eq!(vals.len(), 4, "the wordmark's four letters");
         for (i, v) in vals.iter().enumerate() {
             assert_eq!(v.len(), ANIM_STEPS);
             assert_eq!(v.first(), v.last(), "seamless loop");
@@ -481,6 +650,19 @@ mod tests {
             "the wave travels across the letters"
         );
         assert!(preview.contains("dur=\"3.5s\" repeatCount=\"indefinite\""));
+        // The activity bar flows through the wordmark's rainbow, a stop per
+        // filled cell, on the wordmark's clock.
+        let bar = values_of(&preview, "stop-color");
+        assert!(bar.len() >= 4, "the running bar animates: {}", bar.len());
+        for (j, v) in bar.iter().enumerate() {
+            assert_eq!(v, &gauge_values(j), "bar cell {j}");
+            assert_eq!(v.first(), v.last(), "seamless loop");
+        }
+        assert_eq!(
+            preview.matches("<animate").count(),
+            4 + bar.len(),
+            "nothing else animates"
+        );
 
         for (title, hints) in HELP_GROUPS {
             assert!(help.contains(title), "group {title}");
@@ -520,11 +702,13 @@ mod tests {
         assert!(svg.contains("<title>meownary picker</title>"));
         assert_eq!(svg.matches("<animate").count(), 4, "the wordmark");
         for needle in [
-            "path",
-            "places",
             "Downloads",
-            r"C:\Users\you\Documents",
-            "Current folder",
+            "Scan this folder",
+            "3,912+ files",
+            "1,030 files",
+            "2,264+ files",
+            "game-patch.zip",
+            "scan here",
             PICKER_LINE,
         ] {
             assert!(svg.contains(needle), "{needle}");
@@ -534,54 +718,151 @@ mod tests {
     const PICKER_LINE: &str =
         "Pick a file or folder to scan. Nothing is changed until you confirm an action.";
 
+    /// Every size the picker is drawn at, from roomy to tiny.
+    const PICKER_SIZES: [(u16, u16); 6] =
+        [(100, 30), (80, 24), (60, 24), (50, 20), (34, 20), (24, 8)];
+
+    fn has_rgb(buf: &Buffer) -> bool {
+        buf.content()
+            .iter()
+            .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..)))
+    }
+
+    /// The picker's four screens: places, a folder, the prompt, and the
+    /// large-root confirm.
+    const SCREENS: [&str; 4] = ["places", "folder", "prompt", "confirm"];
+
+    fn picker_screen(name: &str) -> App {
+        let (mut app, keys) = match name {
+            "places" => (demo_places(), vec![]),
+            "prompt" => (
+                demo_picker(),
+                vec![KeyCode::Char('/'), KeyCode::Char('g'), KeyCode::Char('a')],
+            ),
+            "confirm" => (demo_places(), vec![KeyCode::End, KeyCode::Char('s')]),
+            _ => (demo_picker(), vec![]),
+        };
+        for k in keys {
+            app.on_key(KeyEvent::from(k));
+        }
+        app
+    }
+
     #[test]
     fn the_picker_draws_calmly_at_every_size() {
         let look = Look::vivid();
+        for name in SCREENS {
+            for (w, h) in PICKER_SIZES {
+                let (text, _) = screen(&mut picker_screen(name), &look, w, h);
+                assert!(text.contains("esc"), "{name} {w}x{h}\n{text}");
+                if (w, h) == (24, 8) {
+                    continue;
+                }
+                let needles: &[&str] = match name {
+                    "places" => &["places", "Downloads", "enter  open", "/  path"],
+                    "folder" => &["Downloads", "Scan this", "Games", "s  scan here"],
+                    "prompt" => &["/  ga_", "Games", "tab  complete", "esc  cancel"],
+                    _ => &["That is your whole", "esc  cancel"],
+                };
+                for needle in needles {
+                    // The narrowest footers drop hints; esc always stays.
+                    if w <= 60 && needle.contains("  ") && !needle.starts_with("esc") {
+                        continue;
+                    }
+                    assert!(text.contains(needle), "{name} {w}x{h}: {needle}\n{text}");
+                }
+            }
+        }
+        let (wide, _) = screen(&mut demo_picker(), &look, 100, 30);
+        assert!(wide.contains(PICKER_LINE), "{wide}");
+        assert!(wide.contains("meownary"));
+        assert!(!wide.contains("findings"), "no scan view behind\n{wide}");
+        for (w, h) in [(10, 4), (200, 60), (1, 1), (80, 10)] {
+            for name in SCREENS {
+                let _ = screen(&mut picker_screen(name), &look, w, h);
+            }
+        }
+        // NO_COLOR draws every screen in terminal defaults; NO_ANIM holds
+        // still.
+        let mono = Look::from_flags(true, false);
+        let still = Look::from_flags(false, true);
+        for name in SCREENS {
+            let (_, buf) = screen(&mut picker_screen(name), &mono, 80, 24);
+            assert!(!has_rgb(&buf), "{name}");
+            let mut a = picker_screen(name);
+            a.anim_ms = 0;
+            let (one, _) = screen(&mut a, &still, 80, 24);
+            a.anim_ms = 4321;
+            let (two, _) = screen(&mut a, &still, 80, 24);
+            assert_eq!(one, two, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_location_line_holds_its_row_across_listings() {
+        let look = Look::vivid();
+        let row_of = |text: &str, needle: &str| text.lines().position(|l| l.contains(needle));
+        for (w, h) in [(100, 30), (80, 24), (60, 24)] {
+            let (folder, _) = screen(&mut demo_picker(), &look, w, h);
+            let (places, _) = screen(&mut demo_places(), &look, w, h);
+            let at = row_of(&folder, "Downloads ─").expect("location");
+            assert_eq!(row_of(&places, "places ─"), Some(at), "{w}x{h}");
+            // A folder of two entries and one of three hundred.
+            for n in [2usize, 300] {
+                let mut picker = Picker::with_suggestions(Vec::new(), Vec::new());
+                let dir = PathBuf::from("big");
+                picker.on_paste("big");
+                let full = picker
+                    .take_requests()
+                    .into_iter()
+                    .find_map(|r| match r {
+                        crate::tui::picker::Request::Stat(p) => Some(p),
+                        _ => None,
+                    })
+                    .unwrap_or(dir);
+                picker.on_stat(&full, crate::tui::picker::Found::Folder);
+                let items = (0..n)
+                    .map(|i| Item {
+                        name: format!("f{i:03}"),
+                        path: full.join(format!("f{i:03}")),
+                        dir: false,
+                        cloud: false,
+                        link: false,
+                        hidden: false,
+                        size: Some(1),
+                    })
+                    .collect();
+                picker.on_listing(Listing {
+                    location: full.clone(),
+                    items,
+                    error: None,
+                    truncated: false,
+                });
+                let (text, _) = screen(&mut App::picking(picker), &look, w, h);
+                assert_eq!(
+                    row_of(&text, "big ─"),
+                    Some(at),
+                    "{n} rows at {w}x{h}\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_picker_help_sheet_lists_every_picker_key() {
+        let look = Look::vivid();
         for (w, h) in [(100, 30), (80, 24)] {
             let mut app = demo_picker();
-            let (text, _) = screen(&mut app, &look, w, h);
-            for needle in [
-                "meownary",
-                " path ",
-                "places",
-                "place   Downloads",
-                r"C:\Users\you\Desktop",
-                "up/dn",
-                "enter",
-                "esc",
-            ] {
-                assert!(text.contains(needle), "{w}x{h}: {needle}\n{text}");
+            app.on_key(KeyEvent::from(KeyCode::Char('?')));
+            let (help, _) = screen(&mut app, &look, w, h);
+            for (title, hints) in crate::tui::keymap::PICKER_HELP {
+                assert!(help.contains(title), "{w}x{h}: {title}\n{help}");
+                for hint in *hints {
+                    assert!(help.contains(hint.label), "{w}x{h}: {}\n{help}", hint.label);
+                }
             }
-            assert!(
-                text.contains(PICKER_LINE)
-                    || (text.contains("Pick a file or folder to scan.")
-                        && text.contains("Nothing is changed until you confirm an action.")),
-                "{w}x{h} tagline\n{text}"
-            );
-            assert!(!text.contains("files  "), "no scan view behind\n{text}");
+            assert!(help.contains("Press any key to close"), "{help}");
         }
-        // The tagline splits where it no longer fits on one line.
-        let (narrow, _) = screen(&mut demo_picker(), &look, 60, 24);
-        assert!(
-            narrow.contains("Pick a file or folder to scan."),
-            "{narrow}"
-        );
-        assert!(narrow.contains("Downloads"), "{narrow}");
-        // Short and tiny terminals keep the path box, and never panic.
-        let (short, _) = screen(&mut demo_picker(), &look, 80, 10);
-        assert!(short.contains(" path "), "{short}");
-        for (w, h) in [(24, 8), (30, 9), (40, 12), (10, 4), (200, 60), (1, 1)] {
-            let _ = screen(&mut demo_picker(), &look, w, h);
-        }
-        // NO_COLOR draws the picker in terminal defaults.
-        let mono = Look::from_flags(true, false);
-        let mut app = demo_picker();
-        let (_, buf) = screen(&mut app, &mono, 80, 24);
-        assert!(
-            !buf.content()
-                .iter()
-                .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..)))
-        );
     }
 
     fn screen(app: &mut App, look: &Look, w: u16, h: u16) -> (String, Buffer) {
@@ -674,6 +955,85 @@ mod tests {
         empty.scan_done();
         let (none, _) = screen(&mut empty, &look, 80, 24);
         assert!(none.contains("No files to scan."), "{none}");
+    }
+
+    const VIEW_SIZES: [(u16, u16); 4] = [(100, 30), (80, 24), (60, 24), (50, 20)];
+
+    fn no_rgb(buf: &Buffer) -> bool {
+        !buf.content()
+            .iter()
+            .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..)))
+    }
+
+    #[test]
+    fn the_folder_view_draws_mid_scan_and_done_at_every_size() {
+        let sep = std::path::MAIN_SEPARATOR;
+        for look in [Look::vivid(), Look::from_flags(true, false)] {
+            for (w, h) in VIEW_SIZES {
+                let mut app = demo_scanning();
+                app.on_action(Key::Home);
+                let (text, buf) = screen(&mut app, &look, w, h);
+                assert!(text.contains("Scanning 4 of 16 files"), "{w}x{h}\n{text}");
+                for needle in [
+                    format!("Media{sep}"),
+                    format!("Photos{sep}"),
+                    "notes.txt".into(),
+                ] {
+                    assert!(text.contains(&needle), "{w}x{h}: {needle}\n{text}");
+                }
+                if w >= 80 {
+                    assert!(text.contains("1/2"), "the folder being scanned\n{text}");
+                    assert!(text.contains("3 files"), "a waiting folder's count\n{text}");
+                    assert!(text.contains("1 file "), "a done folder\n{text}");
+                }
+                if look.mono {
+                    assert!(no_rgb(&buf), "{w}x{h}");
+                }
+
+                let mut done = demo_app();
+                done.on_action(Key::Left);
+                done.on_action(Key::Home);
+                let (text, buf) = screen(&mut done, &look, w, h);
+                assert!(text.contains("Scanned 16 files"), "{w}x{h}\n{text}");
+                assert!(text.contains(&format!("Games{sep}")), "{w}x{h}\n{text}");
+                if !done.narrow {
+                    assert!(text.contains("folder"), "the folder summary\n{text}");
+                }
+                if h >= 24 && w >= 80 {
+                    assert!(text.contains("1 file, 1 with findings"), "{w}x{h}\n{text}");
+                    assert!(text.contains("open it"), "{w}x{h}\n{text}");
+                }
+                if look.mono {
+                    assert!(no_rgb(&buf), "{w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_folder_summary_names_what_is_inside() {
+        let look = Look::vivid();
+        let mut app = demo_app();
+        app.on_action(Key::Left);
+        let pos = app.rows().iter().position(|r| r.name == "Photos").unwrap();
+        app.file_cursor = pos;
+        let (text, _) = screen(&mut app, &look, 100, 30);
+        for needle in [
+            "3 files, 2 with findings",
+            "notice 3",
+            "most common",
+            "jpeg.exif",
+            "png.text",
+            "deattribute every file in it",
+        ] {
+            assert!(text.contains(needle), "{needle}\n{text}");
+        }
+        // Inside it, the footer offers the way back up.
+        app.on_action(Key::Enter);
+        let (inside, _) = screen(&mut app, &look, 100, 30);
+        assert!(inside.contains("left  up"), "{inside}");
+        assert!(inside.contains("beach-day.jpg"), "{inside}");
+        assert!(inside.contains(&format!("downloads{}Photos", std::path::MAIN_SEPARATOR)));
     }
 
     #[test]
