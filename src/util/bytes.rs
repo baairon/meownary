@@ -54,9 +54,11 @@ pub fn cstr(buf: &[u8], off: usize, max: usize) -> Option<&[u8]> {
 pub fn utf16le(buf: &[u8], off: usize, max_units: usize) -> Option<String> {
     let rest = buf.get(off..)?;
     let units: Vec<u16> = rest
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .take(max_units)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .map(|c| u16::from_le_bytes(*c))
         .take_while(|&u| u != 0)
         .collect();
     Some(String::from_utf16_lossy(&units))

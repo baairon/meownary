@@ -113,6 +113,12 @@ pub enum JunkKind {
     Iptc,
     /// Document properties such as author and dates (PDF Info, OLE summary).
     DocInfo,
+    /// AI provenance marks: C2PA content credentials, JUMBF boxes, and AI tool
+    /// names in comments or package metadata.
+    Provenance,
+    /// Invisible or look-alike characters in text: zero-width and tag
+    /// characters, exotic spaces, and bidirectional controls.
+    HiddenText,
 }
 
 impl Category {

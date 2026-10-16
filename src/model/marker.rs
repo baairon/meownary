@@ -26,7 +26,8 @@ impl Region {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerKind {
-    /// Loose bytes with no surrounding structure to keep valid.
+    /// Loose bytes with no surrounding structure to keep valid. A structural
+    /// rewrite of `Raw` is a text file cleaned of hidden characters.
     Raw,
     /// Appended data after a PE image (truncate at the overlay offset).
     PeOverlay,
@@ -34,7 +35,8 @@ pub enum ContainerKind {
     PeResource,
     /// A JPEG `APP1` segment (EXIF/XMP).
     JpegApp1,
-    /// The trailing comment of a ZIP end-of-central-directory record.
+    /// The trailing comment of a ZIP end-of-central-directory record, or one
+    /// entry of the archive (an OOXML or EPUB part) cleaned and re-stored.
     ZipComment,
     /// A 128-byte ID3v1 trailer.
     Id3v1,
@@ -48,7 +50,7 @@ pub enum ContainerKind {
     PngChunk,
     /// A RIFF chunk (WebP, WAV, AVI).
     RiffChunk,
-    /// An ISO base media box (MP4, MOV).
+    /// An ISO base media box or `meta` item (MP4, MOV, HEIC, AVIF).
     IsoBox,
     /// An EBML element (Matroska, WebM).
     EbmlElement,
