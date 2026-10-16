@@ -5,7 +5,7 @@
 //! Every marker here is a RawBlank or a Truncate, so `structural_remove`
 //! stays `None`.
 
-mod image;
+pub(crate) mod image;
 mod rich;
 mod version;
 
@@ -288,6 +288,16 @@ const VERSION_KEYS: [&str; 6] = [
 /// Free-form version strings that carry build or personal notes.
 const JUNK_KEYS: [&str; 3] = ["Comments", "PrivateBuild", "SpecialBuild"];
 
+/// Free-form version values deattribute blanks beside [`VERSION_KEYS`]: where
+/// build notes and patch credits usually go. `InternalName` and
+/// `ProductVersion` stay, since some installers and updaters read them.
+const DEATTRIBUTE_EXTRA_KEYS: [&str; 4] = [
+    "Comments",
+    "LegalTrademarks",
+    "PrivateBuild",
+    "SpecialBuild",
+];
+
 /// Individual decorative version values behind the aggregate audit finding.
 pub(crate) fn deattribute_version(view: &dyn FileView) -> Vec<Marker> {
     let Some(img) = PeImage::parse(view) else {
@@ -299,7 +309,10 @@ pub(crate) fn deattribute_version(view: &dyn FileView) -> Vec<Marker> {
     info.strings
         .iter()
         .filter(|s| {
-            VERSION_KEYS.contains(&s.key.as_str()) && !s.value.trim().is_empty() && s.value_len > 0
+            (VERSION_KEYS.contains(&s.key.as_str())
+                || DEATTRIBUTE_EXTRA_KEYS.contains(&s.key.as_str()))
+                && !s.value.trim().is_empty()
+                && s.value_len > 0
         })
         .map(|s| {
             Marker::blank(
@@ -734,7 +747,7 @@ fn mostly_zero(view: &dyn FileView, start: u64, len: u64) -> bool {
 
 /// The standard PE checksum: a 16-bit one's-complement sum of the file's
 /// little-endian words with the CheckSum field taken as zero, plus the length.
-fn pe_checksum(view: &dyn FileView, checksum_off: u64) -> Option<u32> {
+pub(crate) fn pe_checksum(view: &dyn FileView, checksum_off: u64) -> Option<u32> {
     const CHUNK: usize = 1 << 20;
     let size = view.size();
     let mut sum: u64 = 0;

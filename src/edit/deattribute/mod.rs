@@ -40,6 +40,12 @@ pub enum Kind {
     Patch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Basic,
+    Deep,
+}
+
 impl Kind {
     pub fn slug(self) -> &'static str {
         match self {
@@ -85,6 +91,8 @@ pub struct Target {
     pub kind: Kind,
     pub marker: Marker,
     pub expected_hash: String,
+    /// Same-length bytes to write instead of the marker's fill byte.
+    pub replacement: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,16 +101,50 @@ pub struct Skipped {
     pub reason: Reason,
 }
 
+/// Something the copy will lose that is not a skipped credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caveat {
+    /// The file carries a code signature (Authenticode or `LC_CODE_SIGNATURE`)
+    /// that any edit invalidates.
+    SignatureInvalidated,
+}
+
+impl Caveat {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::SignatureInvalidated => "signature invalidated, re-sign to run",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FilePlan {
     pub targets: Vec<Target>,
     pub skipped: Vec<Skipped>,
+    pub caveats: Vec<Caveat>,
+}
+
+impl Target {
+    /// The bytes this target leaves in its region.
+    pub fn new_bytes(&self) -> Vec<u8> {
+        match (&self.replacement, &self.marker.removal) {
+            (Some(bytes), _) => bytes.clone(),
+            (None, RemovalStrategy::RawBlank { fill }) => {
+                vec![*fill; usize::try_from(self.marker.region.len).unwrap_or(0)]
+            }
+            (None, _) => Vec::new(),
+        }
+    }
 }
 
 fn select(category: &Category, signature: &str) -> Option<Kind> {
     match category {
         Category::Brand(_) => Some(Kind::Brand),
-        Category::Tamper(TamperKind::Patched) if signature == "catalog.tamper.patched_by" => {
+        Category::Tamper(TamperKind::Patched | TamperKind::Cracked)
+            if signature
+                .strip_prefix("catalog.")
+                .is_some_and(|id| PATCH_CREDIT_IDS.contains(&id)) =>
+        {
             Some(Kind::Patch)
         }
         _ => None,
@@ -157,13 +199,35 @@ fn standalone_credit(id: &str) -> bool {
     )
 }
 
-/// Bound a plain credit to a printable C string inside the same scan window.
+/// Catalog credits that name who patched or cracked the file.
+const PATCH_CREDIT_IDS: &[&str] = &["tamper.patched_by", "tamper.cracked_by"];
+
+/// Formats whose metadata sits under a CRC a raw blank would break: a catalog
+/// needle there is cleaned only through the parser's own marker.
+const CRC_FORMATS: &[&str] = &["ogg", "matroska", "webm"];
+
+/// Catalog needles too short to trust without the version that follows them.
+const VERSIONED_NEEDLES: &[&str] = &["encoder.lavf", "encoder.lavc"];
+
+/// Bound a plain credit to the C string that holds it. The needle must start a
+/// word (`dispatched by` is not `patched by`), the span runs back to the
+/// string's NUL when one is near and forward to the next NUL or non-text byte,
+/// and the result must be valid UTF-8. When the file's strings are not
+/// NUL-terminated (Go, Rust), only the needle itself is blanked.
 fn c_string_marker(
     view: &dyn FileView,
     offset: u64,
     needle_len: u64,
     available: usize,
+    unterminated: bool,
+    versioned: bool,
 ) -> Option<Marker> {
+    if offset > 0 {
+        let prev = view.read_at(offset - 1, 1).ok()?;
+        if prev.first().is_some_and(u8::is_ascii_alphanumeric) {
+            return None;
+        }
+    }
     let limit = available.min(80);
     let bytes = view.read_at(offset, limit).ok()?;
     let needle_len = usize::try_from(needle_len).ok()?;
@@ -174,12 +238,34 @@ fn c_string_marker(
     {
         return None;
     }
-    let end = needle_len
+    if versioned && !bytes.get(needle_len).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    if unterminated {
+        return Some(Marker::blank(
+            Region::new(offset, needle_len as u64),
+            ContainerKind::Raw,
+        ));
+    }
+    let text = |b: u8| (0x20..=0x7e).contains(&b) || b >= 0x80;
+    let mut end = needle_len
         + bytes[needle_len..]
             .iter()
-            .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b))?;
+            .position(|&b| b == 0 || !text(b))?;
+    if std::str::from_utf8(&bytes[..end]).is_err() {
+        end = needle_len
+            + bytes[needle_len..]
+                .iter()
+                .position(|&b| !(0x20..=0x7e).contains(&b))?;
+    }
+    let back = offset.min(64);
+    let before = view.read_at(offset - back, back as usize).ok()?;
+    let start = match before.iter().rposition(|&b| !(0x20..=0x7e).contains(&b)) {
+        Some(i) if before[i] == 0 => offset - back + i as u64 + 1,
+        _ => offset,
+    };
     Some(Marker::blank(
-        Region::new(offset, end as u64),
+        Region::new(start, offset - start + end as u64),
         ContainerKind::Raw,
     ))
 }
@@ -194,6 +280,10 @@ fn push_skip(plan: &mut FilePlan, kind: Kind, reason: Reason) {
 /// Plan every selected span. This never reads finding titles, notes, or evidence
 /// into output data. The caller provides a view of the same file it scanned.
 pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
+    plan_mode(report, view, Mode::Basic)
+}
+
+pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePlan {
     let mut out = FilePlan::default();
     let mut raw: Vec<(Kind, Marker)> = Vec::new();
     let pe_values = if report.format.as_deref() == Some("pe") {
@@ -237,9 +327,14 @@ pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
     }
 
     let cat = catalog();
-    for hit in catalog_probe::deattribute_hits(view, report.format.as_deref()) {
+    let format = report.format.as_deref();
+    let unterminated = report.findings.iter().any(|f| {
+        f.signature_id.starts_with("catalog.toolchain.go")
+            || f.signature_id == "catalog.toolchain.rust"
+    });
+    for hit in catalog_probe::deattribute_hits(view, format) {
         let sig = &cat.signatures[hit.index];
-        let kind = if sig.id == "tamper.patched_by" {
+        let kind = if PATCH_CREDIT_IDS.contains(&sig.id.as_str()) {
             Kind::Patch
         } else {
             Kind::Brand
@@ -249,13 +344,21 @@ pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
             push_skip(&mut out, kind, Reason::LoadBearing);
             continue;
         }
+        let covered = || {
+            raw.iter().any(|(_, m)| {
+                m.region.offset <= hit.offset && m.region.end() >= hit.offset + hit.len
+            })
+        };
+        if format.is_some_and(|f| CRC_FORMATS.contains(&f)) {
+            if !covered() {
+                push_skip(&mut out, kind, Reason::NoMarker);
+            }
+            continue;
+        }
         // PDF and other structured producer values must come from a parser,
         // never an unbounded catalog needle in a content stream.
         if sig.id.starts_with("producer.") {
-            let covered = raw.iter().any(|(_, m)| {
-                m.region.offset <= hit.offset && m.region.end() >= hit.offset + hit.len
-            });
-            if !covered {
+            if !covered() {
                 match marker_for(sig, Region::new(hit.offset, hit.len)) {
                     Some(marker) => raw.push((kind, marker)),
                     None => push_skip(&mut out, kind, Reason::NoMarker),
@@ -263,8 +366,16 @@ pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
             }
             continue;
         }
-        if sig.id == "tamper.patched_by" || standalone_credit(&sig.id) {
-            match c_string_marker(view, hit.offset, hit.len, hit.available) {
+        if kind == Kind::Patch || standalone_credit(&sig.id) {
+            let versioned = VERSIONED_NEEDLES.contains(&sig.id.as_str());
+            match c_string_marker(
+                view,
+                hit.offset,
+                hit.len,
+                hit.available,
+                unterminated,
+                versioned,
+            ) {
                 Some(marker) => raw.push((kind, marker)),
                 None => push_skip(&mut out, kind, Reason::NoMarker),
             }
@@ -273,13 +384,20 @@ pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
         }
     }
 
-    raw.sort_by_key(|(_, m)| (m.region.offset, m.region.len));
+    // At one offset the longer span sorts first, and the sort is stable, so a
+    // parser's marker stays ahead of a shorter catalog one it covers.
+    raw.sort_by_key(|(_, m)| (m.region.offset, std::cmp::Reverse(m.region.len)));
     let mut merged: Vec<(Kind, Marker)> = Vec::new();
     for (kind, marker) in raw {
         if let Some((old_kind, old)) = merged.last_mut()
             && marker.region.offset < old.region.end()
         {
-            if old.removal == marker.removal {
+            if marker.region.end() <= old.region.end() {
+                // Fully covered: the covering span already blanks it.
+                if kind == Kind::Patch {
+                    *old_kind = kind;
+                }
+            } else if old.removal == marker.removal {
                 old.region.len = old.region.end().max(marker.region.end()) - old.region.offset;
                 if kind == Kind::Patch {
                     *old_kind = kind;
@@ -317,6 +435,7 @@ pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
             kind,
             marker,
             expected_hash: hash_hex(&bytes),
+            replacement: None,
         });
     }
     out
@@ -455,7 +574,12 @@ pub fn write_deattributed(
         ));
     }
     for target in targets {
-        if !matches!(target.marker.removal, RemovalStrategy::RawBlank { .. }) {
+        if !matches!(target.marker.removal, RemovalStrategy::RawBlank { .. })
+            || target
+                .replacement
+                .as_ref()
+                .is_some_and(|b| b.len() as u64 != target.marker.region.len)
+        {
             return Err(EditError::Refused(
                 "a deattributed copy only blanks bytes in place".into(),
             ));
@@ -473,7 +597,8 @@ pub fn write_deattributed(
         return Err(EditError::Refused("not a regular file".into()));
     }
     let src = File::open(original)?;
-    if src.metadata()?.len() != size {
+    let opened = src.metadata()?;
+    if opened.len() != size || !same_file(&meta, &opened) {
         return Err(EditError::Changed);
     }
     check_regions(&src, targets)?;
@@ -489,7 +614,7 @@ pub fn write_deattributed(
         _ => {}
     }
     let (tmp, file) = fsio::create_temp_beside(&output)?;
-    match build_copy(&src, file, &tmp, &output, size, targets, &meta) {
+    match build_copy(original, &src, file, &tmp, &output, size, targets, &meta) {
         Ok(()) => {
             if let Some(dir) = output.parent() {
                 fsio::sync_dir(dir);
@@ -501,6 +626,109 @@ pub fn write_deattributed(
             Err(e)
         }
     }
+}
+
+/// What checking a written copy found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verified {
+    /// The copy holds exactly the original with the planned spans replaced,
+    /// keeps the original's format, and plans nothing more in the same mode.
+    pub clean: bool,
+    /// The rescan of the copy was partial, so `clean` could not be confirmed.
+    pub partial: bool,
+}
+
+impl Verified {
+    pub fn ok(self) -> bool {
+        self.clean && !self.partial
+    }
+
+    const FAILED: Self = Self {
+        clean: false,
+        partial: false,
+    };
+}
+
+/// Check a copy written by [`write_deattributed`]: byte for byte it is the
+/// original with every target's new bytes in place, its format is unchanged,
+/// and planning it again in the same mode finds nothing. Headless and the
+/// interactive view both call this, so both report the same verdict.
+pub fn verify_copy(
+    original: &Path,
+    output: &Path,
+    format: Option<&str>,
+    targets: &[Target],
+    mode: Mode,
+) -> Verified {
+    if !same_with_targets(original, output, targets).unwrap_or(false) {
+        return Verified::FAILED;
+    }
+    let again = crate::scan::scan_file_detailed(output, &crate::parsers::registry());
+    if again.report.format.as_deref() != format {
+        return Verified::FAILED;
+    }
+    let Ok(view) = crate::scan::WindowedFile::open(output) else {
+        return Verified::FAILED;
+    };
+    let replanned = crate::scan::guard::guarded(|| plan_mode(&again.report, &view, mode));
+    Verified {
+        clean: replanned.is_ok_and(|p| p.targets.is_empty()),
+        partial: again.report.partial,
+    }
+}
+
+/// Stream both files and compare, with each target's new bytes laid over the
+/// original.
+fn same_with_targets(original: &Path, output: &Path, targets: &[Target]) -> io::Result<bool> {
+    let a = File::open(original)?;
+    let b = File::open(output)?;
+    let size = a.metadata()?.len();
+    if b.metadata()?.len() != size {
+        return Ok(false);
+    }
+    let overlays: Vec<(u64, Vec<u8>)> = targets
+        .iter()
+        .map(|t| (t.marker.region.offset, t.new_bytes()))
+        .collect();
+    let mut want = vec![0u8; fsio::CHUNK];
+    let mut got = vec![0u8; fsio::CHUNK];
+    let mut pos = 0u64;
+    while pos < size {
+        let n = usize::try_from((size - pos).min(fsio::CHUNK as u64)).unwrap_or(fsio::CHUNK);
+        fill_exact(&a, pos, &mut want[..n])?;
+        fill_exact(&b, pos, &mut got[..n])?;
+        let end = pos + n as u64;
+        for (off, bytes) in &overlays {
+            let o_end = off + bytes.len() as u64;
+            if o_end <= pos || *off >= end {
+                continue;
+            }
+            let from = (*off).max(pos);
+            let to = o_end.min(end);
+            let dst = (from - pos) as usize..(to - pos) as usize;
+            let src = (from - off) as usize..(to - off) as usize;
+            want[dst].copy_from_slice(&bytes[src]);
+        }
+        if want[..n] != got[..n] {
+            return Ok(false);
+        }
+        pos = end;
+    }
+    Ok(true)
+}
+
+/// Read exactly `buf.len()` bytes at `off`, looping over short reads.
+fn fill_exact(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match fsio::read_at(file, off + done as u64, &mut buf[done..]) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Every target's region in `file` still hashes to the scan's value.
@@ -517,7 +745,9 @@ fn check_regions(file: &File, targets: &[Target]) -> Result<(), EditError> {
 
 /// Fill the temp file `out` (at `tmp`) with a blanked copy of `src`, then move
 /// it onto `output`. The caller removes `tmp` on failure.
+#[allow(clippy::too_many_arguments)]
 fn build_copy(
+    src_path: &Path,
     src: &File,
     mut out: File,
     tmp: &Path,
@@ -548,20 +778,67 @@ fn build_copy(
     for target in targets {
         if let RemovalStrategy::RawBlank { fill } = target.marker.removal {
             let region = target.marker.region;
-            fsio::write_fill(&out, region.offset, region.len, fill)?;
+            if let Some(bytes) = &target.replacement {
+                fsio::write_at(&out, region.offset, bytes)?;
+            } else {
+                fsio::write_fill(&out, region.offset, region.len, fill)?;
+            }
         }
     }
     out.sync_all()?;
     drop(out);
-    // Keep the original's mode (an executable stays executable). Windows only
-    // has a read-only bit, which would block the next run's replace, so it is
-    // left clear there.
+    // Keep the original's mode (an executable stays executable) without the
+    // setuid and setgid bits. Windows only has a read-only bit, which would
+    // block the next run's replace, so it is left clear there.
     #[cfg(unix)]
-    fs::set_permissions(tmp, meta.permissions())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o1777;
+        fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
+    }
     #[cfg(not(unix))]
     let _ = meta;
-    fs::rename(tmp, output)?;
+    carry_origin_mark(src_path, tmp);
+    fs::rename(tmp, output).map_err(|e| match e.kind() {
+        io::ErrorKind::PermissionDenied => {
+            EditError::Refused("the previous copy is read-only or in use".into())
+        }
+        _ => EditError::Io(e),
+    })?;
     Ok(())
+}
+
+/// The file opened is the one whose metadata was checked, not something
+/// swapped in between.
+fn same_file(checked: &fs::Metadata, opened: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        checked.dev() == opened.dev() && checked.ino() == opened.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        checked.len() == opened.len() && checked.modified().ok() == opened.modified().ok()
+    }
+}
+
+/// Copy the download mark (Windows `Zone.Identifier`) onto the copy, so a
+/// copy of a downloaded program is treated like the download itself. Best
+/// effort: a file without the mark, or a volume without streams, is fine.
+fn carry_origin_mark(original: &Path, tmp: &Path) {
+    #[cfg(windows)]
+    {
+        let stream = |p: &Path| {
+            let mut s = p.as_os_str().to_owned();
+            s.push(":Zone.Identifier");
+            PathBuf::from(s)
+        };
+        if let Ok(mark) = fs::read(stream(original)) {
+            let _ = fs::write(stream(tmp), mark);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (original, tmp);
 }
 
 #[cfg(test)]

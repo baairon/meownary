@@ -584,6 +584,7 @@ fn credit(off: u64, len: u64, original: &[u8]) -> super::deattribute::Target {
         kind: super::deattribute::Kind::Patch,
         marker: blank(off, len),
         expected_hash: crate::util::hash::hash_hex(span),
+        replacement: None,
     }
 }
 

@@ -164,8 +164,10 @@ pub(crate) fn deattribute_hits(view: &dyn FileView, format: Option<&str>) -> Vec
             };
             let category = sig.kind.to_category();
             if !matches!(category, Category::Brand(_))
-                && !(category == Category::Tamper(TamperKind::Patched)
-                    && sig.id == "tamper.patched_by")
+                && !(matches!(
+                    category,
+                    Category::Tamper(TamperKind::Patched | TamperKind::Cracked)
+                ) && matches!(sig.id.as_str(), "tamper.patched_by" | "tamper.cracked_by"))
             {
                 continue;
             }

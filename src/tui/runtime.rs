@@ -628,6 +628,7 @@ pub fn write_copies(plan: &Plan) -> (Vec<SavedItem>, Vec<String>) {
             kind,
             marker: item.marker.clone(),
             expected_hash: hash,
+            replacement: None,
         };
         match by_file
             .iter_mut()
