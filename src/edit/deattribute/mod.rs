@@ -398,6 +398,9 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
     let deep = (mode == Mode::Deep).then(|| deep::sweep(report, view));
     if let Some(d) = &deep {
         raw.extend(d.blanks.iter().cloned());
+        for reason in &d.skipped {
+            push_skip(&mut out, Kind::Brand, *reason);
+        }
     }
 
     // At one offset the longer span sorts first, and the sort is stable, so a
@@ -457,6 +460,13 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
     if let Some(d) = deep {
         for (kind, off, bytes) in d.rewrites {
             let end = off + bytes.len() as u64;
+            if out
+                .targets
+                .iter()
+                .any(|t| t.marker.region.offset <= off && t.marker.region.end() >= end)
+            {
+                continue;
+            }
             if out
                 .targets
                 .iter()

@@ -16,7 +16,7 @@ use crate::model::{ContainerKind, FileReport, Marker, Region, RemovalStrategy};
 use crate::parsers::{elf, macho};
 use crate::scan::FileView;
 
-use super::{Caveat, Kind};
+use super::{Caveat, Kind, Reason};
 
 mod pe;
 
@@ -43,6 +43,7 @@ pub(super) struct Deep {
     /// Same-length field rewrites at `(offset, new bytes)`.
     pub rewrites: Vec<(Kind, u64, Vec<u8>)>,
     pub caveats: Vec<Caveat>,
+    pub skipped: Vec<Reason>,
 }
 
 /// Plan the deep pass for one file.
@@ -74,7 +75,27 @@ pub(super) struct Hit {
     /// Length in bytes.
     pub len: usize,
     pub text: String,
+    pub encoding: Encoding,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Encoding {
+    Utf8,
+    Utf16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Source {
+    Company,
+    Product,
+    Pdb,
+    Manifest,
+    Url,
+    Registry,
+    Certificate,
+}
+
+pub(super) type Evidence = Vec<(String, Source)>;
 
 /// Byte ranges a sweep must never touch, as sorted `(start, end)` pairs.
 #[derive(Debug, Default)]
@@ -130,6 +151,7 @@ fn strings(bytes: &[u8], base: u64, bounded_start: bool, out: &mut Vec<Hit>) {
                 off: base + start as u64,
                 len,
                 text: text.to_string(),
+                encoding: Encoding::Utf8,
             });
         }
     }
@@ -157,6 +179,7 @@ fn strings(bytes: &[u8], base: u64, bounded_start: bool, out: &mut Vec<Hit>) {
                         .step_by(2)
                         .map(|&b| char::from(b))
                         .collect(),
+                    encoding: Encoding::Utf16,
                 });
             }
         }
@@ -229,18 +252,6 @@ const PATCH_CREDITS: &[&str] = &[
 
 /// Vendor marks of licensing libraries, which name the protection outright.
 const LICENSING_VENDORS: &[&str] = &["limelm", "wyday.com", "floatinglicenses", "turboactivate"];
-
-/// Licensing words that count only beside another attribution signal.
-const LICENSING_WORDS: &[&str] = &[
-    "license",
-    "licence",
-    "licensing",
-    "activation",
-    "deactivation",
-    "trial",
-    "serial number",
-    "isgenuine",
-];
 
 /// Paths that name the machine or the person who built the file.
 const BUILD_PATHS: &[&str] = &[
@@ -356,21 +367,147 @@ fn copyright_vendor(text: &str) -> Option<String> {
     (head.len() >= 5 && !ROOT_STOPLIST.contains(&head.as_str())).then_some(head)
 }
 
-/// Vendor and product roots corroborated across the file: the module stem
-/// the caller passes (a PE export name), copyright owners, and uppercase
-/// product marks repeated at least three times with class or UI context.
-pub(super) fn roots(hits: &[Hit], module: Option<&str>) -> BTreeSet<String> {
+fn candidate(value: &str) -> Option<String> {
+    let first = value
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '/' | '\\'))
+        .next()?
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase();
+    (first.len() >= 5
+        && first.bytes().any(|b| b.is_ascii_alphabetic())
+        && !ROOT_STOPLIST.contains(&first.as_str()))
+    .then_some(first)
+}
+
+/// Mine a host label, without treating the transport or service subdomain as
+/// the product. A URL is evidence only; editing it could change behavior.
+fn url_candidates(text: &str) -> Vec<String> {
+    const SERVICE: &[&str] = &[
+        "www",
+        "api",
+        "cdn",
+        "auth",
+        "license",
+        "licensing",
+        "activation",
+        "update",
+        "updates",
+        "download",
+        "downloads",
+        "app",
+        "static",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    for scheme in ["https://", "http://"] {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(scheme) {
+            let start = from + rel + scheme.len();
+            let end = start
+                + lower[start..]
+                    .find(|c: char| matches!(c, '/' | ':' | '?' | '#' | ' ' | '\\'))
+                    .unwrap_or(lower.len() - start);
+            let host = &lower[start..end];
+            if !host.contains('@')
+                && let Some(name) = host
+                    .split('.')
+                    .find(|part| !SERVICE.contains(part) && candidate(part).is_some())
+            {
+                out.push(name.to_string());
+            }
+            from = end.max(start);
+            if from >= lower.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn registry_candidates(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("software\\") {
+        let mut start = from + rel + "software\\".len();
+        if lower[start..].starts_with("wow6432node\\") {
+            start += "wow6432node\\".len();
+        }
+        let end = start
+            + lower[start..]
+                .find(['\\', '/', ' ', '"'])
+                .unwrap_or(lower.len() - start);
+        if let Some(name) = candidate(&text[start..end]) {
+            out.push(name);
+        }
+        from = end.max(start);
+        if from >= lower.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// Functional endpoints and keys stay byte-exact, including when a string
+/// also contains display text that can be deattributed.
+fn functional_spans(text: &str) -> Vec<(usize, usize)> {
+    let lower = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    for scheme in ["https://", "http://"] {
+        for (start, _) in lower.match_indices(scheme) {
+            let end = start
+                + text[start..]
+                    .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '>' | '<'))
+                    .unwrap_or(text.len() - start);
+            spans.push((start, end));
+        }
+    }
+    for (at, _) in lower.match_indices("software\\") {
+        let start = lower[..at]
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '=' | ';'))
+            .map_or(0, |n| n + 1);
+        let end = at
+            + text[at..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '>' | '<'))
+                .unwrap_or(text.len() - at);
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// One explicit identity is enough; incidental paths and hosts must agree
+/// with an independent source family. Repeated strings from one family count
+/// once. The output is kept private to planning and never reported by name.
+pub(super) fn roots(hits: &[Hit], module: Option<&str>, extra: &Evidence) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
     if let Some(stem) = module {
-        let lower = stem.to_ascii_lowercase();
-        if lower.len() >= 5 && !ROOT_STOPLIST.contains(&lower.as_str()) {
-            roots.insert(lower);
+        if let Some(root) = candidate(stem) {
+            roots.insert(root);
+        }
+    }
+    let mut corroborated: BTreeMap<String, BTreeSet<Source>> = BTreeMap::new();
+    for (value, source) in extra {
+        if let Some(root) = candidate(value) {
+            if *source == Source::Company {
+                roots.insert(root.clone());
+            }
+            corroborated.entry(root).or_default().insert(*source);
         }
     }
     let mut acronyms: BTreeMap<String, (usize, bool)> = BTreeMap::new();
     for hit in hits {
         if let Some(vendor) = copyright_vendor(&hit.text) {
             roots.insert(vendor);
+        }
+        for name in url_candidates(&hit.text) {
+            corroborated.entry(name).or_default().insert(Source::Url);
+        }
+        for name in registry_candidates(&hit.text) {
+            corroborated
+                .entry(name)
+                .or_default()
+                .insert(Source::Registry);
         }
         let contextual = hit.text.starts_with(".?AV")
             || hit.text.starts_with(".?AU")
@@ -416,42 +553,141 @@ pub(super) fn roots(hits: &[Hit], module: Option<&str>) -> BTreeSet<String> {
             .filter(|(_, (count, contextual))| *count >= 3 && *contextual)
             .map(|(word, _)| word),
     );
+    roots.extend(
+        corroborated
+            .into_iter()
+            .filter(|(_, sources)| sources.len() >= 2)
+            .map(|(root, _)| root),
+    );
     roots
 }
 
-/// What a string is, when the deep pass blanks it.
-fn classify(text: &str, roots: &BTreeSet<String>) -> Option<Kind> {
+/// Edit only attribution spans. The surrounding message can contain useful
+/// diagnostics and must remain readable after a deep copy.
+fn redaction_spans(text: &str, roots: &BTreeSet<String>) -> Vec<(usize, usize, Kind)> {
     let lower = text.to_ascii_lowercase();
-    if is_patch_credit(&lower) {
-        return Some(Kind::Patch);
+    let mut spans = Vec::new();
+    let clause_end = |start: usize| {
+        let tail = &text[start..];
+        let end = [tail.find(';'), tail.find(" | "), tail.find(". ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(text.len(), |rel| start + rel);
+        start + text[start..end].trim_end().len()
+    };
+    for cue in PATCH_CREDITS {
+        for (start, _) in lower.match_indices(cue) {
+            let before = start.checked_sub(1).and_then(|at| lower.as_bytes().get(at));
+            let after = lower.as_bytes().get(start + cue.len());
+            if !before.is_some_and(u8::is_ascii_alphanumeric)
+                && !after.is_some_and(u8::is_ascii_alphanumeric)
+            {
+                spans.push((start, clause_end(start), Kind::Patch));
+            }
+        }
     }
-    let rooted = roots.iter().any(|r| lower.contains(r.as_str()));
-    let attributed = rooted
-        || is_copyright(&lower)
-        || names_build_path(&lower)
-        || LICENSING_VENDORS.iter().any(|n| lower.contains(n));
-    if attributed {
-        return Some(Kind::Brand);
+    for cue in ["copyright", "(c) ", "©"] {
+        for (start, _) in lower.match_indices(cue) {
+            spans.push((start, clause_end(start), Kind::Brand));
+        }
     }
-    let licensing = LICENSING_WORDS.iter().any(|n| has_word(&lower, n));
-    let linked = lower.contains("http://") || lower.contains("https://");
-    (licensing && linked).then_some(Kind::Brand)
+    for path in BUILD_PATHS {
+        for (start, _) in lower.match_indices(path) {
+            let end = start
+                + text[start..]
+                    .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '>' | '<'))
+                    .unwrap_or(text.len() - start);
+            spans.push((start, end, Kind::Brand));
+        }
+    }
+    for (at, _) in lower.match_indices(".pdb") {
+        let start = lower[..at]
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '>' | '<'))
+            .map_or(0, |n| n + 1);
+        spans.push((start, at + 4, Kind::Brand));
+    }
+    for root in roots
+        .iter()
+        .map(String::as_str)
+        .chain(LICENSING_VENDORS.iter().copied())
+    {
+        for (start, _) in lower.match_indices(root) {
+            let end = start + root.len();
+            let before = start.checked_sub(1).and_then(|i| lower.as_bytes().get(i));
+            let after = lower.as_bytes().get(end);
+            let identifier = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+            if !before.is_some_and(identifier) && !after.is_some_and(identifier) {
+                spans.push((start, end, Kind::Brand));
+            }
+        }
+    }
+    let functional = functional_spans(text);
+    let mut isolated = Vec::new();
+    for (start, end, kind) in spans {
+        let mut remaining = vec![(start, end)];
+        for &(keep_start, keep_end) in &functional {
+            remaining = remaining
+                .into_iter()
+                .flat_map(|(from, to)| {
+                    if keep_start >= to || keep_end <= from {
+                        vec![(from, to)]
+                    } else {
+                        [(from, keep_start.min(to)), (keep_end.max(from), to)]
+                            .into_iter()
+                            .filter(|(a, b)| a < b)
+                            .collect()
+                    }
+                })
+                .collect();
+        }
+        isolated.extend(remaining.into_iter().map(|(from, to)| (from, to, kind)));
+    }
+    let mut spans = isolated;
+    spans.retain(|(start, end, _)| {
+        start < end && text.is_char_boundary(*start) && text.is_char_boundary(*end)
+    });
+    spans.sort_by_key(|&(start, end, _)| (start, end));
+    let mut merged: Vec<(usize, usize, Kind)> = Vec::new();
+    for (start, end, kind) in spans {
+        if let Some(last) = merged.last_mut()
+            && start < last.1
+        {
+            last.1 = last.1.max(end);
+            if kind == Kind::Patch {
+                last.2 = Kind::Patch;
+            }
+        } else {
+            merged.push((start, end, kind));
+        }
+    }
+    merged
 }
 
-/// Raw-blank markers for every classified hit outside `protected`. RTTI type
-/// names are never blanked: exception matching across modules compares them.
-fn blank_hits(
+/// Same-length replacements outside protected ranges. RTTI names are never
+/// edited: exception matching across modules compares them.
+fn redact_hits(
     hits: &[Hit],
     roots: &BTreeSet<String>,
     protected: &Protected,
-    fill: u8,
-) -> Vec<(Kind, Marker)> {
+) -> Vec<(Kind, u64, Vec<u8>)> {
     hits.iter()
         .filter(|h| !h.text.starts_with(".?AV") && !h.text.starts_with(".?AU"))
         .filter(|h| !protected.overlaps(h.off, h.off + h.len as u64))
-        .filter_map(|h| {
-            let kind = classify(&h.text, roots)?;
-            Some((kind, fill_marker(h.off, h.len as u64, fill)))
+        .flat_map(|h| {
+            redaction_spans(&h.text, roots)
+                .into_iter()
+                .filter_map(|(start, end, kind)| {
+                    let (start, end, bytes) = match h.encoding {
+                        Encoding::Utf8 => (start, end, vec![b' '; end - start]),
+                        Encoding::Utf16 => {
+                            let from = h.text[..start].encode_utf16().count() * 2;
+                            let to = h.text[..end].encode_utf16().count() * 2;
+                            (from, to, [0x20, 0].repeat((to - from) / 2))
+                        }
+                    };
+                    (start < end && end <= h.len).then_some((kind, h.off + start as u64, bytes))
+                })
         })
         .collect()
 }
@@ -470,9 +706,9 @@ pub(super) fn fill_marker(off: u64, len: u64, fill: u8) -> Marker {
 /// regions.
 fn binary(view: &dyn FileView, regions: &[(u64, u64)], protected: &Protected) -> Deep {
     let hits = region_strings(view, regions);
-    let roots = roots(&hits, None);
+    let roots = roots(&hits, None, &Vec::new());
     Deep {
-        blanks: blank_hits(&hits, &roots, protected, 0),
+        rewrites: redact_hits(&hits, &roots, protected),
         ..Deep::default()
     }
 }
@@ -495,11 +731,8 @@ fn looks_text(view: &dyn FileView) -> bool {
     }
 }
 
-/// A plain-text file: the span from each credit, copyright mark or build path
-/// to the end of its line or quoted value is filled with spaces, so newlines,
-/// quotes and the bytes around them stay where they are and JSON, XML and
-/// source keep parsing. Vendor roots are not swept here: in source text a
-/// vendor name is often an identifier the code depends on.
+/// A plain-text file: keep the delimiters and useful text around each credit
+/// or path. Vendor roots are not swept here because they may be identifiers.
 fn text(view: &dyn FileView) -> Deep {
     if crate::parsers::text::is_protected(view.path()) {
         return Deep::default();
@@ -522,29 +755,10 @@ fn text(view: &dyn FileView) -> Deep {
         let piece = &text[piece_start..at];
         let base = piece_start;
         piece_start = at + c.len_utf8();
-        let lower = piece.to_ascii_lowercase();
-        let kind = if is_patch_credit(&lower) {
-            Kind::Patch
-        } else if is_copyright(&lower) || names_build_path(&lower) {
-            Kind::Brand
-        } else {
-            continue;
-        };
-        let starts = PATCH_CREDITS
-            .iter()
-            .chain(["copyright"].iter())
-            .filter_map(|n| find_word(&lower, n))
-            .chain(["(c) ", "\u{a9}"].iter().filter_map(|n| lower.find(n)))
-            .chain(BUILD_PATHS.iter().filter_map(|n| lower.find(n)))
-            .min();
-        let Some(start) = starts else {
-            continue;
-        };
-        let value = piece[start..].trim_end();
-        if value.len() >= 4 {
+        for (start, end, kind) in redaction_spans(piece, &BTreeSet::new()) {
             blanks.push((
                 kind,
-                fill_marker((base + start) as u64, value.len() as u64, b' '),
+                fill_marker((base + start) as u64, (end - start) as u64, b' '),
             ));
         }
     }
@@ -580,16 +794,12 @@ fn entropy(bytes: &[u8]) -> f64 {
 fn fallback(view: &dyn FileView) -> Deep {
     let size = view.size();
     let hits = region_strings(view, &[(0, size.min(MAX_TOTAL))]);
-    let mut blanks = Vec::new();
+    let mut rewrites = Vec::new();
     for hit in hits {
         let lower = hit.text.to_ascii_lowercase();
-        let kind = if is_patch_credit(&lower) {
-            Kind::Patch
-        } else if is_copyright(&lower) || names_build_path(&lower) {
-            Kind::Brand
-        } else {
+        if !is_patch_credit(&lower) && !is_copyright(&lower) && !names_build_path(&lower) {
             continue;
-        };
+        }
         let half = (ENTROPY_WINDOW / 2) as u64;
         let from = hit.off.saturating_sub(half);
         let len = (hit.off + hit.len as u64 + half).min(size) - from;
@@ -597,11 +807,11 @@ fn fallback(view: &dyn FileView) -> Deep {
             continue;
         };
         if entropy(&around) < ENTROPY_LIMIT {
-            blanks.push((kind, fill_marker(hit.off, hit.len as u64, 0)));
+            rewrites.extend(redact_hits(&[hit], &BTreeSet::new(), &Protected::default()));
         }
     }
     Deep {
-        blanks,
+        rewrites,
         ..Deep::default()
     }
 }

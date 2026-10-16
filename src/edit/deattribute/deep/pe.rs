@@ -3,10 +3,12 @@
 //! disassembler resolves by content: import and delay-import names and thunk
 //! tables, export names and their arrays, TLS, load config, relocations,
 //! exception data, the resource directory, version and manifest resources,
-//! and .NET metadata other than the user string heap. The rewrites are fixed
+//! and .NET metadata other than the user string heap. Version and manifest
+//! values can still identify a vendor, and RT_STRING leaves have their own
+//! length-prefixed parser. The rewrites are fixed
 //! fields: the export module name, COFF, export, resource and debug
 //! timestamps, CodeView PDB paths and GUIDs, POGO, VC feature and repro
-//! records, and the Authenticode directory slot.
+//! records, and the Authenticode directory slot and detached certificate.
 
 use std::collections::BTreeSet;
 
@@ -14,11 +16,15 @@ use crate::model::{ContainerKind, Marker, Region};
 use crate::parsers::pe::image::{
     DIR_CLR, DIR_DEBUG, DIR_EXPORT, DIR_RESOURCE, DIR_SECURITY, PeImage,
 };
+use crate::parsers::pe::version;
 use crate::scan::FileView;
 use crate::util::hash::hash_hex;
 
-use super::super::{Caveat, Kind, Target};
-use super::{Deep, Hit, Protected, blank_hits, read_full, region_strings, roots};
+use super::super::{Caveat, Kind, Reason, Target};
+use super::{
+    Deep, Encoding, Evidence, Hit, Protected, Source, fill_marker, read_full, redact_hits,
+    region_strings, roots,
+};
 
 const DIR_IMPORT: usize = 1;
 const DIR_EXCEPTION: usize = 3;
@@ -31,6 +37,7 @@ const DIR_DELAY_IMPORT: usize = 13;
 
 const RT_VERSION: u32 = 16;
 const RT_MANIFEST: u32 = 24;
+const RT_STRING: u32 = 6;
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x20;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x40;
@@ -47,6 +54,8 @@ const MAX_ENTRIES: usize = 65_536;
 const MAX_NAME: usize = 512;
 /// Largest debug record body rewritten.
 const MAX_DEBUG_BODY: usize = 64 * 1024;
+const MAX_RESOURCE_STRING: usize = 256 * 1024;
+const MAX_CERT_BODY: usize = 4 * 1024 * 1024;
 
 /// The neutral stem a deep copy's export module name is rewritten to.
 pub(super) const NEUTRAL_MODULE: &[u8] = b"module";
@@ -63,15 +72,216 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
 }
 
+/// RT_STRING has sixteen length-prefixed UTF-16 values and no terminators.
+fn string_table(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
+    if size > MAX_RESOURCE_STRING {
+        return Vec::new();
+    }
+    let Some(bytes) = read_full(view, off, size) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    let mut at = 0usize;
+    for _ in 0..16 {
+        let Some(units) = u16_at(&bytes, at).map(usize::from) else {
+            break;
+        };
+        at += 2;
+        let Some(end) = at.checked_add(units * 2).filter(|&n| n <= bytes.len()) else {
+            break;
+        };
+        if (4..=super::MAX_STRING).contains(&units) {
+            let raw: Vec<u16> = bytes[at..end]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            if let Ok(text) = String::from_utf16(&raw) {
+                hits.push(Hit {
+                    off: off + at as u64,
+                    len: end - at,
+                    text,
+                    encoding: Encoding::Utf16,
+                });
+            }
+        }
+        at = end;
+    }
+    hits
+}
+
+/// Only assembly identities are used as evidence. The XML bytes stay intact.
+fn manifest_names(view: &dyn FileView, off: u64, size: usize) -> Vec<String> {
+    if size > MAX_RESOURCE_STRING {
+        return Vec::new();
+    }
+    let Some(bytes) = read_full(view, off, size) else {
+        return Vec::new();
+    };
+    let utf16 =
+        bytes.starts_with(&[0xff, 0xfe]) || (bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0);
+    let text = if utf16 {
+        let start = if bytes.starts_with(&[0xff, 0xfe]) {
+            2
+        } else {
+            0
+        };
+        let units: Vec<u16> = bytes[start..]
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        String::from_utf16(&units).ok()
+    } else {
+        std::str::from_utf8(&bytes).ok().map(str::to_string)
+    };
+    let Some(text) = text else { return Vec::new() };
+    let lower = text.to_ascii_lowercase();
+    let mut names = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<assemblyidentity") {
+        let begin = from + rel;
+        let Some(end) = lower[begin..].find('>').map(|n| begin + n) else {
+            break;
+        };
+        let tag = &text[begin..end];
+        let tag_lower = &lower[begin..end];
+        let name_at = tag_lower
+            .match_indices("name")
+            .map(|(at, _)| at)
+            .find(|&at| {
+                at.checked_sub(1)
+                    .and_then(|before| tag.as_bytes().get(before))
+                    .is_some_and(u8::is_ascii_whitespace)
+                    && tag
+                        .as_bytes()
+                        .get(at + 4)
+                        .is_some_and(|b| b.is_ascii_whitespace() || *b == b'=')
+            });
+        if let Some(at) = name_at {
+            let mut value = at + 4;
+            while tag
+                .as_bytes()
+                .get(value)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                value += 1;
+            }
+            if tag.as_bytes().get(value) == Some(&b'=') {
+                value += 1;
+                while tag
+                    .as_bytes()
+                    .get(value)
+                    .is_some_and(u8::is_ascii_whitespace)
+                {
+                    value += 1;
+                }
+                if let Some(&quote @ (b'"' | b'\'')) = tag.as_bytes().get(value) {
+                    value += 1;
+                    if let Some(close) = tag[value..].find(char::from(quote)) {
+                        names.push(
+                            tag[value..value + close]
+                                .split('.')
+                                .next()
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        from = end + 1;
+    }
+    names
+}
+
+/// Read O and CN name attributes from bounded DER in PKCS#7. These are weak
+/// evidence because a certificate table may also contain CA certificates.
+fn certificate_names(table: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 8 <= table.len() {
+        let Some(len) = u32_at(table, at).map(|n| n as usize) else {
+            break;
+        };
+        if len < 8 || at + len > table.len() {
+            break;
+        }
+        if u16_at(table, at + 6) == Some(2) {
+            let der = &table[at + 8..at + len];
+            for pos in 0..der.len().saturating_sub(6) {
+                if der.get(pos..pos + 4) != Some(&[6, 3, 0x55, 4][..])
+                    || !matches!(der.get(pos + 4), Some(3 | 10))
+                {
+                    continue;
+                }
+                let tag = der[pos + 5];
+                if !matches!(tag, 0x0c | 0x13 | 0x16 | 0x1e) {
+                    continue;
+                }
+                let len0 = der[pos + 6];
+                let (body, size) = if len0 & 0x80 == 0 {
+                    (pos + 7, len0 as usize)
+                } else if len0 == 0x81 && pos + 7 < der.len() {
+                    (pos + 8, der[pos + 7] as usize)
+                } else if len0 == 0x82 && pos + 8 < der.len() {
+                    (
+                        pos + 9,
+                        u16::from_be_bytes([der[pos + 7], der[pos + 8]]) as usize,
+                    )
+                } else {
+                    continue;
+                };
+                if size == 0 || size > 512 {
+                    continue;
+                }
+                let Some(value) = der.get(body..body + size) else {
+                    continue;
+                };
+                let name = if tag == 0x1e {
+                    let units: Vec<u16> = value
+                        .chunks_exact(2)
+                        .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                        .collect();
+                    String::from_utf16(&units).ok()
+                } else {
+                    std::str::from_utf8(value).ok().map(str::to_string)
+                };
+                if let Some(name) = name {
+                    out.push(name);
+                }
+            }
+        }
+        at = (at + len + 7) & !7;
+    }
+    out
+}
+
 struct Walk<'a> {
     view: &'a dyn FileView,
     img: &'a PeImage,
     protected: Protected,
     rewrites: Vec<(Kind, u64, Vec<u8>)>,
     caveats: Vec<Caveat>,
+    resource_hits: Vec<Hit>,
+    evidence: Evidence,
+    skipped: Vec<Reason>,
 }
 
 impl Walk<'_> {
+    fn safe_resource_leaf(&self, rva: u32, size: u32) -> Option<u64> {
+        let section = self.img.sections.iter().find(|s| s.contains_rva(rva))?;
+        let delta = rva.checked_sub(section.va)?;
+        if section.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0
+            || section.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA == 0
+            || delta.checked_add(size)? > section.raw_size
+        {
+            return None;
+        }
+        let off = u64::from(section.raw_ptr) + u64::from(delta);
+        off.checked_add(u64::from(size))
+            .filter(|&end| end <= self.view.size())
+            .map(|_| off)
+    }
+
     /// Protect a data directory's whole range.
     fn dir_range(&mut self, index: usize) {
         if let Some(d) = self.img.dir(index)
@@ -288,12 +498,26 @@ impl Walk<'_> {
                 continue;
             };
             self.protected.add(entry_off, 16);
-            if matches!(kind, Some(RT_VERSION | RT_MANIFEST))
-                && let Some(entry) = read_full(self.view, entry_off, 16)
+            if let Some(entry) = read_full(self.view, entry_off, 16)
                 && let (Some(rva), Some(size)) = (u32_at(&entry, 0), u32_at(&entry, 4))
-                && let Some(off) = self.img.rva_to_off(rva)
+                && let Some(off) = self.safe_resource_leaf(rva, size)
             {
-                self.protected.add(off, u64::from(size));
+                match kind {
+                    Some(RT_VERSION) => self.protected.add(off, u64::from(size)),
+                    Some(RT_MANIFEST) => {
+                        self.protected.add(off, u64::from(size));
+                        self.evidence.extend(
+                            manifest_names(self.view, off, size as usize)
+                                .into_iter()
+                                .map(|name| (name, Source::Manifest)),
+                        );
+                    }
+                    Some(RT_STRING) => {
+                        self.resource_hits
+                            .extend(string_table(self.view, off, size as usize))
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -381,8 +605,45 @@ impl Walk<'_> {
             .and_then(|b| b.iter().position(|&x| x == 0))
             .filter(|&e| e > 0)
         {
+            let path = String::from_utf8_lossy(&data[path_at..path_at + end]);
+            let file = path.rsplit(['\\', '/']).next().unwrap_or("");
+            if let Some(stem) = file.to_ascii_lowercase().strip_suffix(".pdb") {
+                self.evidence.push((stem.to_string(), Source::Pdb));
+            }
             self.zero(ptr + path_at as u64, end);
         }
+    }
+
+    /// The certificate is outside the loaded image. Mine its names before
+    /// clearing the detached payload and the directory slot.
+    fn certificate(&mut self) -> Option<Marker> {
+        let d = self.img.dir(DIR_SECURITY)?;
+        let off = u64::from(d.rva);
+        let len = d.size as usize;
+        if len < 8
+            || len > MAX_CERT_BODY
+            || off < self.img.image_end()
+            || off
+                .checked_add(len as u64)
+                .is_none_or(|end| end > self.view.size())
+        {
+            self.skipped.push(Reason::Unsafe);
+            return None;
+        }
+        let Some(table) = read_full(self.view, off, len) else {
+            self.skipped.push(Reason::Io);
+            return None;
+        };
+        if u32_at(&table, 0).is_none_or(|n| n < 8 || n as usize > len) {
+            self.skipped.push(Reason::Unsafe);
+            return None;
+        }
+        self.evidence.extend(
+            certificate_names(&table)
+                .into_iter()
+                .map(|name| (name, Source::Certificate)),
+        );
+        Some(fill_marker(off, len as u64, 0))
     }
 
     /// Initialized data sections past the headers that hold no code.
@@ -477,6 +738,7 @@ fn user_strings(view: &dyn FileView, md: u64, md_size: u64) -> Option<Vec<Hit>> 
                     off: heap_off + body as u64,
                     len: chars,
                     text: bytes.iter().step_by(2).map(|&b| char::from(b)).collect(),
+                    encoding: Encoding::Utf16,
                 });
             }
             pos = body + len;
@@ -496,6 +758,9 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         protected: Protected::default(),
         rewrites: Vec::new(),
         caveats: Vec::new(),
+        resource_hits: Vec::new(),
+        evidence: Vec::new(),
+        skipped: Vec::new(),
     };
     w.protected
         .add(0, u64::from(img.size_of_headers).max(img.table_end));
@@ -520,6 +785,24 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     w.resources();
     let user = w.dotnet();
     w.debug();
+    let certificate = w.certificate();
+    if let Some(info) = version::find(&img, view) {
+        for item in info.strings {
+            let source = match item.key.as_str() {
+                "CompanyName" => Some(Source::Company),
+                "ProductName" | "InternalName" | "OriginalFilename" => Some(Source::Product),
+                _ => None,
+            };
+            if let Some(source) = source {
+                let value = if item.key == "OriginalFilename" {
+                    item.value.split('.').next().unwrap_or("").to_string()
+                } else {
+                    item.value
+                };
+                w.evidence.push((value, source));
+            }
+        }
+    }
 
     // COFF header TimeDateStamp.
     w.zero(img.e_lfanew + 8, 4);
@@ -531,14 +814,23 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     }
 
     let regions = w.data_regions();
-    let hits = region_strings(view, &regions);
+    let mut hits = region_strings(view, &regions);
+    hits.extend(w.resource_hits.iter().cloned());
+    hits.sort();
+    hits.dedup();
+    let mut all_hits = hits.clone();
+    all_hits.extend(user.iter().cloned());
     let stem = module.as_ref().and_then(|(_, name)| {
         let name = std::str::from_utf8(name).ok()?;
         name.split(['.', '_']).next()
     });
-    let roots = roots(&hits, stem);
-    let mut blanks = blank_hits(&hits, &roots, &w.protected, 0);
-    blanks.extend(blank_hits(&user, &roots, &Protected::default(), 0));
+    let roots = roots(&all_hits, stem, &w.evidence);
+    let mut rewrites = redact_hits(&hits, &roots, &w.protected);
+    rewrites.extend(redact_hits(&user, &roots, &Protected::default()));
+    let blanks = certificate
+        .into_iter()
+        .map(|marker| (Kind::Brand, marker))
+        .collect();
 
     if let Some((off, old)) = module {
         let suffix = old
@@ -556,8 +848,9 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
 
     Deep {
         blanks,
-        rewrites: w.rewrites,
+        rewrites: w.rewrites.into_iter().chain(rewrites).collect(),
         caveats: w.caveats,
+        skipped: w.skipped,
     }
 }
 

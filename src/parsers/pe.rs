@@ -7,7 +7,7 @@
 
 pub(crate) mod image;
 mod rich;
-mod version;
+pub(crate) mod version;
 
 #[cfg(test)]
 mod tests;
