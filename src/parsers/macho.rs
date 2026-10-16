@@ -66,6 +66,7 @@ const MAX_BLOBS: usize = 64;
 
 const LC_UUID: u32 = 0x1b;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
+const LC_SYMTAB: u32 = 0x2;
 const LC_ENCRYPTION_INFO: u32 = 0x21;
 const LC_VERSION_MIN_MACOSX: u32 = 0x24;
 const LC_VERSION_MIN_IPHONEOS: u32 = 0x25;
@@ -338,6 +339,16 @@ pub(crate) struct DeepRegions {
     pub regions: Vec<(u64, u64)>,
     /// Any slice carries `LC_CODE_SIGNATURE`.
     pub signed: bool,
+    pub signatures: Vec<DeepSignature>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DeepSignature {
+    pub off: u64,
+    pub len: u64,
+    pub command_off: u64,
+    pub ident: Option<String>,
+    pub team: Option<String>,
 }
 
 /// String sections a deep sweep may read, by `(segment prefix, section)`.
@@ -411,7 +422,78 @@ fn thin_regions(view: &dyn FileView, base: u64, size: u64, out: &mut DeepRegions
         };
         pos += cmdsize;
         if cmd == LC_CODE_SIGNATURE {
+            let (Some(dataoff), Some(datasize)) = (o.u32(lc, 8), o.u32(lc, 12)) else {
+                continue;
+            };
+            if datasize == 0 {
+                continue;
+            }
             out.signed = true;
+            if u64::from(dataoff)
+                .checked_add(u64::from(datasize))
+                .is_some_and(|end| end <= size)
+            {
+                let ctx = Ctx {
+                    view,
+                    base,
+                    size,
+                    arch: None,
+                    o,
+                };
+                let cd = superblob(&ctx, u64::from(dataoff), u64::from(datasize));
+                out.signatures.push(DeepSignature {
+                    off: base + u64::from(dataoff),
+                    len: u64::from(datasize),
+                    command_off: base + hdr + pos as u64 - cmdsize as u64,
+                    ident: cd.as_ref().and_then(|c| c.ident.clone()),
+                    team: cd.and_then(|c| c.team),
+                });
+            }
+            continue;
+        }
+        if cmd == LC_SYMTAB {
+            let (Some(symoff), Some(nsyms), Some(stroff), Some(strsize)) =
+                (o.u32(lc, 8), o.u32(lc, 12), o.u32(lc, 16), o.u32(lc, 20))
+            else {
+                continue;
+            };
+            let ent = if is64 { 16u64 } else { 12 };
+            if nsyms > 65_536
+                || strsize > 64 * 1024 * 1024
+                || u64::from(symoff) + u64::from(nsyms) * ent > size
+                || u64::from(stroff) + u64::from(strsize) > size
+            {
+                continue;
+            }
+            for i in 0..nsyms {
+                let Some(sym) = read(
+                    view,
+                    base + u64::from(symoff) + u64::from(i) * ent,
+                    ent as usize,
+                ) else {
+                    break;
+                };
+                if !matches!(sym[4], 0x64 | 0x66 | 0x84) {
+                    continue;
+                }
+                let Some(strx) = o.u32(&sym, 0) else {
+                    continue;
+                };
+                if strx == 0 || strx >= strsize {
+                    continue;
+                }
+                let off = base + u64::from(stroff) + u64::from(strx);
+                let limit = (strsize - strx).min(4096) as usize;
+                let Some(raw) = read(view, off, limit) else {
+                    continue;
+                };
+                if let Some(end) = raw.iter().position(|&b| b == 0)
+                    && end >= 4
+                    && raw[..end].iter().all(|&b| b >= 0x20)
+                {
+                    out.regions.push((off, end as u64 + 1));
+                }
+            }
             continue;
         }
         let (nsects_at, first, entsize) = match cmd {
@@ -467,6 +549,18 @@ fn code_signature(ctx: &Ctx, lc: &[u8], lc_off: u64, out: &mut Vec<Finding>) {
     let (Some(dataoff), Some(datasize)) = (ctx.o.u32(lc, 8), ctx.o.u32(lc, 12)) else {
         return;
     };
+    if dataoff == 0 && datasize == 0 {
+        out.push(finding(
+            Category::Integrity(SignatureStatus::Absent),
+            Confidence::Strong,
+            Severity::Info,
+            "macho.code_signature",
+            ctx.title("No embedded code signature".to_string()),
+            Evidence::at(lc_off).with_note("LC_CODE_SIGNATURE has no data"),
+            None,
+        ));
+        return;
+    }
     let parsed = superblob(ctx, u64::from(dataoff), u64::from(datasize));
     let f = match parsed {
         Some(cd) => {

@@ -596,9 +596,11 @@ clean flags (<select> is --deattribute, one --category, or one --signature)
                                     offsets; never matched text, titles,
                                     notes, evidence, or signature ids
   --deep                            with --deattribute: also sweep data
-                                    strings (PE, ELF, Mach-O, text), the PE
-                                    export DLL name, PDB path, and timestamps;
-                                    may break loading or licensing
+                                    strings (PE, ELF, Mach-O, resource forks,
+                                    text), PE resources, .NET attributes and
+                                    plug-in names, build paths, debug records,
+                                    timestamps and code signatures; may break
+                                    loading, signing or licensing
   --category <slug>                 select findings by category: identity,
                                     brand, integrity, tamper, deception,
                                     bundleware, junk

@@ -18,7 +18,7 @@ use crate::model::{Category, Confidence, DeceptionKind, Evidence, Finding, Sever
 use crate::scan::FileView;
 use crate::util::bytes::{slice, u8_at, u16_le, u32_be, u32_le};
 
-use super::media::ebml;
+use super::{media::ebml, rsrc};
 
 /// Identify `view`. Returns the true-format label (if any matched) and any
 /// findings worth surfacing (extension and content mismatches). A file whose
@@ -31,9 +31,14 @@ pub fn identify(view: &dyn FileView) -> (Option<&'static str>, Vec<Finding>) {
     if let (Some(det), Some(ext)) = (detected, extension(view))
         && let Some(info) = ext_info(&ext)
     {
-        let harmless = info
-            .expected
-            .is_some_and(|expected| harmless_swap(&ext, expected, det.label));
+        let harmless = (det.label == "appledouble"
+            && view
+                .path()
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("._")))
+            || info
+                .expected
+                .is_some_and(|expected| harmless_swap(&ext, expected, det.label));
         let actual = class_of(det.label);
         if harmless {
             // A known-benign pairing, such as a .zip that is really a jar.
@@ -248,6 +253,7 @@ fn ext_format(ext: &str) -> Option<&'static str> {
         "exe" | "dll" | "sys" | "scr" | "ocx" | "cpl" | "com" | "pif" => "pe",
         "elf" | "so" | "o" => "elf",
         "dylib" => "macho",
+        "rsrc" => "rsrc",
         "wasm" => "wasm",
         "lnk" => "lnk",
         "class" => "class",
@@ -312,6 +318,9 @@ fn detect_long(h: &[u8], view: &dyn FileView) -> Option<Detected> {
     let s = Detected::strong;
     if starts(h, b"\x7fELF") {
         return Some(s("elf", 0, 4));
+    }
+    if starts(h, &[0, 5, 0x16, 7]) {
+        return rsrc::parse(view).is_some().then(|| s("appledouble", 0, 4));
     }
     if starts(h, b"\0asm") {
         return Some(s("wasm", 0, 4));
@@ -399,6 +408,12 @@ fn detect_long(h: &[u8], view: &dyn FileView) -> Option<Detected> {
     }
     if id3_header_ok(h) {
         return Some(s("mp3", 0, 10));
+    }
+    if matches!(u32_be(h, 0), Some(16..))
+        && u32_be(h, 4).is_some_and(|n| u64::from(n) < view.size())
+        && rsrc::parse(view).is_some_and(|f| !f.apple_double)
+    {
+        return Some(s("rsrc", 0, 16));
     }
     None
 }

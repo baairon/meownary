@@ -17,6 +17,7 @@ pub mod macho;
 pub mod media;
 pub mod pe;
 pub mod provenance;
+pub mod rsrc;
 pub mod text;
 pub mod zip;
 

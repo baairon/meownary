@@ -18,12 +18,16 @@ use crate::scan::FileView;
 
 use super::{Caveat, Kind, Reason};
 
+mod dotnet;
+mod needle;
 mod pe;
+mod pipl;
+mod rsrc;
 
 pub(super) use pe::{checksum_target, signed as pe_signed};
 
 /// Longest string the sweep considers, in characters.
-const MAX_STRING: usize = 4096;
+const MAX_STRING: usize = 64 * 1024;
 /// Largest region read in one piece.
 const WINDOW: u64 = 8 * 1024 * 1024;
 /// Most bytes one file's sweep reads in total.
@@ -41,21 +45,72 @@ pub(super) struct Deep {
     /// Raw blanks, merged with the basic plan's markers.
     pub blanks: Vec<(Kind, Marker)>,
     /// Same-length field rewrites at `(offset, new bytes)`.
-    pub rewrites: Vec<(Kind, u64, Vec<u8>)>,
+    pub rewrites: Vec<Rewrite>,
     pub caveats: Vec<Caveat>,
     pub skipped: Vec<Reason>,
 }
+
+/// One same-length rewrite: its kind, offset and new bytes.
+pub(super) type Rewrite = (Kind, u64, Vec<u8>);
 
 /// Plan the deep pass for one file.
 pub(super) fn sweep(report: &FileReport, view: &dyn FileView) -> Deep {
     match report.format.as_deref() {
         Some("pe") => pe::sweep(view),
-        Some("elf") => binary(view, &elf::data_regions(view), &Protected::default()),
+        Some("rsrc" | "appledouble") => rsrc::sweep(view),
+        Some("elf") => {
+            let mut regions = elf::data_regions(view);
+            regions.extend(elf::debug_string_regions(view));
+            regions.sort_unstable();
+            binary(view, &regions, &Protected::default(), &Vec::new())
+        }
         Some("macho") => {
             let found = macho::deep_regions(view);
-            let mut deep = binary(view, &found.regions, &Protected::default());
+            let evidence: Evidence = found
+                .signatures
+                .iter()
+                .flat_map(|sig| {
+                    let mut names = Vec::new();
+                    if let Some(id) = &sig.ident {
+                        names.extend(
+                            id.split('.')
+                                .filter(|part| part.len() >= 5)
+                                .map(|part| (part.to_string(), Source::Company)),
+                        );
+                    }
+                    if let Some(team) = &sig.team {
+                        names.push((team.clone(), Source::Certificate));
+                    }
+                    names
+                })
+                .collect();
+            let mut deep = binary(view, &found.regions, &Protected::default(), &evidence);
+            for sig in &found.signatures {
+                if sig.len > MAX_TOTAL {
+                    deep.skipped.push(Reason::DeepBudget);
+                    continue;
+                }
+                let mut at = sig.off;
+                let end = sig.off + sig.len;
+                while at < end {
+                    let len = (end - at).min(1024 * 1024);
+                    deep.blanks.push((Kind::Brand, fill_marker(at, len, 0)));
+                    at += len;
+                }
+                let Some(lc) = read_full(view, sig.command_off + 8, 8) else {
+                    deep.skipped.push(Reason::Io);
+                    continue;
+                };
+                if lc.iter().any(|&b| b != 0) {
+                    deep.rewrites
+                        .push((Kind::Brand, sig.command_off + 8, vec![0; 8]));
+                }
+            }
             if found.signed {
                 deep.caveats.push(Caveat::SignatureInvalidated);
+                if found.signatures.is_empty() {
+                    deep.skipped.push(Reason::MalformedMetadata);
+                }
             }
             deep
         }
@@ -82,6 +137,7 @@ pub(super) struct Hit {
 pub(super) enum Encoding {
     Utf8,
     Utf16,
+    SingleByte,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -103,14 +159,41 @@ pub(super) struct Protected(Vec<(u64, u64)>);
 
 impl Protected {
     pub fn add(&mut self, start: u64, len: u64) {
-        if len > 0 {
-            self.0.push((start, start.saturating_add(len)));
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        // Every range that overlaps or touches the new one folds into it.
+        let lo = self.0.partition_point(|&(_, b)| b < start);
+        let hi = self.0.partition_point(|&(a, _)| a <= end);
+        if lo == hi {
+            self.0.insert(lo, (start, end));
+        } else {
+            let merged = (self.0[lo].0.min(start), self.0[hi - 1].1.max(end));
+            self.0.splice(lo..hi, [merged]);
         }
     }
 
     fn overlaps(&self, start: u64, end: u64) -> bool {
-        self.0.iter().any(|&(a, b)| start < b && end > a)
+        let at = self.0.partition_point(|&(_, b)| b <= start);
+        self.0.get(at).is_some_and(|&(a, _)| a < end)
     }
+}
+
+/// Decode Windows ANSI text without changing its one-byte offsets.
+fn single_byte(bytes: &[u8]) -> String {
+    const C1: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '\u{2013}', '\u{2014}', '˜', '™', 'š', '›',
+        'œ', '\u{9d}', 'ž', 'Ÿ',
+    ];
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9f => C1[(b - 0x80) as usize],
+            _ => char::from(b),
+        })
+        .collect()
 }
 
 /// Printable ASCII, or a byte of a multi-byte UTF-8 sequence.
@@ -142,16 +225,28 @@ fn strings(bytes: &[u8], base: u64, bounded_start: bool, out: &mut Vec<Hit>) {
             i += 1;
         }
         let len = i - start;
-        if (4..=MAX_STRING).contains(&len)
-            && bytes.get(i) == Some(&0)
-            && starts_ok(start, 1)
-            && let Ok(text) = std::str::from_utf8(&bytes[start..i])
-        {
+        if (4..=255).contains(&len) && start > 0 && bytes[start - 1] == len as u8 {
+            let (text, encoding) = match std::str::from_utf8(&bytes[start..i]) {
+                Ok(text) => (text.to_string(), Encoding::Utf8),
+                Err(_) => (single_byte(&bytes[start..i]), Encoding::SingleByte),
+            };
             out.push(Hit {
                 off: base + start as u64,
                 len,
-                text: text.to_string(),
-                encoding: Encoding::Utf8,
+                text,
+                encoding,
+            });
+        }
+        if (4..=MAX_STRING).contains(&len) && bytes.get(i) == Some(&0) && starts_ok(start, 1) {
+            let (text, encoding) = match std::str::from_utf8(&bytes[start..i]) {
+                Ok(text) => (text.to_string(), Encoding::Utf8),
+                Err(_) => (single_byte(&bytes[start..i]), Encoding::SingleByte),
+            };
+            out.push(Hit {
+                off: base + start as u64,
+                len,
+                text,
+                encoding,
             });
         }
     }
@@ -189,6 +284,9 @@ fn strings(bytes: &[u8], base: u64, bounded_start: bool, out: &mut Vec<Hit>) {
 /// Read `len` bytes at `off`, looping over short reads. `None` on an error or
 /// when the file ends first.
 pub(super) fn read_full(view: &dyn FileView, off: u64, len: usize) -> Option<Vec<u8>> {
+    // A recorded length past the file or the budget is refused before allocating.
+    off.checked_add(len as u64)
+        .filter(|&end| end <= view.size() && len as u64 <= MAX_TOTAL)?;
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
         let part = view.read_at(off + out.len() as u64, len - out.len()).ok()?;
@@ -202,8 +300,12 @@ pub(super) fn read_full(view: &dyn FileView, off: u64, len: usize) -> Option<Vec
 
 /// Every string in each region, read in overlapping windows so a string that
 /// straddles a window edge is still seen whole. Regions past `MAX_TOTAL` are
-/// not read. Sorted and deduplicated.
-fn region_strings(view: &dyn FileView, regions: &[(u64, u64)]) -> Vec<Hit> {
+/// not read and report [`Reason::DeepBudget`]. Sorted and deduplicated.
+fn region_strings(
+    view: &dyn FileView,
+    regions: &[(u64, u64)],
+    skipped: &mut Vec<Reason>,
+) -> Vec<Hit> {
     let overlap = (MAX_STRING as u64 + 1) * 2;
     let mut budget = MAX_TOTAL;
     let mut hits = Vec::new();
@@ -211,23 +313,26 @@ fn region_strings(view: &dyn FileView, regions: &[(u64, u64)]) -> Vec<Hit> {
         let Some(end) = off.checked_add(len).filter(|&e| e <= view.size()) else {
             continue;
         };
-        if len > budget {
-            break;
-        }
-        budget -= len;
         let mut pos = off;
         while pos < end {
-            let stop = pos.saturating_add(WINDOW).min(end);
+            let stop = pos.saturating_add(WINDOW - overlap - 2).min(end);
             let lead = if pos == off { 0 } else { 2 };
             let from = pos - lead;
-            let to = stop.saturating_add(overlap).min(end);
+            let to = stop.saturating_add(overlap).min(end).min(from + budget);
+            if to <= pos {
+                if !skipped.contains(&Reason::DeepBudget) {
+                    skipped.push(Reason::DeepBudget);
+                }
+                break;
+            }
             let Some(bytes) = read_full(view, from, (to - from) as usize) else {
                 break;
             };
+            budget -= to - from;
             let mut found = Vec::new();
             strings(&bytes, from, pos == off, &mut found);
             hits.extend(found.into_iter().filter(|h| h.off >= pos && h.off < stop));
-            pos = stop;
+            pos = stop.min(to);
         }
     }
     hits.sort();
@@ -287,6 +392,8 @@ const ROOT_STOPLIST: &[&str] = &[
     "rights",
     "reserved",
     "copyright",
+    "effect",
+    "effects",
 ];
 
 /// Uppercase words too common to count as a product mark.
@@ -356,9 +463,18 @@ fn copyright_vendor(text: &str) -> Option<String> {
         .map(|i| i + "copyright".len())
         .or_else(|| lower.find("(c)").map(|i| i + 3))
         .or_else(|| lower.find('\u{a9}').map(|i| i + '\u{a9}'.len_utf8()))?;
-    let rest = text.get(at..)?.trim_start_matches(|c: char| {
-        c.is_ascii_digit() || matches!(c, '-' | ' ' | ',' | '(' | ')' | 'c' | 'C' | '\u{a9}')
-    });
+    // Skip years, punctuation and further marks, but never a name's first
+    // letter: `(c)` is dropped as a whole.
+    let mut rest = text.get(at..)?;
+    loop {
+        rest = rest.trim_start_matches(|c: char| {
+            c.is_ascii_digit() || matches!(c, '-' | ' ' | ',' | '(' | ')' | '\u{a9}')
+        });
+        match rest.get(..2) {
+            Some(mark) if mark.eq_ignore_ascii_case("c)") => rest = &rest[2..],
+            _ => break,
+        }
+    }
     let head = rest
         .split([',', ' '])
         .next()?
@@ -614,10 +730,7 @@ fn redaction_spans(text: &str, roots: &BTreeSet<String>) -> Vec<(usize, usize, K
     {
         for (start, _) in lower.match_indices(root) {
             let end = start + root.len();
-            let before = start.checked_sub(1).and_then(|i| lower.as_bytes().get(i));
-            let after = lower.as_bytes().get(end);
-            let identifier = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
-            if !before.is_some_and(identifier) && !after.is_some_and(identifier) {
+            if needle::identity_boundary(text, start, end) {
                 spans.push((start, end, Kind::Brand));
             }
         }
@@ -666,11 +779,7 @@ fn redaction_spans(text: &str, roots: &BTreeSet<String>) -> Vec<(usize, usize, K
 
 /// Same-length replacements outside protected ranges. RTTI names are never
 /// edited: exception matching across modules compares them.
-fn redact_hits(
-    hits: &[Hit],
-    roots: &BTreeSet<String>,
-    protected: &Protected,
-) -> Vec<(Kind, u64, Vec<u8>)> {
+fn redact_hits(hits: &[Hit], roots: &BTreeSet<String>, protected: &Protected) -> Vec<Rewrite> {
     hits.iter()
         .filter(|h| !h.text.starts_with(".?AV") && !h.text.starts_with(".?AU"))
         .filter(|h| !protected.overlaps(h.off, h.off + h.len as u64))
@@ -680,6 +789,11 @@ fn redact_hits(
                 .filter_map(|(start, end, kind)| {
                     let (start, end, bytes) = match h.encoding {
                         Encoding::Utf8 => (start, end, vec![b' '; end - start]),
+                        Encoding::SingleByte => {
+                            let from = h.text[..start].chars().count();
+                            let to = h.text[..end].chars().count();
+                            (from, to, vec![b' '; to - from])
+                        }
                         Encoding::Utf16 => {
                             let from = h.text[..start].encode_utf16().count() * 2;
                             let to = h.text[..end].encode_utf16().count() * 2;
@@ -690,6 +804,53 @@ fn redact_hits(
                 })
         })
         .collect()
+}
+
+/// Whether `text` names a root as a whole word or a case-joined part.
+fn rooted(text: &str, roots: &BTreeSet<String>) -> bool {
+    let lower = text.to_ascii_lowercase();
+    roots.iter().any(|root| {
+        lower
+            .match_indices(root.as_str())
+            .any(|(start, _)| needle::identity_boundary(text, start, start + root.len()))
+    })
+}
+
+/// Why a rooted identity stays in the copy: inside instructions, a linkage
+/// name or RTTI, or a URL or registry key. Names are never reported.
+fn residuals(
+    hits: &[Hit],
+    code: &[Hit],
+    linkage: &[String],
+    roots: &BTreeSet<String>,
+) -> Vec<Reason> {
+    let mut out = Vec::new();
+    if code.iter().any(|h| rooted(&h.text, roots)) {
+        out.push(Reason::IdentityInCode);
+    }
+    // The `.?AV` or `.?AU` prefix would join the class name's first word.
+    let rtti = |h: &Hit| {
+        h.text
+            .strip_prefix(".?AV")
+            .or_else(|| h.text.strip_prefix(".?AU"))
+            .map(str::to_string)
+    };
+    if linkage.iter().any(|name| rooted(name, roots))
+        || hits
+            .iter()
+            .filter_map(rtti)
+            .any(|name| rooted(&name, roots))
+    {
+        out.push(Reason::FunctionalName);
+    }
+    if hits.iter().any(|h| {
+        functional_spans(&h.text)
+            .into_iter()
+            .any(|(start, end)| rooted(&h.text[start..end], roots))
+    }) {
+        out.push(Reason::FunctionalValue);
+    }
+    out
 }
 
 pub(super) fn fill_marker(off: u64, len: u64, fill: u8) -> Marker {
@@ -704,11 +865,19 @@ pub(super) fn fill_marker(off: u64, len: u64, fill: u8) -> Marker {
 
 /// A native image: NUL-filled blanks of the classified strings in its data
 /// regions.
-fn binary(view: &dyn FileView, regions: &[(u64, u64)], protected: &Protected) -> Deep {
-    let hits = region_strings(view, regions);
-    let roots = roots(&hits, None, &Vec::new());
+fn binary(
+    view: &dyn FileView,
+    regions: &[(u64, u64)],
+    protected: &Protected,
+    evidence: &Evidence,
+) -> Deep {
+    let mut skipped = Vec::new();
+    let hits = region_strings(view, regions, &mut skipped);
+    let roots = roots(&hits, None, evidence);
+    skipped.extend(residuals(&hits, &[], &[], &roots));
     Deep {
         rewrites: redact_hits(&hits, &roots, protected),
+        skipped,
         ..Deep::default()
     }
 }
@@ -793,7 +962,11 @@ fn entropy(bytes: &[u8]) -> f64 {
 /// are not compressed or encrypted.
 fn fallback(view: &dyn FileView) -> Deep {
     let size = view.size();
-    let hits = region_strings(view, &[(0, size.min(MAX_TOTAL))]);
+    let mut skipped = Vec::new();
+    if size > MAX_TOTAL {
+        skipped.push(Reason::DeepBudget);
+    }
+    let hits = region_strings(view, &[(0, size.min(MAX_TOTAL))], &mut skipped);
     let mut rewrites = Vec::new();
     for hit in hits {
         let lower = hit.text.to_ascii_lowercase();
@@ -812,6 +985,7 @@ fn fallback(view: &dyn FileView) -> Deep {
     }
     Deep {
         rewrites,
+        skipped,
         ..Deep::default()
     }
 }

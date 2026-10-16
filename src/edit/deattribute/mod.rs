@@ -63,6 +63,16 @@ pub enum Reason {
     Unsafe,
     Changed,
     Io,
+    /// An identity remains in executable instructions.
+    IdentityInCode,
+    /// An identity remains in an import, export or entry point.
+    FunctionalName,
+    /// An identity remains in a URL or registry key.
+    FunctionalValue,
+    /// A structured identity could not be parsed safely.
+    MalformedMetadata,
+    /// The deep scan reached its bounded read budget.
+    DeepBudget,
     /// An archive entry that cannot be read: encrypted, an unknown method,
     /// sparse or corrupt.
     UnsupportedEntry,
@@ -85,6 +95,11 @@ impl Reason {
             Self::Unsafe => "unsafe edit",
             Self::Changed => "changed since scan",
             Self::Io => "io error",
+            Self::IdentityInCode => "identity in code",
+            Self::FunctionalName => "functional name kept",
+            Self::FunctionalValue => "functional value kept",
+            Self::MalformedMetadata => "malformed metadata",
+            Self::DeepBudget => "deep scan budget reached",
             Self::UnsupportedEntry => "unsupported entry",
             Self::EntryTooLarge => "entry too large",
             Self::NestedArchive => "nested archive",

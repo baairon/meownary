@@ -459,6 +459,25 @@ pub(crate) fn data_regions(view: &dyn FileView) -> Vec<(u64, u64)> {
     out
 }
 
+/// Debug string pools hold paths and credits but are not loader strings.
+pub(crate) fn debug_string_regions(view: &dyn FileView) -> Vec<(u64, u64)> {
+    let Some(elf) = Elf::parse(view) else {
+        return Vec::new();
+    };
+    [".debug_str", ".debug_line_str"]
+        .into_iter()
+        .filter_map(|name| elf.section(name))
+        .filter(|s| {
+            s.kind == SHT_PROGBITS
+                && s.size > 0
+                && s.offset
+                    .checked_add(s.size)
+                    .is_some_and(|end| end <= view.size())
+        })
+        .map(|s| (s.offset, s.size))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // .comment
 

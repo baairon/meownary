@@ -21,9 +21,11 @@ use crate::scan::FileView;
 use crate::util::hash::hash_hex;
 
 use super::super::{Caveat, Kind, Reason, Target};
+use super::dotnet;
+use super::pipl::Pipl;
 use super::{
-    Deep, Encoding, Evidence, Hit, Protected, Source, fill_marker, read_full, redact_hits,
-    region_strings, roots,
+    Deep, Encoding, Evidence, Hit, Protected, Rewrite, Source, fill_marker, read_full, redact_hits,
+    region_strings, residuals, roots, single_byte, strings,
 };
 
 const DIR_IMPORT: usize = 1;
@@ -38,15 +40,20 @@ const DIR_DELAY_IMPORT: usize = 13;
 const RT_VERSION: u32 = 16;
 const RT_MANIFEST: u32 = 24;
 const RT_STRING: u32 = 6;
+const RT_DIALOG: u32 = 5;
+const RT_MESSAGETABLE: u32 = 11;
+const RT_PIPL: u32 = u32::MAX;
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x20;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x40;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 const DEBUG_CODEVIEW: u32 = 2;
+const DEBUG_MISC: u32 = 4;
 const DEBUG_VC_FEATURE: u32 = 12;
 const DEBUG_POGO: u32 = 13;
 const DEBUG_REPRO: u32 = 16;
+const DEBUG_EMBEDDED_PDB: u32 = 17;
 
 /// Cap on import descriptors, thunks, export names and resource entries.
 const MAX_ENTRIES: usize = 65_536;
@@ -107,6 +114,177 @@ fn string_table(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
             }
         }
         at = end;
+    }
+    hits
+}
+
+fn utf16_field(
+    raw: &[u8],
+    at: &mut usize,
+    base: u64,
+    hits: &mut Vec<Hit>,
+    emit: bool,
+) -> Option<()> {
+    let first = u16_at(raw, *at)?;
+    if first == 0 {
+        *at += 2;
+        return Some(());
+    }
+    if first == 0xffff {
+        *at += 4;
+        return (*at <= raw.len()).then_some(());
+    }
+    let start = *at;
+    let mut units = Vec::new();
+    loop {
+        let unit = u16_at(raw, *at)?;
+        *at += 2;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        if units.len() > super::MAX_STRING {
+            return None;
+        }
+    }
+    if emit
+        && units.len() >= 4
+        && let Ok(text) = String::from_utf16(&units)
+    {
+        hits.push(Hit {
+            off: base + start as u64,
+            len: units.len() * 2,
+            text,
+            encoding: Encoding::Utf16,
+        });
+    }
+    Some(())
+}
+
+/// Dialog headers and controls carry counted UTF-16 fields without NULs before them.
+fn dialog_table(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
+    if size > 1024 * 1024 {
+        return Vec::new();
+    }
+    let Some(raw) = read_full(view, off, size) else {
+        return Vec::new();
+    };
+    let extended = u16_at(&raw, 2) == Some(0xffff);
+    let (style, count, mut at) = if extended {
+        let (Some(style), Some(count)) = (u32_at(&raw, 12), u16_at(&raw, 16)) else {
+            return Vec::new();
+        };
+        (style, count as usize, 26usize)
+    } else {
+        let (Some(style), Some(count)) = (u32_at(&raw, 0), u16_at(&raw, 8)) else {
+            return Vec::new();
+        };
+        (style, count as usize, 18usize)
+    };
+    if count > 4096 {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for i in 0..3 {
+        if utf16_field(&raw, &mut at, off, &mut hits, i == 2).is_none() {
+            return Vec::new();
+        }
+    }
+    if style & 0x40 != 0 {
+        at += if extended { 6 } else { 2 };
+        if utf16_field(&raw, &mut at, off, &mut hits, false).is_none() {
+            return Vec::new();
+        }
+    }
+    for _ in 0..count {
+        at = (at + 3) & !3;
+        at += if extended { 24 } else { 18 };
+        if at > raw.len() {
+            return Vec::new();
+        }
+        for i in 0..2 {
+            if utf16_field(&raw, &mut at, off, &mut hits, i == 1).is_none() {
+                return Vec::new();
+            }
+        }
+        let Some(extra) = u16_at(&raw, at) else {
+            return Vec::new();
+        };
+        at += 2 + extra as usize;
+        if at > raw.len() {
+            return Vec::new();
+        }
+    }
+    hits
+}
+
+/// Message table entries contain ANSI or UTF-16 text after a four-byte header.
+fn message_table(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
+    if size > 1024 * 1024 {
+        return Vec::new();
+    }
+    let Some(raw) = read_full(view, off, size) else {
+        return Vec::new();
+    };
+    let Some(blocks) = u32_at(&raw, 0).map(|n| n as usize).filter(|&n| n <= 4096) else {
+        return Vec::new();
+    };
+    if 4 + blocks * 12 > raw.len() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for block in 0..blocks {
+        let at = 4 + block * 12;
+        let (Some(low), Some(high), Some(mut pos)) = (
+            u32_at(&raw, at),
+            u32_at(&raw, at + 4),
+            u32_at(&raw, at + 8).map(|n| n as usize),
+        ) else {
+            return Vec::new();
+        };
+        if high < low || high - low > 65_536 {
+            return Vec::new();
+        }
+        for _ in low..=high {
+            let (Some(len), Some(flags)) = (u16_at(&raw, pos), u16_at(&raw, pos + 2)) else {
+                return Vec::new();
+            };
+            let len = len as usize;
+            if len < 4 || pos + len > raw.len() {
+                return Vec::new();
+            }
+            let body = &raw[pos + 4..pos + len];
+            if flags & 1 != 0 {
+                let units = body
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u16::from_le_bytes(*p))
+                    .take_while(|&u| u != 0)
+                    .collect::<Vec<_>>();
+                if units.len() >= 4
+                    && let Ok(text) = String::from_utf16(&units)
+                {
+                    hits.push(Hit {
+                        off: off + pos as u64 + 4,
+                        len: units.len() * 2,
+                        text,
+                        encoding: Encoding::Utf16,
+                    });
+                }
+            } else {
+                let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+                if end >= 4 {
+                    hits.push(Hit {
+                        off: off + pos as u64 + 4,
+                        len: end,
+                        text: single_byte(&body[..end]),
+                        encoding: Encoding::SingleByte,
+                    });
+                }
+            }
+            pos += len;
+        }
     }
     hits
 }
@@ -265,9 +443,13 @@ struct Walk<'a> {
     view: &'a dyn FileView,
     img: &'a PeImage,
     protected: Protected,
-    rewrites: Vec<(Kind, u64, Vec<u8>)>,
+    rewrites: Vec<Rewrite>,
     caveats: Vec<Caveat>,
     resource_hits: Vec<Hit>,
+    structured_hits: Vec<Hit>,
+    pipls: Vec<Pipl>,
+    /// Import, export and module names the loader resolves.
+    linkage: Vec<String>,
     evidence: Evidence,
     skipped: Vec<Reason>,
 }
@@ -303,6 +485,8 @@ impl Walk<'_> {
         let bytes = self.view.read_at(off, MAX_NAME).ok()?;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         self.protected.add(off, end as u64 + 1);
+        self.linkage
+            .push(String::from_utf8_lossy(&bytes[..end]).into_owned());
         Some((off, bytes[..end].to_vec()))
     }
 
@@ -423,8 +607,12 @@ impl Walk<'_> {
             self.zero(stamp, 4);
         }
         let module = self.name_at(name_rva)?;
-        (module.1.len() >= 4 && module.1.iter().all(|b| (0x20..=0x7e).contains(b)))
-            .then_some(module)
+        let rewritable = module.1.len() >= 4 && module.1.iter().all(|b| (0x20..=0x7e).contains(b));
+        // A rewritten module name no longer carries the identity.
+        if rewritable {
+            self.linkage.pop();
+        }
+        rewritable.then_some(module)
     }
 
     /// Queue a same-length zero rewrite when the field is not zero already.
@@ -484,14 +672,25 @@ impl Walk<'_> {
             else {
                 continue;
             };
+            let mut named_pipl = false;
             if name & 0x8000_0000 != 0 {
                 let off = base + u64::from(name & 0x7fff_ffff);
                 if let Some(len) = read_full(self.view, off, 2).and_then(|b| u16_at(&b, 0)) {
                     self.protected.add(off, 2 + u64::from(len) * 2);
+                    if depth == 0
+                        && len == 4
+                        && let Some(raw) = read_full(self.view, off + 2, 8)
+                    {
+                        named_pipl = raw == b"P\0i\0P\0L\0";
+                    }
                 }
             }
             let kind = if depth == 0 {
-                (name & 0x8000_0000 == 0).then_some(name)
+                if named_pipl {
+                    Some(RT_PIPL)
+                } else {
+                    (name & 0x8000_0000 == 0).then_some(name)
+                }
             } else {
                 kind
             };
@@ -519,8 +718,31 @@ impl Walk<'_> {
                         );
                     }
                     Some(RT_STRING) => {
-                        self.resource_hits
+                        self.protected.add(off, u64::from(size));
+                        self.structured_hits
                             .extend(string_table(self.view, off, size as usize))
+                    }
+                    Some(RT_DIALOG) => {
+                        self.protected.add(off, u64::from(size));
+                        self.structured_hits
+                            .extend(dialog_table(self.view, off, size as usize));
+                    }
+                    Some(RT_MESSAGETABLE) => {
+                        self.protected.add(off, u64::from(size));
+                        self.structured_hits
+                            .extend(message_table(self.view, off, size as usize));
+                    }
+                    Some(RT_PIPL) => {
+                        self.protected.add(off, u64::from(size));
+                        match read_full(self.view, off, size as usize)
+                            .and_then(|raw| Pipl::parse(&raw, off))
+                        {
+                            Some(pipl) => {
+                                self.evidence.extend(pipl.evidence());
+                                self.pipls.push(pipl);
+                            }
+                            None => self.skipped.push(Reason::MalformedMetadata),
+                        }
                     }
                     _ => {}
                 }
@@ -559,6 +781,10 @@ impl Walk<'_> {
             return Vec::new();
         };
         self.protected.add(md, u64::from(md_size));
+        let (rewrites, evidence, skipped) = dotnet::attributes(self.view, md, u64::from(md_size));
+        self.rewrites.extend(rewrites);
+        self.evidence.extend(evidence);
+        self.skipped.extend(skipped);
         user_strings(self.view, md, u64::from(md_size)).unwrap_or_default()
     }
 
@@ -587,6 +813,8 @@ impl Walk<'_> {
             self.protected.add(ptr, size as u64);
             match kind {
                 DEBUG_CODEVIEW => self.codeview(ptr, size),
+                DEBUG_MISC => self.misc(ptr, size),
+                DEBUG_EMBEDDED_PDB => self.embedded_pdb(at, ptr, size),
                 DEBUG_VC_FEATURE | DEBUG_POGO | DEBUG_REPRO => self.zero(ptr, size),
                 _ => {}
             }
@@ -620,6 +848,98 @@ impl Walk<'_> {
         }
     }
 
+    fn misc(&mut self, ptr: u64, size: usize) {
+        let Some(raw) = read_full(self.view, ptr, size) else {
+            return;
+        };
+        if raw.len() < 12
+            || u32_at(&raw, 0) != Some(1)
+            || u32_at(&raw, 4).is_none_or(|n| n as usize > size || n < 12)
+        {
+            return;
+        }
+        let unicode = raw[8] != 0;
+        let data = &raw[12..];
+        let len = if unicode {
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .position(|p| *p == [0, 0])
+                .map(|n| n * 2)
+        } else {
+            data.iter().position(|&b| b == 0)
+        };
+        let Some(len) = len.filter(|&n| n > 0) else {
+            return;
+        };
+        let value = if unicode {
+            String::from_utf16(
+                &data[..len]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u16::from_le_bytes(*p))
+                    .collect::<Vec<_>>(),
+            )
+            .ok()
+        } else {
+            Some(single_byte(&data[..len]))
+        };
+        if let Some(value) = value {
+            let stem = value
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or("")
+                .split('.')
+                .next()
+                .unwrap_or("");
+            self.evidence.push((stem.to_string(), Source::Pdb));
+            self.zero(ptr + 12, len);
+        }
+    }
+
+    fn embedded_pdb(&mut self, entry: u64, ptr: u64, size: usize) {
+        let Some(raw) = read_full(self.view, ptr, size) else {
+            return;
+        };
+        if raw.get(..4) != Some(b"MPDB") {
+            return;
+        }
+        let Some(unpacked) = u32_at(&raw, 4)
+            .map(|n| n as usize)
+            .filter(|&n| n <= 64 * 1024 * 1024)
+        else {
+            self.skipped.push(Reason::DeepBudget);
+            return;
+        };
+        let Ok(data) = miniz_oxide::inflate::decompress_to_vec_with_limit(&raw[8..], unpacked)
+        else {
+            self.skipped.push(Reason::MalformedMetadata);
+            return;
+        };
+        if data.len() != unpacked {
+            self.skipped.push(Reason::MalformedMetadata);
+            return;
+        }
+        let mut hits = Vec::new();
+        strings(&data, 0, true, &mut hits);
+        for hit in hits {
+            if hit.text.to_ascii_lowercase().contains(".pdb") {
+                let stem = hit
+                    .text
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("");
+                self.evidence.push((stem.to_string(), Source::Pdb));
+            }
+        }
+        self.zero(ptr, size);
+        self.zero(entry + 16, 12);
+    }
+
     /// The certificate is outside the loaded image. Mine its names before
     /// clearing the detached payload and the directory slot.
     fn certificate(&mut self) -> Option<Marker> {
@@ -649,6 +969,20 @@ impl Walk<'_> {
                 .map(|name| (name, Source::Certificate)),
         );
         Some(fill_marker(off, len as u64, 0))
+    }
+
+    /// Executable sections, read only to report identities left in code.
+    fn code_regions(&self) -> Vec<(u64, u64)> {
+        self.img
+            .sections
+            .iter()
+            .filter(|s| {
+                s.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0
+                    && s.raw_size != 0
+                    && u64::from(s.raw_ptr) + u64::from(s.raw_size) <= self.view.size()
+            })
+            .map(|s| (u64::from(s.raw_ptr), u64::from(s.raw_size)))
+            .collect()
     }
 
     /// Initialized data sections past the headers that hold no code.
@@ -764,6 +1098,9 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         rewrites: Vec::new(),
         caveats: Vec::new(),
         resource_hits: Vec::new(),
+        structured_hits: Vec::new(),
+        pipls: Vec::new(),
+        linkage: Vec::new(),
         evidence: Vec::new(),
         skipped: Vec::new(),
     };
@@ -819,8 +1156,9 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     }
 
     let regions = w.data_regions();
-    let mut hits = region_strings(view, &regions);
+    let mut hits = region_strings(view, &regions, &mut w.skipped);
     hits.extend(w.resource_hits.iter().cloned());
+    hits.extend(w.structured_hits.iter().cloned());
     hits.sort();
     hits.dedup();
     let mut all_hits = hits.clone();
@@ -830,8 +1168,21 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         name.split(['.', '_']).next()
     });
     let roots = roots(&all_hits, stem, &w.evidence);
+    let code = region_strings(view, &w.code_regions(), &mut w.skipped);
+    let residual = residuals(&hits, &code, &w.linkage, &roots);
+    w.skipped.extend(residual);
     let mut rewrites = redact_hits(&hits, &roots, &w.protected);
+    rewrites.extend(redact_hits(
+        &w.structured_hits,
+        &roots,
+        &Protected::default(),
+    ));
     rewrites.extend(redact_hits(&user, &roots, &Protected::default()));
+    for pipl in &w.pipls {
+        let (planned, skipped) = pipl.rewrites(&roots);
+        rewrites.extend(planned);
+        w.skipped.extend(skipped);
+    }
     let blanks = certificate
         .into_iter()
         .map(|marker| (Kind::Brand, marker))
@@ -882,18 +1233,28 @@ pub(in super::super) fn checksum_target(view: &dyn FileView, targets: &[Target])
         return None;
     }
     let size = view.size();
-    let overlays: Vec<(u64, Vec<u8>)> = targets
+    let mut overlays: Vec<(u64, Vec<u8>)> = targets
         .iter()
         .map(|t| (t.marker.region.offset, t.new_bytes()))
         .collect();
+    overlays.sort_by_key(|(off, _)| *off);
     const CHUNK: u64 = 1 << 20;
     let mut sum: u64 = 0;
     let mut pos = 0u64;
+    // Overlays sorted by offset: each chunk skips the finished prefix and
+    // stops at the first one past its end.
+    let mut first = 0;
     while pos < size {
         let n = CHUNK.min(size - pos);
         let mut buf = read_full(view, pos, n as usize)?;
         let end = pos + n;
-        for (off, bytes) in &overlays {
+        while overlays
+            .get(first)
+            .is_some_and(|(off, bytes)| off + bytes.len() as u64 <= pos)
+        {
+            first += 1;
+        }
+        for (off, bytes) in overlays[first..].iter().take_while(|(off, _)| *off < end) {
             let o_end = off + bytes.len() as u64;
             if o_end <= pos || *off >= end {
                 continue;

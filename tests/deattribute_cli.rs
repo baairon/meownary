@@ -65,6 +65,95 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// A Macintosh resource fork holding one `STR#` list of `texts` under the
+/// resource name `Glimmer Glow`, and the same fork as the resource entry of an
+/// AppleDouble file. All names invented.
+fn resource_forks(texts: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+    let mut list = (texts.len() as u16).to_be_bytes().to_vec();
+    for text in texts {
+        list.push(text.len() as u8);
+        list.extend_from_slice(text);
+    }
+    let mut data = (list.len() as u32).to_be_bytes().to_vec();
+    data.extend_from_slice(&list);
+    // The map: header copy and handles, then the type list at 28, one
+    // reference after it and the name list at 50.
+    let mut map = vec![0u8; 24];
+    for v in [28u16, 50, 0] {
+        map.extend_from_slice(&v.to_be_bytes());
+    }
+    map.extend_from_slice(b"STR#");
+    for v in [0u16, 10, 128, 0] {
+        map.extend_from_slice(&v.to_be_bytes());
+    }
+    map.extend_from_slice(&[0; 8]);
+    map.extend_from_slice(b"\x0cGlimmer Glow");
+    let mut fork = Vec::new();
+    for v in [0x100, 0x100 + data.len(), data.len(), map.len()] {
+        fork.extend_from_slice(&(v as u32).to_be_bytes());
+    }
+    fork.resize(0x100, 0);
+    fork.extend_from_slice(&data);
+    fork.extend_from_slice(&map);
+    let mut double = vec![0, 5, 0x16, 7, 0, 2, 0, 0];
+    double.resize(24, 0);
+    double.extend_from_slice(&1u16.to_be_bytes());
+    for v in [2u32, 38, fork.len() as u32] {
+        double.extend_from_slice(&v.to_be_bytes());
+    }
+    double.extend_from_slice(&fork);
+    (fork, double)
+}
+
+#[test]
+fn deep_mode_cleans_resource_forks_and_appledouble_files() {
+    let fx = Fixture::empty();
+    let (fork, double) = resource_forks(&[b"\xa9 2024 Glimmer Labs", b"Patched by Nobody Group"]);
+    fs::write(fx.path("Glow.rsrc"), &fork).unwrap();
+    fs::write(fx.path("._Glow.dll"), &double).unwrap();
+
+    // The basic pass has nothing to say about a resource fork.
+    let basic = fx.run(&["clean", fx.root(), "--deattribute", "--json"]);
+    basic.assert_code(0);
+    assert!(
+        of_kind(&basic.events(), "saved").is_empty(),
+        "{}",
+        basic.stdout
+    );
+
+    let run = fx.run(&["clean", fx.root(), "--deattribute", "--deep", "--json"]);
+    run.assert_code(0);
+    let events = run.events();
+    let saved = of_kind(&events, "saved");
+    assert_eq!(saved.len(), 2, "{}", run.stdout);
+    assert!(
+        saved.iter().all(|e| e["verified"] == true),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        of_kind(&events, "skipped")
+            .iter()
+            .any(|e| e["reason"] == "functional name kept"),
+        "the resource name stays and is reported: {}",
+        run.stdout
+    );
+    for (name, original) in [("Glow", &fork), ("._Glow", &double)] {
+        let ext = if name == "Glow" { "rsrc" } else { "dll" };
+        let copy = fs::read(fx.path(&format!("{name}.deattributed.{ext}"))).unwrap();
+        assert_eq!(copy.len(), original.len());
+        let has = |needle: &[u8]| copy.windows(needle.len()).any(|w| w == needle);
+        assert!(!has(b"2024 Glimmer Labs") && !has(b"Nobody"), "{name}");
+        assert!(has(b"Glimmer Glow"), "{name}: the resource name is kept");
+    }
+    assert!(!run.stdout.contains("Glimmer") && !run.stdout.contains("Nobody"));
+    assert!(
+        !run.stderr.contains("verification incomplete"),
+        "{}",
+        run.stderr
+    );
+}
+
 #[test]
 fn usage_errors_still_end_with_a_done_event() {
     let fx = Fixture::empty();

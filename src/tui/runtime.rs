@@ -1624,6 +1624,97 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "original untouched");
     }
 
+    /// A Macintosh resource fork whose one `STR#` string is a copyright line,
+    /// under the resource name `Glimmer Glow`, and the same fork inside an
+    /// AppleDouble file. All names invented.
+    fn resource_forks() -> (Vec<u8>, Vec<u8>) {
+        let text = b"\xa9 2024 Glimmer Labs";
+        let mut data = ((text.len() + 3) as u32).to_be_bytes().to_vec();
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.push(text.len() as u8);
+        data.extend_from_slice(text);
+        // The map: header copy and handles, then the type list at 28, one
+        // reference after it and the name list at 50.
+        let mut map = vec![0u8; 24];
+        for v in [28u16, 50, 0] {
+            map.extend_from_slice(&v.to_be_bytes());
+        }
+        map.extend_from_slice(b"STR#");
+        for v in [0u16, 10, 128, 0] {
+            map.extend_from_slice(&v.to_be_bytes());
+        }
+        map.extend_from_slice(&[0; 8]);
+        map.extend_from_slice(b"\x0cGlimmer Glow");
+        let mut fork = Vec::new();
+        for v in [0x100, 0x100 + data.len(), data.len(), map.len()] {
+            fork.extend_from_slice(&(v as u32).to_be_bytes());
+        }
+        fork.resize(0x100, 0);
+        fork.extend_from_slice(&data);
+        fork.extend_from_slice(&map);
+        let mut double = vec![0, 5, 0x16, 7, 0, 2, 0, 0];
+        double.resize(24, 0);
+        double.extend_from_slice(&1u16.to_be_bytes());
+        for v in [2u32, 38, fork.len() as u32] {
+            double.extend_from_slice(&v.to_be_bytes());
+        }
+        double.extend_from_slice(&fork);
+        (fork, double)
+    }
+
+    #[test]
+    fn deep_deattribute_writes_verified_copies_of_resource_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fork, double) = resource_forks();
+        let registry = crate::parsers::registry();
+        let mut reports = Vec::new();
+        for (name, bytes) in [("Glow.rsrc", &fork), ("._Glow.dll", &double)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            app_picks(&mut reports, scan::scan_file(&path, &registry));
+        }
+        let formats: Vec<Option<&str>> = reports.iter().map(|r| r.format.as_deref()).collect();
+        assert_eq!(formats, [Some("appledouble"), Some("rsrc")]);
+        let mut app = App::new(dir.path());
+        let paths: Vec<PathBuf> = reports.iter().map(|r| r.path.clone()).collect();
+        app.push_reports(reports);
+        app.scan_done();
+        app.picked_files.extend(paths);
+        assert!(
+            app.deattribute_plan().is_err(),
+            "the basic pass has nothing to blank in a resource fork"
+        );
+
+        let plan = app.deattribute_plan_mode(deattribute::Mode::Deep).unwrap();
+        assert_eq!(plan.kind, PlanKind::DeepDeattribute);
+        assert_eq!(plan.items.len(), 2, "one rewrite in each file");
+        assert!(plan.items.iter().all(|item| item.replacement.is_some()));
+        assert!(
+            plan.private_skips
+                .iter()
+                .any(|s| s.ends_with("(functional name kept)")),
+            "{:?}",
+            plan.private_skips
+        );
+
+        let out = write_copies(&plan, dir.path());
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert!(out.unverified.is_empty(), "{:?}", out.unverified);
+        assert_eq!(out.saved.len(), 2);
+        for item in &out.saved {
+            let copy = std::fs::read(&item.output).unwrap();
+            let has = |needle: &[u8]| copy.windows(needle.len()).any(|w| w == needle);
+            assert!(!has(b"2024 Glimmer Labs"), "{}", item.output.display());
+            assert!(has(b"Glimmer Glow"), "the resource name is kept");
+        }
+    }
+
+    /// Keep `reports` sorted by path, the order the view holds them in.
+    fn app_picks(reports: &mut Vec<FileReport>, report: FileReport) {
+        let at = reports.partition_point(|r| r.path < report.path);
+        reports.insert(at, report);
+    }
+
     /// Wait until the running job has landed and the view is free again, as
     /// the frame loop does. True when a plan arrived on the way.
     fn settle(rt: &mut Runtime) -> bool {
