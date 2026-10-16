@@ -1,5 +1,5 @@
 //! The pastel-violet palette, shared across every view, plus the rainbow math
-//! behind the animated wordmark.
+//! behind the animated wordmark and the progress bars.
 //!
 //! Colors live in a [`Palette`] so the whole view can drop to the terminal's
 //! default colors when `NO_COLOR` is set; [`Look`] bundles the palette with
@@ -114,6 +114,48 @@ pub fn rainbow_color(i: usize, t_ms: u64) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// Saturation and value of the progress bar's rainbow: the wordmark's own.
+pub const GAUGE_SAT: f32 = RAINBOW_SAT;
+pub const GAUGE_VAL: f32 = RAINBOW_VAL;
+/// Hue distance between neighbouring cells of a progress bar, in degrees:
+/// a 24-cell bar holds one whole rainbow.
+pub const GAUGE_STEP_DEG: f32 = 15.0;
+/// One full turn of the progress bar's flow while work runs, in
+/// milliseconds: the wordmark's cycle, so the two move together.
+pub const GAUGE_CYCLE_MS: u64 = RAINBOW_CYCLE_MS;
+/// How far an in-flight cell leans from the track toward its pastel when
+/// the bar holds still.
+pub const GAUGE_INFLIGHT_MIX: f32 = 0.35;
+/// The range in-flight cells shimmer through while work runs.
+pub const GAUGE_SHIMMER: (f32, f32) = (0.25, 0.6);
+/// One full shimmer of the in-flight cells, in milliseconds.
+pub const GAUGE_SHIMMER_MS: u64 = 1600;
+
+/// The hue (degrees, 0..360) of progress bar cell `i` at time `t_ms`. Each
+/// cell trails its left neighbour by [`GAUGE_STEP_DEG`], and the whole ramp
+/// turns once every [`GAUGE_CYCLE_MS`], so the colors flow left to right
+/// with the progress, the way the wordmark's do.
+pub fn gauge_hue(i: usize, t_ms: u64) -> f32 {
+    let base = (t_ms % GAUGE_CYCLE_MS) as f32 * 360.0 / GAUGE_CYCLE_MS as f32;
+    (base - i as f32 * GAUGE_STEP_DEG).rem_euclid(360.0)
+}
+
+/// The pastel of progress bar cell `i` at time `t_ms`.
+pub fn gauge_color(i: usize, t_ms: u64) -> Color {
+    let (r, g, b) = hsv_to_rgb(gauge_hue(i, t_ms), GAUGE_SAT, GAUGE_VAL);
+    Color::Rgb(r, g, b)
+}
+
+/// How far in-flight cells lean toward their pastel at `t_ms`: a slow swell
+/// from the low end of [`GAUGE_SHIMMER`] to the high end and back, once
+/// every [`GAUGE_SHIMMER_MS`].
+pub fn gauge_shimmer(t_ms: u64) -> f32 {
+    let phase = (t_ms % GAUGE_SHIMMER_MS) as f32 / GAUGE_SHIMMER_MS as f32;
+    let swell = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+    let (lo, hi) = GAUGE_SHIMMER;
+    lo + (hi - lo) * swell
+}
+
 /// Every color the view uses. [`Palette::mono`] maps all of them to the
 /// terminal default, for `NO_COLOR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +237,8 @@ pub struct Look {
     pub p: Palette,
     /// `NO_COLOR`: no colors at all, hierarchy from modifiers alone.
     pub mono: bool,
-    /// Whether the wordmark animates (otherwise it holds its first frame).
+    /// Whether the wordmark and the progress bars animate (otherwise they
+    /// hold their first frame).
     pub animate: bool,
 }
 
@@ -476,6 +519,41 @@ impl Look {
             .fg(lerp(ACCENT_RAMP[0], ACCENT_RAMP[1], t))
             .add_modifier(Modifier::BOLD)
     }
+
+    /// The clock a progress bar runs on: the frame time while `live` work
+    /// runs, otherwise held at the start. A bar moves while work runs even
+    /// under `MEOWNARY_NO_ANIM`: its motion is how the view says it is
+    /// working.
+    fn gauge_clock(&self, t_ms: u64, live: bool) -> u64 {
+        if live { t_ms } else { 0 }
+    }
+
+    /// Filled cell `i` of a progress bar: the wordmark's rainbow, flowing
+    /// while `live` work runs. Plain under `NO_COLOR`, and never bold.
+    pub fn gauge_fill(&self, i: usize, t_ms: u64, live: bool) -> Style {
+        if self.mono {
+            return Style::new();
+        }
+        Style::new().fg(gauge_color(i, self.gauge_clock(t_ms, live)))
+    }
+
+    /// Track cell `i` of a progress bar inside the span of the item being
+    /// worked on: the track color leaning toward that cell's color, a fixed
+    /// step when idle and shimmering while `live` work runs. Under
+    /// `NO_COLOR` it is the plain track, and the bar marks the span with a
+    /// dashed symbol instead.
+    pub fn gauge_inflight(&self, i: usize, t_ms: u64, live: bool) -> Style {
+        if self.mono {
+            return self.rule();
+        }
+        let t = self.gauge_clock(t_ms, live);
+        let mix = if live {
+            gauge_shimmer(t)
+        } else {
+            GAUGE_INFLIGHT_MIX
+        };
+        Style::new().fg(lerp(self.p.border, gauge_color(i, t), mix))
+    }
 }
 
 #[cfg(test)]
@@ -521,6 +599,65 @@ mod tests {
         assert_eq!(still.rainbow(1, 0), still.rainbow(1, 1800));
         let live = Look::vivid();
         assert_ne!(live.rainbow(1, 0), live.rainbow(1, 1800));
+    }
+
+    #[test]
+    fn gauge_ramp_steps_drifts_and_shimmers() {
+        assert_eq!(gauge_hue(0, 0), 0.0);
+        assert_eq!(gauge_hue(3, 0), 315.0);
+        assert_eq!(gauge_hue(24, 0), 0.0, "24 cells make a full turn");
+        // A quarter cycle later every cell has moved 90 degrees.
+        let q = GAUGE_CYCLE_MS / 4;
+        assert!((gauge_hue(0, q) - 90.0).abs() < 1e-2);
+        assert!((gauge_hue(3, q) - 45.0).abs() < 1e-2);
+        // The bar wears the wordmark's colors and keeps its time.
+        assert_eq!(GAUGE_CYCLE_MS, RAINBOW_CYCLE_MS);
+        assert_eq!(gauge_color(0, 0), rainbow_color(0, 0));
+        // The colors flow rightward: a hue reaches the next cell later.
+        let step_ms = (GAUGE_STEP_DEG / 360.0 * GAUGE_CYCLE_MS as f32) as u64;
+        assert!((gauge_hue(4, step_ms) - gauge_hue(3, 0)).abs() < 0.5);
+        assert_eq!(gauge_hue(5, GAUGE_CYCLE_MS), gauge_hue(5, 0));
+        // The shimmer swells from the low end to the high end and back.
+        let (lo, hi) = GAUGE_SHIMMER;
+        assert!((gauge_shimmer(0) - lo).abs() < 1e-6);
+        assert!((gauge_shimmer(GAUGE_SHIMMER_MS / 2) - hi).abs() < 1e-6);
+        assert_eq!(gauge_shimmer(GAUGE_SHIMMER_MS), gauge_shimmer(0));
+        for t in [1, 399, 800, 1201, 1599, 123_457] {
+            let s = gauge_shimmer(t);
+            assert!((lo..=hi).contains(&s), "{s}");
+        }
+    }
+
+    #[test]
+    fn gauge_styles_follow_the_switches() {
+        let live = Look::vivid();
+        assert_ne!(live.gauge_fill(2, 0, true), live.gauge_fill(2, 2000, true));
+        assert_eq!(
+            live.gauge_fill(2, 0, false),
+            live.gauge_fill(2, 2000, false),
+            "an idle bar holds still"
+        );
+        // MEOWNARY_NO_ANIM stills the wordmark, never a bar with work running.
+        let still = Look::from_flags(false, true);
+        assert_ne!(
+            still.gauge_fill(2, 0, true),
+            still.gauge_fill(2, 2000, true)
+        );
+        assert_ne!(
+            still.gauge_inflight(2, 0, true),
+            still.gauge_inflight(2, 400, true)
+        );
+        let mono = Look::from_flags(true, false);
+        assert_eq!(mono.gauge_fill(2, 2000, true).fg, None);
+        assert_eq!(mono.gauge_inflight(2, 2000, true), mono.rule());
+        for look in [live, still, mono] {
+            for s in [
+                look.gauge_fill(1, 50, true),
+                look.gauge_inflight(1, 50, true),
+            ] {
+                assert!(!s.add_modifier.contains(Modifier::BOLD), "{s:?}");
+            }
+        }
     }
 
     #[test]

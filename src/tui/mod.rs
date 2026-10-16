@@ -1,8 +1,9 @@
 //! The interactive terminal view and the theme/keymap it is built on.
 //!
-//! `app` is the state machine (no terminal), `ui` draws it, `runtime` owns the
-//! terminal, the frame clock and the edit engine, and `preview` renders the
-//! same drawing code to animated SVG for the README.
+//! `app` is the state machine (no terminal), `ui` draws it, `widgets` holds
+//! the small drawing pieces the views share (the thin progress bar),
+//! `runtime` owns the terminal, the frame clock and the edit engine, and
+//! `preview` renders the same drawing code to animated SVG for the README.
 //!
 //! `picker` is the first-run file browser. `listing` reads one folder from
 //! its directory listing alone, for the views that browse folders, and `bg`
@@ -24,5 +25,6 @@ pub mod runtime;
 pub mod theme;
 pub mod tree;
 pub mod ui;
+pub mod widgets;
 
 pub use app::run;
