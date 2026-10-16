@@ -4,7 +4,7 @@
 //! snapshots the original and writes the result atomically.
 
 use crate::model::{ContainerKind, Region};
-use crate::parsers::{archive, doc, elf, image, macho, media, pe, zip};
+use crate::parsers::{archive, doc, elf, image, macho, media, pe, text, zip};
 
 /// Rewrite `data` with `region` removed in a way that keeps `container` valid.
 /// `None` means no structural remover exists for this container yet (the engine
@@ -20,6 +20,7 @@ pub fn remove(container: ContainerKind, data: &[u8], region: Region) -> Option<V
         PeOverlay | PeResource => pe::structural_remove(data, region),
         ElfSection => elf::structural_remove(data, region),
         MachoLoadCmd => macho::structural_remove(data, region),
-        Raw | Generic => None,
+        Raw => text::structural_remove(data, region),
+        Generic => None,
     }
 }
