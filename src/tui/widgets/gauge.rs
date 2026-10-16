@@ -1,10 +1,12 @@
 //! The thin progress bar: ratatui's [`LineGauge`], `━` filled over a `─`
 //! track, spanning exactly the area it is given. Filled cells carry the
 //! wordmark's rainbow, flowing left to right while work runs, and the track
-//! cells under the item being worked on lean faintly toward it. The bar
-//! keeps moving under `MEOWNARY_NO_ANIM`, since its motion is the sign that
-//! work is running; it turns plain under `NO_COLOR` (with the in-flight span
-//! dashed so it still shows), and is never bold.
+//! cells under the item being worked on shimmer in the same rainbow, a sheen
+//! running rightward that peaks at the wordmark's own colors; held still,
+//! they lean faintly toward it. The bar keeps moving under
+//! `MEOWNARY_NO_ANIM`, since its motion is the sign that work is running; it
+//! turns plain under `NO_COLOR` (with the in-flight span dashed so it still
+//! shows), and is never bold.
 //!
 //! `LineGauge` panics on a ratio outside 0..=1 and draws a percentage label
 //! unless given one, and its bar starts a column after the label even when

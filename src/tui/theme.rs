@@ -126,10 +126,13 @@ pub const GAUGE_CYCLE_MS: u64 = RAINBOW_CYCLE_MS;
 /// How far an in-flight cell leans from the track toward its pastel when
 /// the bar holds still.
 pub const GAUGE_INFLIGHT_MIX: f32 = 0.35;
-/// The range in-flight cells shimmer through while work runs.
-pub const GAUGE_SHIMMER: (f32, f32) = (0.25, 0.6);
-/// One full shimmer of the in-flight cells, in milliseconds.
+/// The range in-flight cells shimmer through while work runs: at the crest
+/// a cell wears the wordmark's own color.
+pub const GAUGE_SHIMMER: (f32, f32) = (0.55, 1.0);
+/// One full shimmer of an in-flight cell, in milliseconds.
 pub const GAUGE_SHIMMER_MS: u64 = 1600;
+/// How many cells apart the shimmer's crests run.
+pub const GAUGE_SHIMMER_CELLS: usize = 8;
 
 /// The hue (degrees, 0..360) of progress bar cell `i` at time `t_ms`. Each
 /// cell trails its left neighbour by [`GAUGE_STEP_DEG`], and the whole ramp
@@ -146,11 +149,13 @@ pub fn gauge_color(i: usize, t_ms: u64) -> Color {
     Color::Rgb(r, g, b)
 }
 
-/// How far in-flight cells lean toward their pastel at `t_ms`: a slow swell
-/// from the low end of [`GAUGE_SHIMMER`] to the high end and back, once
-/// every [`GAUGE_SHIMMER_MS`].
-pub fn gauge_shimmer(t_ms: u64) -> f32 {
-    let phase = (t_ms % GAUGE_SHIMMER_MS) as f32 / GAUGE_SHIMMER_MS as f32;
+/// How far in-flight cell `i` leans toward its color at `t_ms`: a swell from
+/// the low end of [`GAUGE_SHIMMER`] to the high end and back once every
+/// [`GAUGE_SHIMMER_MS`], each cell a step behind its left neighbour, so a
+/// sheen runs rightward through the wordmark's rainbow.
+pub fn gauge_shimmer(i: usize, t_ms: u64) -> f32 {
+    let phase = (t_ms % GAUGE_SHIMMER_MS) as f32 / GAUGE_SHIMMER_MS as f32
+        - (i % GAUGE_SHIMMER_CELLS) as f32 / GAUGE_SHIMMER_CELLS as f32;
     let swell = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
     let (lo, hi) = GAUGE_SHIMMER;
     lo + (hi - lo) * swell
@@ -539,7 +544,8 @@ impl Look {
 
     /// Track cell `i` of a progress bar inside the span of the item being
     /// worked on: the track color leaning toward that cell's color, a fixed
-    /// step when idle and shimmering while `live` work runs. Under
+    /// step when idle, and while `live` work runs a sheen through the
+    /// wordmark's rainbow that peaks at the wordmark's own colors. Under
     /// `NO_COLOR` it is the plain track, and the bar marks the span with a
     /// dashed symbol instead.
     pub fn gauge_inflight(&self, i: usize, t_ms: u64, live: bool) -> Style {
@@ -548,7 +554,7 @@ impl Look {
         }
         let t = self.gauge_clock(t_ms, live);
         let mix = if live {
-            gauge_shimmer(t)
+            gauge_shimmer(i, t)
         } else {
             GAUGE_INFLIGHT_MIX
         };
@@ -617,15 +623,33 @@ mod tests {
         let step_ms = (GAUGE_STEP_DEG / 360.0 * GAUGE_CYCLE_MS as f32) as u64;
         assert!((gauge_hue(4, step_ms) - gauge_hue(3, 0)).abs() < 0.5);
         assert_eq!(gauge_hue(5, GAUGE_CYCLE_MS), gauge_hue(5, 0));
-        // The shimmer swells from the low end to the high end and back.
+        // The shimmer swells from the low end to the wordmark's own color and
+        // back, and its crest reaches the next cell later: a sheen running
+        // rightward.
         let (lo, hi) = GAUGE_SHIMMER;
-        assert!((gauge_shimmer(0) - lo).abs() < 1e-6);
-        assert!((gauge_shimmer(GAUGE_SHIMMER_MS / 2) - hi).abs() < 1e-6);
-        assert_eq!(gauge_shimmer(GAUGE_SHIMMER_MS), gauge_shimmer(0));
-        for t in [1, 399, 800, 1201, 1599, 123_457] {
-            let s = gauge_shimmer(t);
-            assert!((lo..=hi).contains(&s), "{s}");
+        assert_eq!(hi, 1.0);
+        assert!((gauge_shimmer(0, 0) - lo).abs() < 1e-6);
+        assert!((gauge_shimmer(0, GAUGE_SHIMMER_MS / 2) - hi).abs() < 1e-6);
+        assert_eq!(gauge_shimmer(0, GAUGE_SHIMMER_MS), gauge_shimmer(0, 0));
+        let cell_ms = GAUGE_SHIMMER_MS / GAUGE_SHIMMER_CELLS as u64;
+        assert!((gauge_shimmer(1, GAUGE_SHIMMER_MS / 2 + cell_ms) - hi).abs() < 1e-6);
+        assert_eq!(
+            gauge_shimmer(GAUGE_SHIMMER_CELLS, 300),
+            gauge_shimmer(0, 300)
+        );
+        for i in [0, 1, 7, 8, 23] {
+            for t in [1, 399, 800, 1201, 1599, 123_457] {
+                let s = gauge_shimmer(i, t);
+                assert!((lo..=hi).contains(&s), "{s}");
+            }
         }
+        // At the crest an in-flight cell wears exactly the filled color.
+        let look = Look::vivid();
+        let crest = GAUGE_SHIMMER_MS / 2;
+        assert_eq!(
+            look.gauge_inflight(0, crest, true).fg,
+            look.gauge_fill(0, crest, true).fg
+        );
     }
 
     #[test]
