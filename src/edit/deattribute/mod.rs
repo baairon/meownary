@@ -14,6 +14,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+mod deep;
 pub mod mem;
 mod route;
 pub mod tar;
@@ -26,7 +27,7 @@ use crate::catalog::{catalog, marker_for};
 use crate::model::{
     Category, ContainerKind, FileReport, Marker, Region, RemovalStrategy, TamperKind,
 };
-use crate::parsers::{catalog_probe, elf, pe};
+use crate::parsers::{catalog_probe, elf, macho, pe};
 use crate::scan::FileView;
 use crate::util::hash::hash_hex;
 
@@ -394,8 +395,13 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
         }
     }
 
+    let deep = (mode == Mode::Deep).then(|| deep::sweep(report, view));
+    if let Some(d) = &deep {
+        raw.extend(d.blanks.iter().cloned());
+    }
+
     // At one offset the longer span sorts first, and the sort is stable, so a
-    // parser's marker stays ahead of a shorter catalog one it covers.
+    // parser's marker stays ahead of a shorter catalog or deep one it covers.
     raw.sort_by_key(|(_, m)| (m.region.offset, std::cmp::Reverse(m.region.len)));
     let mut merged: Vec<(Kind, Marker)> = Vec::new();
     for (kind, marker) in raw {
@@ -447,6 +453,67 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
             expected_hash: hash_hex(&bytes),
             replacement: None,
         });
+    }
+    if let Some(d) = deep {
+        for (kind, off, bytes) in d.rewrites {
+            let end = off + bytes.len() as u64;
+            if out
+                .targets
+                .iter()
+                .any(|t| t.marker.region.offset < end && t.marker.region.end() > off)
+            {
+                push_skip(&mut out, kind, Reason::Unsafe);
+                continue;
+            }
+            let marker = Marker::blank(Region::new(off, bytes.len() as u64), ContainerKind::Raw);
+            if !matches!(
+                assess(report.format.as_deref(), report.size, &marker),
+                Risk::Safe
+            ) {
+                push_skip(&mut out, kind, Reason::Unsafe);
+                continue;
+            }
+            let Some(original) = view
+                .read_at(off, bytes.len())
+                .ok()
+                .filter(|o| o.len() == bytes.len())
+            else {
+                push_skip(&mut out, kind, Reason::Io);
+                continue;
+            };
+            if original == bytes {
+                continue;
+            }
+            out.targets.push(Target {
+                kind,
+                marker,
+                expected_hash: hash_hex(&original),
+                replacement: Some(bytes),
+            });
+        }
+        for caveat in d.caveats {
+            if !out.caveats.contains(&caveat) {
+                out.caveats.push(caveat);
+            }
+        }
+    }
+    out.targets.sort_by_key(|t| t.marker.region.offset);
+    if out.targets.is_empty() {
+        return out;
+    }
+    let signed = match report.format.as_deref() {
+        Some("pe") => {
+            if let Some(sum) = deep::checksum_target(view, &out.targets) {
+                out.targets.push(sum);
+                out.targets.sort_by_key(|t| t.marker.region.offset);
+            }
+            deep::pe_signed(view)
+        }
+        Some("macho") => macho::deep_regions(view).signed,
+        _ => false,
+    };
+    if signed && !out.caveats.contains(&Caveat::SignatureInvalidated) {
+        out.caveats.push(Caveat::SignatureInvalidated);
     }
     out
 }

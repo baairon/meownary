@@ -171,7 +171,7 @@ fn extension(path: &Path) -> Option<String> {
 }
 
 /// Whether `path` is agent configuration the cleaner must not read.
-fn is_protected(path: &Path) -> bool {
+pub(crate) fn is_protected(path: &Path) -> bool {
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let name_hit = real
         .file_name()

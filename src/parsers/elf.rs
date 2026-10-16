@@ -212,6 +212,7 @@ impl Order {
 struct Shdr {
     name: String,
     kind: u32,
+    flags: u64,
     offset: u64,
     size: u64,
     link: u32,
@@ -308,8 +309,8 @@ impl Elf {
         if off == 0 || entsize < min || entsize > 256 {
             return Vec::new();
         }
-        // Raw headers: (name offset, type, offset, size, link).
-        let raw = |b: &[u8]| -> Option<(u32, u32, u64, u64, u32)> {
+        // Raw headers: (name offset, type, offset, size, link, flags).
+        let raw = |b: &[u8]| -> Option<(u32, u32, u64, u64, u32, u64)> {
             Some(if o.is64 {
                 (
                     o.u32(b, 0)?,
@@ -317,6 +318,7 @@ impl Elf {
                     o.u64(b, 24)?,
                     o.u64(b, 32)?,
                     o.u32(b, 40)?,
+                    o.u64(b, 8)?,
                 )
             } else {
                 (
@@ -325,6 +327,7 @@ impl Elf {
                     u64::from(o.u32(b, 16)?),
                     u64::from(o.u32(b, 20)?),
                     o.u32(b, 24)?,
+                    u64::from(o.u32(b, 8)?),
                 )
             })
         };
@@ -335,7 +338,7 @@ impl Elf {
             let Some(first) = read(view, off, entsize) else {
                 return Vec::new();
             };
-            let Some((_, _, _, size0, link0)) = raw(&first) else {
+            let Some((_, _, _, size0, link0, _)) = raw(&first) else {
                 return Vec::new();
             };
             if num == 0 {
@@ -358,7 +361,7 @@ impl Elf {
             .filter(|r| r.1 != SHT_NOBITS)
             .and_then(|r| read(view, r.2, r.3.min(MAX_SECTION_READ as u64) as usize));
         raws.iter()
-            .map(|&(name, kind, offset, size, link)| {
+            .map(|&(name, kind, offset, size, link, flags)| {
                 let name = names
                     .as_deref()
                     .and_then(|n| cstr(n, name as usize, 256))
@@ -367,6 +370,7 @@ impl Elf {
                 Shdr {
                     name,
                     kind,
+                    flags,
                     offset,
                     size,
                     link,
@@ -388,6 +392,71 @@ impl Elf {
         }
         read(view, s.offset, s.size.min(MAX_SECTION_READ as u64) as usize)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deep deattribution regions
+
+const SHT_PROGBITS: u32 = 1;
+const SHF_EXECINSTR: u64 = 0x4;
+
+/// Sections whose bytes the loader or linker resolves by content, never swept
+/// even when they are plain data.
+const LOAD_BEARING_SECTIONS: &[&str] = &[
+    ".interp",
+    ".dynstr",
+    ".dynsym",
+    ".strtab",
+    ".symtab",
+    ".shstrtab",
+    ".dynamic",
+    ".gnu.version",
+    ".gnu.version_r",
+    ".gnu.version_d",
+    ".gnu.hash",
+    ".hash",
+    ".got",
+    ".got.plt",
+    ".init_array",
+    ".fini_array",
+    ".go.buildinfo",
+    ".gopclntab",
+    ".typelink",
+    ".itablink",
+];
+
+/// File ranges of the data sections a deep sweep may read: allocated or
+/// `.comment` PROGBITS sections that hold no code and are not resolved by
+/// content (string tables, symbol tables, version and dynamic tables, notes,
+/// unwind data). Sorted, as `(offset, len)`.
+pub(crate) fn data_regions(view: &dyn FileView) -> Vec<(u64, u64)> {
+    let Some(elf) = Elf::parse(view) else {
+        return Vec::new();
+    };
+    let size = view.size();
+    let mut out: Vec<(u64, u64)> = elf
+        .sections
+        .iter()
+        .filter(|s| {
+            s.kind == SHT_PROGBITS
+                && s.flags & SHF_EXECINSTR == 0
+                && s.size != 0
+                && !LOAD_BEARING_SECTIONS.contains(&s.name.as_str())
+                && !s.name.starts_with(".note")
+                && !s.name.starts_with(".eh_frame")
+                && !s.name.starts_with(".debug")
+                && !s.name.starts_with(".rela")
+                && !s.name.starts_with(".rel.")
+                && (s.name == ".comment"
+                    || s.name.starts_with(".rodata")
+                    || s.name.starts_with(".data"))
+                && s.offset >= 64
+                && s.offset.checked_add(s.size).is_some_and(|end| end <= size)
+        })
+        .map(|s| (s.offset, s.size))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 // ---------------------------------------------------------------------------

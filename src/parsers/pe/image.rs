@@ -11,6 +11,7 @@ use crate::util::bytes::{slice, u16_le, u32_le};
 pub const MAX_SECTIONS: usize = 96;
 
 pub const DIR_RESOURCE: usize = 2;
+pub const DIR_EXPORT: usize = 0;
 pub const DIR_SECURITY: usize = 4;
 pub const DIR_DEBUG: usize = 6;
 pub const DIR_CLR: usize = 14;
@@ -41,6 +42,7 @@ pub struct Section {
     pub va: u32,
     pub raw_size: u32,
     pub raw_ptr: u32,
+    pub characteristics: u32,
     /// Absolute file offset of this 40-byte section header.
     pub header_off: u64,
 }
@@ -157,6 +159,7 @@ impl PeImage {
                     va: u32_le(raw, 12)?,
                     raw_size: u32_le(raw, 16)?,
                     raw_ptr: u32_le(raw, 20)?,
+                    characteristics: u32_le(raw, 36)?,
                     header_off: table_off + (i as u64) * 40,
                 })
             })

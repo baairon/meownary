@@ -321,6 +321,146 @@ fn thin(view: &dyn FileView, base: u64, size: u64, arch: Option<&str>, out: &mut
 }
 
 // ---------------------------------------------------------------------------
+// Deep deattribution regions
+
+const LC_SEGMENT: u32 = 0x1;
+const LC_SEGMENT_64: u32 = 0x19;
+const S_ZEROFILL: u32 = 0x1;
+const S_GB_ZEROFILL: u32 = 0xc;
+const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x400;
+
+/// What a deep sweep may read in a Mach-O file.
+#[derive(Debug, Default)]
+pub(crate) struct DeepRegions {
+    /// Absolute `(offset, len)` file ranges, sorted.
+    pub regions: Vec<(u64, u64)>,
+    /// Any slice carries `LC_CODE_SIGNATURE`.
+    pub signed: bool,
+}
+
+/// String sections a deep sweep may read, by `(segment prefix, section)`.
+/// Objective-C class and selector names, symbol and string tables and
+/// everything in `__LINKEDIT` are resolved by content and never listed.
+const DEEP_SECTIONS: &[(&str, &str)] = &[
+    ("__TEXT", "__cstring"),
+    ("__TEXT", "__const"),
+    ("__TEXT", "__ustring"),
+    ("__TEXT", "__oslogstring"),
+    ("__DATA", "__const"),
+    ("__DATA", "__data"),
+];
+
+pub(crate) fn deep_regions(view: &dyn FileView) -> DeepRegions {
+    let mut out = DeepRegions::default();
+    match fat_slices(view) {
+        Some(slices) => {
+            for s in slices {
+                thin_regions(view, s.base, s.size, &mut out);
+            }
+        }
+        None => thin_regions(view, 0, view.size(), &mut out),
+    }
+    out.regions.sort_unstable();
+    out.regions.dedup();
+    out
+}
+
+fn fixed_name(b: &[u8]) -> &[u8] {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    &b[..end]
+}
+
+fn thin_regions(view: &dyn FileView, base: u64, size: u64, out: &mut DeepRegions) {
+    let Some(h) = read(view, base, 32) else {
+        return;
+    };
+    let (le, is64) = match (u32_be(&h, 0), h.get(..4)) {
+        (Some(0xfeed_face), _) => (false, false),
+        (Some(0xfeed_facf), _) => (false, true),
+        (_, Some([0xce, 0xfa, 0xed, 0xfe])) => (true, false),
+        (_, Some([0xcf, 0xfa, 0xed, 0xfe])) => (true, true),
+        _ => return,
+    };
+    let o = Order { le };
+    let u64o = |b: &[u8], at: usize| -> Option<u64> {
+        let lo = u64::from(o.u32(b, at)?);
+        let hi = u64::from(o.u32(b, at + 4)?);
+        Some(if le { lo | (hi << 32) } else { (lo << 32) | hi })
+    };
+    let (Some(ncmds), Some(sizeofcmds)) = (o.u32(&h, 16), o.u32(&h, 20)) else {
+        return;
+    };
+    let hdr = if is64 { 32u64 } else { 28 };
+    if hdr + u64::from(sizeofcmds) > size {
+        return;
+    }
+    let want = u64::from(sizeofcmds).min(MAX_CMDS_BYTES) as usize;
+    let Some(cmds) = read(view, base + hdr, want) else {
+        return;
+    };
+    let mut pos = 0usize;
+    for _ in 0..(ncmds as usize).min(MAX_CMDS) {
+        let (Some(cmd), Some(cmdsize)) = (o.u32(&cmds, pos), o.u32(&cmds, pos + 4)) else {
+            break;
+        };
+        let cmdsize = cmdsize as usize;
+        let Some(lc) = slice(&cmds, pos, cmdsize).filter(|_| cmdsize >= 8) else {
+            break;
+        };
+        pos += cmdsize;
+        if cmd == LC_CODE_SIGNATURE {
+            out.signed = true;
+            continue;
+        }
+        let (nsects_at, first, entsize) = match cmd {
+            LC_SEGMENT => (48usize, 56usize, 68usize),
+            LC_SEGMENT_64 => (64, 72, 80),
+            _ => continue,
+        };
+        let Some(nsects) = o.u32(lc, nsects_at) else {
+            continue;
+        };
+        for i in 0..(nsects as usize).min(256) {
+            let Some(sec) = slice(lc, first + i * entsize, entsize) else {
+                break;
+            };
+            let sect = fixed_name(&sec[..16]);
+            let seg = fixed_name(&sec[16..32]);
+            let listed = DEEP_SECTIONS
+                .iter()
+                .any(|(s, n)| seg.starts_with(s.as_bytes()) && sect == n.as_bytes());
+            if !listed {
+                continue;
+            }
+            let (sz, off, flags) = if cmd == LC_SEGMENT_64 {
+                (u64o(sec, 40), o.u32(sec, 48), o.u32(sec, 64))
+            } else {
+                (
+                    o.u32(sec, 36).map(u64::from),
+                    o.u32(sec, 40),
+                    o.u32(sec, 56),
+                )
+            };
+            let (Some(sz), Some(off), Some(flags)) = (sz, off, flags) else {
+                continue;
+            };
+            let kind = flags & 0xff;
+            if matches!(kind, S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL)
+                || flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0
+                || sz == 0
+                || u64::from(off) < hdr + u64::from(sizeofcmds)
+                || u64::from(off).checked_add(sz).is_none_or(|end| end > size)
+            {
+                continue;
+            }
+            out.regions.push((base + u64::from(off), sz));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Code signature
 
 fn code_signature(ctx: &Ctx, lc: &[u8], lc_off: u64, out: &mut Vec<Finding>) {
