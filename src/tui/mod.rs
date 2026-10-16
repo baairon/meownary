@@ -3,7 +3,8 @@
 //! `app` is the state machine (no terminal), `ui` draws it, `widgets` holds
 //! the small drawing pieces the views share (the thin progress bar),
 //! `runtime` owns the terminal, the frame clock and the edit engine, and
-//! `preview` renders the same drawing code to animated SVG for the README.
+//! `preview` renders the same drawing code to animated SVG for the README
+//! through `svg`.
 //!
 //! `picker` is the first-run file browser. `listing` reads one folder from
 //! its directory listing alone, for the views that browse folders, and `bg`
@@ -22,6 +23,7 @@ pub mod logo;
 pub mod picker;
 pub mod preview;
 pub mod runtime;
+pub mod svg;
 pub mod theme;
 pub mod tree;
 pub mod ui;

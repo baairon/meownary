@@ -1,9 +1,9 @@
 //! README previews. A demo [`App`] built from synthetic reports is drawn by
-//! the real renderer (`ui::draw`) into ratatui's `TestBackend`, and the buffer
-//! is converted to a standalone SVG. The four "meow" wordmark cells carry SMIL
-//! `<animate>` children sampled from the same rainbow function the terminal
-//! uses, so the wordmark cycles even when GitHub shows the file through an
-//! `<img>` tag (which runs SMIL but not scripts).
+//! the real renderer (`ui::draw`) into ratatui's `TestBackend`, and `svg`
+//! converts the buffer to a standalone SVG. The four "meow" wordmark cells
+//! carry SMIL `<animate>` children sampled from the same rainbow function the
+//! terminal uses, so the wordmark cycles even when GitHub shows the file
+//! through an `<img>` tag (which runs SMIL but not scripts).
 //!
 //! Regenerate them with `cargo test --lib -- --ignored write_preview_svg`,
 //! which writes `assets/preview.svg`, `assets/keys.svg` and
@@ -11,14 +11,10 @@
 
 #![cfg(feature = "tui")]
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::{Buffer, Cell};
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
 
 use crate::model::{
     BrandKind, Category, Confidence, ContainerKind, Evidence, FileReport, Finding, JunkKind,
@@ -28,19 +24,9 @@ use crate::model::{
 use super::app::{App, Pane};
 use super::keymap::Key;
 use super::picker::{Picker, Suggestion};
-use super::theme::{self, Look};
+use super::svg;
+use super::theme::Look;
 use super::ui;
-
-/// Cell width in tenths of a pixel (9.6 px).
-pub const CELL_W_TENTHS: u32 = 96;
-/// Line height in pixels.
-pub const LINE_H: u32 = 20;
-/// Font size in pixels.
-pub const FONT_SIZE: u32 = 16;
-/// The font stack every text run uses.
-pub const FONT_STACK: &str = "Cascadia Mono, Consolas, Menlo, monospace";
-/// How many rainbow samples each animated letter carries (first equals last).
-pub const ANIM_STEPS: usize = 24;
 
 /// The interactive view as an animated SVG, `width` by `height` cells.
 pub fn render_preview_svg(width: u16, height: u16) -> String {
@@ -430,256 +416,16 @@ fn render_svg(app: &mut App, width: u16, height: u16, title: &str) -> String {
         },
         Err(e) => match e {},
     };
-    buffer_to_svg(&buf, &app.rainbow_cells, title)
-}
-
-/// Escape text for XML content and attribute values.
-pub fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// `tenths` of a pixel as a short decimal ("28.8", "960").
-fn px(tenths: u32) -> String {
-    if tenths.is_multiple_of(10) {
-        (tenths / 10).to_string()
-    } else {
-        format!("{}.{}", tenths / 10, tenths % 10)
-    }
-}
-
-fn col_x(col: u32) -> String {
-    px(col * CELL_W_TENTHS)
-}
-
-fn hex(c: (u8, u8, u8)) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
-}
-
-fn rgb_of(c: Color, fallback: Color) -> (u8, u8, u8) {
-    match c {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Reset => rgb_of(fallback, Color::Rgb(0xff, 0xff, 0xff)),
-        Color::Black => (0x16, 0x13, 0x1d),
-        Color::Red => (0xff, 0x6b, 0x8b),
-        Color::Green => (0x7e, 0xe0, 0xa1),
-        Color::Yellow => (0xf6, 0xc5, 0x60),
-        Color::Blue => (0x8f, 0xbc, 0xff),
-        Color::Magenta => (0xd8, 0xb4, 0xfe),
-        Color::Cyan => (0x7f, 0xdb, 0xe6),
-        Color::Gray => (0x9a, 0x91, 0xb0),
-        Color::DarkGray => (0x6b, 0x65, 0x77),
-        _ => rgb_of(fallback, Color::Rgb(0xff, 0xff, 0xff)),
-    }
-}
-
-/// A cell's drawn colors, with REVERSED applied.
-fn cell_colors(cell: &Cell) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let fg = rgb_of(cell.fg, theme::TEXT);
-    let bg = rgb_of(cell.bg, theme::BG);
-    if cell.modifier.contains(Modifier::REVERSED) {
-        (bg, fg)
-    } else {
-        (fg, bg)
-    }
-}
-
-/// The text attributes that split runs.
-#[derive(Clone, PartialEq, Eq)]
-struct RunStyle {
-    fill: (u8, u8, u8),
-    bold: bool,
-    dim: bool,
-    underline: bool,
-    italic: bool,
-}
-
-fn run_style(cell: &Cell) -> RunStyle {
-    let m = cell.modifier;
-    RunStyle {
-        fill: cell_colors(cell).0,
-        bold: m.contains(Modifier::BOLD),
-        dim: m.contains(Modifier::DIM),
-        underline: m.contains(Modifier::UNDERLINED),
-        italic: m.contains(Modifier::ITALIC),
-    }
-}
-
-fn style_attrs(s: &RunStyle) -> String {
-    let mut a = format!(" fill=\"{}\"", hex(s.fill));
-    if s.bold {
-        a.push_str(" font-weight=\"bold\"");
-    }
-    if s.dim {
-        a.push_str(" fill-opacity=\"0.6\"");
-    }
-    if s.underline {
-        a.push_str(" text-decoration=\"underline\"");
-    }
-    if s.italic {
-        a.push_str(" font-style=\"italic\"");
-    }
-    a
-}
-
-/// The SMIL `values` list for rainbow letter `i`: [`ANIM_STEPS`] samples of
-/// [`theme::rainbow_color`] evenly spaced across one cycle, endpoints
-/// included, so the first and last are equal and the loop is seamless.
-pub fn rainbow_values(i: usize) -> Vec<String> {
-    let cycle = theme::RAINBOW_CYCLE_MS;
-    (0..ANIM_STEPS)
-        .map(|k| {
-            let t = cycle * k as u64 / (ANIM_STEPS as u64 - 1);
-            hex(rgb_of(theme::rainbow_color(i, t), theme::TEXT))
-        })
-        .collect()
-}
-
-fn anim_dur() -> String {
-    let ms = theme::RAINBOW_CYCLE_MS;
-    if ms.is_multiple_of(1000) {
-        format!("{}s", ms / 1000)
-    } else {
-        format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
-    }
-}
-
-/// Convert a rendered buffer to a standalone SVG. `rainbow` lists the cells
-/// (column, row, letter index) that animate through the rainbow.
-pub fn buffer_to_svg(buf: &Buffer, rainbow: &[(u16, u16, usize)], title: &str) -> String {
-    let area: Rect = buf.area;
-    let (w, h) = (u32::from(area.width), u32::from(area.height));
-    let width = col_x(w);
-    let height = (h * LINE_H).to_string();
-    let base_bg = rgb_of(theme::BG, theme::BG);
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
-         viewBox=\"0 0 {width} {height}\" font-family=\"{}\" font-size=\"{FONT_SIZE}\" \
-         xml:space=\"preserve\">",
-        xml_escape(FONT_STACK)
-    );
-    let _ = writeln!(out, "<title>{}</title>", xml_escape(title));
-    let _ = writeln!(
-        out,
-        "<rect width=\"{width}\" height=\"{height}\" fill=\"{}\"/>",
-        hex(base_bg)
-    );
-
-    let cell = |x: u32, y: u32| buf.cell((area.x + x as u16, area.y + y as u16));
-    let is_rainbow = |x: u32, y: u32| -> Option<usize> {
-        rainbow
-            .iter()
-            .find(|(cx, cy, _)| {
-                u32::from(*cx) == area.x as u32 + x && u32::from(*cy) == area.y as u32 + y
-            })
-            .map(|(_, _, i)| *i)
-    };
-
-    // Backgrounds: one rect per run of equal, non-default background.
-    let _ = writeln!(out, "<g>");
-    for y in 0..h {
-        let mut x = 0;
-        while x < w {
-            let Some(c) = cell(x, y) else { break };
-            let bg = cell_colors(c).1;
-            let start = x;
-            x += 1;
-            while x < w && cell(x, y).map(|c| cell_colors(c).1) == Some(bg) {
-                x += 1;
-            }
-            if bg != base_bg {
-                let _ = writeln!(
-                    out,
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{LINE_H}\" fill=\"{}\"/>",
-                    col_x(start),
-                    y * LINE_H,
-                    px((x - start) * CELL_W_TENTHS),
-                    hex(bg)
-                );
-            }
-        }
-    }
-    let _ = writeln!(out, "</g>");
-
-    // Text: one <text> per same-style run, placed at its first cell and held
-    // to the grid with textLength, so any monospace fallback lines up. The
-    // rainbow letters are single-cell runs whose <tspan> carries the animation.
-    let dur = anim_dur();
-    for y in 0..h {
-        let baseline = y * LINE_H + 15;
-        let mut x = 0;
-        while x < w {
-            let Some(c) = cell(x, y) else { break };
-            if let Some(i) = is_rainbow(x, y) {
-                let style = run_style(c);
-                let values = rainbow_values(i).join(";");
-                let _ = writeln!(
-                    out,
-                    "<text x=\"{}\" y=\"{baseline}\"><tspan{}>{}<animate attributeName=\"fill\" \
-                     dur=\"{dur}\" repeatCount=\"indefinite\" values=\"{values}\"/></tspan></text>",
-                    col_x(x),
-                    style_attrs(&style),
-                    xml_escape(c.symbol())
-                );
-                x += 1;
-                continue;
-            }
-            let style = run_style(c);
-            let start = x;
-            let mut text = String::new();
-            while x < w {
-                let Some(c) = cell(x, y) else { break };
-                if is_rainbow(x, y).is_some() || run_style(c) != style {
-                    break;
-                }
-                text.push_str(c.symbol());
-                x += 1;
-            }
-            // Trailing blanks carry nothing visible; leading ones shift the x.
-            let shown = text.trim_end();
-            let lead = shown.chars().take_while(|c| *c == ' ').count() as u32;
-            let shown = shown.trim_start();
-            if shown.is_empty() {
-                continue;
-            }
-            let n = shown.chars().count() as u32;
-            let length = if n > 1 {
-                format!(
-                    " textLength=\"{}\" lengthAdjust=\"spacing\"",
-                    px(n * CELL_W_TENTHS)
-                )
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                out,
-                "<text x=\"{}\" y=\"{baseline}\"{length}{}>{}</text>",
-                col_x(start + lead),
-                style_attrs(&style),
-                xml_escape(shown)
-            );
-        }
-    }
-    out.push_str("</svg>\n");
-    out
+    svg::buffer_to_svg(&buf, &app.rainbow_cells, title)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::keymap::HELP_GROUPS;
+    use crate::tui::svg::{ANIM_STEPS, FONT_STACK, rainbow_values};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
 
     /// Every `&` must start an entity.
     fn only_entities(svg: &str) -> bool {
@@ -836,16 +582,6 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c.fg, Color::Rgb(..)) || matches!(c.bg, Color::Rgb(..)))
         );
-    }
-
-    #[test]
-    fn rainbow_samples_come_from_the_hue_function() {
-        let v = rainbow_values(2);
-        assert_eq!(v[0], hex(rgb_of(theme::rainbow_color(2, 0), theme::TEXT)));
-        assert_eq!(anim_dur(), "3.5s");
-        assert_eq!(px(96), "9.6");
-        assert_eq!(px(9600), "960");
-        assert_eq!(xml_escape("a&<b>\"'"), "a&amp;&lt;b&gt;&quot;&apos;");
     }
 
     fn screen(app: &mut App, look: &Look, w: u16, h: u16) -> (String, Buffer) {
