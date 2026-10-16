@@ -5,4 +5,7 @@ pub mod embed;
 pub mod schema;
 
 pub use embed::catalog;
-pub use schema::{CatKind, Catalog, Detect, RemovalSpec, Signature, Window, removal_for, validate};
+pub use schema::{
+    CatKind, Catalog, Detect, KNOWN_FORMATS, RemovalSpec, Signature, Window, marker_for,
+    removal_for, validate,
+};
