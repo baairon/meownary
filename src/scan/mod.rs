@@ -12,6 +12,12 @@
 //! arrives while the walk is still running, and the total is sent as
 //! [`ScanEvent::Total`] the moment the walk ends. Either way the tree is walked
 //! once.
+//!
+//! The streaming walker also counts entries per folder as it goes and sends
+//! the counts as [`ScanEvent::Counted`] deltas. It runs well ahead of the
+//! scanning, so folder totals arrive early too, and the last delta comes just
+//! before the total. [`count`] runs the same walk on its own, only counting,
+//! for the picker.
 
 pub mod guard;
 pub mod probe;
@@ -31,7 +37,7 @@ use crate::parsers;
 
 pub use probe::{Probe, ProbeCtx, Registry};
 pub use reader::{FileView, MemView, WindowedFile};
-pub use walk::{WalkEntry, WalkOpts};
+pub use walk::{CountDelta, Totals, WalkEntry, WalkOpts};
 
 /// The partial reason recorded when a probe (or identity) panicked.
 pub const PROBE_PANICKED: &str = "probe panicked";
@@ -44,8 +50,14 @@ pub struct ScanOpts {
 
 /// A message from a running scan.
 pub enum ScanEvent {
-    /// One file finished; boxed to keep the channel message small.
-    Found(Box<FileReport>),
+    /// One file finished, with why it is partial when it is; boxed to keep
+    /// the channel message small.
+    Found(Box<Scanned>),
+    /// The walk counted more entries: per folder since the last `Counted`,
+    /// plus how far it has got. Sent every [`walk::COUNT_BATCH`] entries
+    /// while the walk runs, usually well ahead of the reports, and once more,
+    /// marked done, just before `Total`.
+    Counted(CountDelta),
     /// The walk finished: this many entries will be reported in all. Sent
     /// exactly once, as soon as the walk ends, possibly before the
     /// remaining Found events.
@@ -140,10 +152,11 @@ fn probe_applies(probe: &dyn Probe, fmt: Option<&str>) -> bool {
 /// Start a streaming scan on a background thread, returning the event stream
 /// and the thread handle. The walk runs on a thread of its own and every entry
 /// is scanned as soon as the walk finds it, so `Found` events begin before the
-/// walk ends. Reports arrive in walk order, `Total` arrives once when the walk
-/// ends, and `Done` comes last. Dropping the receiver stops the scan: no new
-/// files start, and the walk stops at its next entry. The handle finishes only
-/// once the walker has stopped too.
+/// walk ends. Reports arrive in walk order, count deltas arrive as the walk
+/// goes (the last one, marked done, just before `Total`), `Total` arrives once
+/// when the walk ends, and `Done` comes last. Dropping the receiver stops the
+/// scan: no new files start, and the walk stops at its next entry. The handle
+/// finishes only once the walker has stopped too.
 pub fn scan(root: &Path, opts: ScanOpts) -> (Receiver<ScanEvent>, JoinHandle<()>) {
     let (tx, rx) = channel();
     let root = root.to_path_buf();
@@ -155,7 +168,7 @@ pub fn scan(root: &Path, opts: ScanOpts) -> (Receiver<ScanEvent>, JoinHandle<()>
         };
         let mut complete = true;
         for item in &mut scan {
-            if tx.send(ScanEvent::Found(Box::new(item.report))).is_err() {
+            if tx.send(ScanEvent::Found(Box::new(item))).is_err() {
                 complete = false;
                 break;
             }
@@ -171,23 +184,121 @@ pub fn scan(root: &Path, opts: ScanOpts) -> (Receiver<ScanEvent>, JoinHandle<()>
     (rx, handle)
 }
 
-/// The walker thread of a streaming scan: feed every entry to the scan, then
-/// send the total. A panic inside the walk ends it early; the entries fed so
-/// far still count, so `Total` and `Done` always arrive.
+/// The walker thread of a streaming scan: feed every entry to the scan,
+/// counting entries per folder on the way, then send the last count and the
+/// total. A panic inside the walk ends it early; the entries fed so far still
+/// count, so the last `Counted`, `Total` and `Done` always arrive.
 fn walk_into(root: &Path, opts: &WalkOpts, feed: Feed, events: &Sender<ScanEvent>) {
     let mut fed = 0;
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    let mut tally = walk::Tally::new(root);
+    let mut dropped = false;
+    let walked = catch_unwind(AssertUnwindSafe(|| {
         for entry in walk::walk_iter(root, opts) {
+            // Counted before the hand-off takes the entry; a failed hand-off
+            // means nobody is listening any more.
+            tally.add(entry.path());
             if !feed.push(entry) {
+                dropped = true;
                 break;
             }
             fed += 1;
+            if let Some(delta) = tally.take(false) {
+                let _ = events.send(ScanEvent::Counted(delta));
+            }
         }
     }));
+    let stopped = dropped || walked.is_err();
+    let _ = events.send(ScanEvent::Counted(tally.finish(stopped)));
     let _ = events.send(ScanEvent::Total(fed));
     // The scan sees the walk end only after `Total` is queued, so `Done`
     // always follows it.
     drop(feed);
+}
+
+/// A running [`count`]. Dropping it stops the count at its next entry.
+pub struct CountWalk {
+    rx: Receiver<CountDelta>,
+    stop: Arc<AtomicBool>,
+}
+
+impl CountWalk {
+    /// The next delta if one is ready, without waiting. The last one has
+    /// `done` set; after it this is always `None`.
+    pub fn try_recv(&self) -> Option<CountDelta> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Every delta ready now, oldest first, without waiting.
+    pub fn try_iter(&self) -> impl Iterator<Item = CountDelta> + '_ {
+        self.rx.try_iter()
+    }
+}
+
+impl Drop for CountWalk {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Count the entries a scan of `root` would cover, on a thread of its own,
+/// for the picker. It is the scan's own walk (sorted, the state dir left out,
+/// links not followed, cloud placeholders and unreadable folders counted as
+/// entries), and nothing is read beyond the folder listings. Deltas arrive
+/// every [`walk::COUNT_BATCH`] entries and once more, marked done, at the
+/// end. The count stops with `stopped` set when more than `cap` entries turn
+/// up, and it stops when the returned [`CountWalk`] is dropped.
+pub fn count(root: &Path, opts: WalkOpts, cap: usize) -> CountWalk {
+    let (tx, rx) = channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawned = {
+        let root = root.to_path_buf();
+        let stop = Arc::clone(&stop);
+        let tx = tx.clone();
+        thread::Builder::new()
+            .name("meownary-count".to_string())
+            .spawn(move || count_into(&root, &opts, cap, &stop, &tx))
+    };
+    if spawned.is_err() {
+        // No thread to count with: end the count at once, short.
+        let _ = tx.send(CountDelta {
+            done: true,
+            stopped: true,
+            ..CountDelta::default()
+        });
+    }
+    CountWalk { rx, stop }
+}
+
+/// The body of [`count`]: walk and tally, sending deltas, until the walk
+/// ends, `cap` entries are counted with more to come, or `stop` is set. The
+/// last delta always goes out (unless nobody is listening).
+fn count_into(
+    root: &Path,
+    opts: &WalkOpts,
+    cap: usize,
+    stop: &AtomicBool,
+    tx: &Sender<CountDelta>,
+) {
+    let mut tally = walk::Tally::new(root);
+    let mut counted = 0;
+    let mut stopped = false;
+    let walked = catch_unwind(AssertUnwindSafe(|| {
+        for entry in walk::walk_iter(root, opts) {
+            if counted >= cap || stop.load(Ordering::Relaxed) {
+                stopped = true;
+                break;
+            }
+            tally.add(entry.path());
+            counted += 1;
+            if let Some(delta) = tally.take(false)
+                && tx.send(delta).is_err()
+            {
+                stopped = true;
+                break;
+            }
+        }
+    }));
+    let _ = tx.send(tally.finish(stopped || walked.is_err()));
 }
 
 /// Convenience for tests and small callers: scan everything and return the
@@ -435,7 +546,7 @@ mod tests {
     use super::*;
     use crate::model::Finding;
     use std::fs;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct Panicker;
 
@@ -473,6 +584,41 @@ mod tests {
         let (rx, handle) = scan(root, ScanOpts::default());
         let got = rx.into_iter().collect();
         handle.join().unwrap();
+        got
+    }
+
+    /// A tree with files at several depths, an empty folder, and more
+    /// entries than one count delta holds, plus each folder's direct count.
+    fn nested() -> (tempfile::TempDir, Vec<(PathBuf, usize)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = [
+            (vec![], 100),
+            (vec!["a"], 200),
+            (vec!["a", "deep"], 150),
+            (vec!["b"], 20),
+            (vec!["empty"], 0),
+        ];
+        let mut folders = Vec::new();
+        for (parts, n) in layout {
+            let folder = parts
+                .iter()
+                .fold(dir.path().to_path_buf(), |p, s| p.join(s));
+            fs::create_dir_all(&folder).unwrap();
+            for i in 0..n {
+                fs::write(folder.join(format!("f{i:03}.bin")), b"x").unwrap();
+            }
+            folders.push((folder, n));
+        }
+        (dir, folders)
+    }
+
+    /// Every delta a count sends, through the last one.
+    fn count_all(counting: &CountWalk) -> Vec<CountDelta> {
+        let mut got: Vec<CountDelta> = Vec::new();
+        while !got.last().is_some_and(|d| d.done) {
+            let wait = Duration::from_secs(30);
+            got.push(counting.rx.recv_timeout(wait).expect("the count ends"));
+        }
         got
     }
 
@@ -612,17 +758,21 @@ mod tests {
     fn scan_events_end_with_done() {
         let (dir, _) = files(12);
         let mut found = 0;
+        let mut counted = Totals::new(dir.path(), None);
         let mut total = None;
         let mut done = false;
         for ev in events(dir.path()) {
             match ev {
                 ScanEvent::Found(_) => found += 1,
+                ScanEvent::Counted(d) => counted.apply(&d),
                 ScanEvent::Total(n) => total = Some(n),
                 ScanEvent::Done => done = true,
             }
         }
         assert_eq!(found, 12);
         assert_eq!(total, Some(12));
+        assert_eq!(counted.total(), 12);
+        assert!(counted.is_done() && !counted.was_stopped());
         assert!(done);
     }
 
@@ -633,7 +783,7 @@ mod tests {
         let found: Vec<PathBuf> = evs
             .iter()
             .filter_map(|e| match e {
-                ScanEvent::Found(r) => Some(r.path.clone()),
+                ScanEvent::Found(s) => Some(s.report.path.clone()),
                 _ => None,
             })
             .collect();
@@ -652,20 +802,159 @@ mod tests {
     }
 
     #[test]
-    fn scan_of_an_empty_folder_sends_total_zero_then_done() {
+    fn scan_of_an_empty_folder_sends_an_empty_count_then_total_zero() {
         let dir = tempfile::tempdir().unwrap();
         let evs = events(dir.path());
         assert!(matches!(
             evs.as_slice(),
-            [ScanEvent::Total(0), ScanEvent::Done]
+            [ScanEvent::Counted(d), ScanEvent::Total(0), ScanEvent::Done]
+                if d.done && !d.stopped && d.dirs.is_empty() && d.frontier.is_none()
         ));
+    }
+
+    #[test]
+    fn scan_counts_every_folder_before_the_total() {
+        let (dir, folders) = nested();
+        let root = dir.path();
+        let evs = events(root);
+        let (total_at, n) = evs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| match e {
+                ScanEvent::Total(n) => Some((i, *n)),
+                _ => None,
+            })
+            .unwrap();
+        let mut totals = Totals::new(root, None);
+        let mut deltas = 0;
+        for (i, ev) in evs.iter().enumerate() {
+            if let ScanEvent::Counted(d) = ev {
+                assert!(i < total_at, "a count after the total");
+                assert!(!totals.is_done(), "a count after the last one");
+                totals.apply(d);
+                deltas += 1;
+            }
+        }
+        assert!(deltas > 1, "counts arrive while the walk runs");
+        assert!(totals.is_done() && !totals.was_stopped());
+        assert_eq!(n, 470);
+        assert_eq!(totals.total(), n as u64);
+        let found = evs
+            .iter()
+            .filter(|e| matches!(e, ScanEvent::Found(_)))
+            .count();
+        assert_eq!(found, n);
+        for (folder, _) in &folders {
+            let under: usize = folders
+                .iter()
+                .filter(|(f, _)| f.starts_with(folder))
+                .map(|(_, direct)| direct)
+                .sum();
+            assert_eq!(totals.get(folder), (under > 0).then_some(under as u64));
+            assert!(totals.is_final(folder));
+        }
+    }
+
+    #[test]
+    fn found_events_carry_why_a_file_is_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let evs = events(&gone);
+        let found: Vec<&Scanned> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::Found(s) => Some(s.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].report.partial);
+        assert_eq!(found[0].error.as_deref(), Some("cannot read: not found"));
+        let mut totals = Totals::new(&gone, None);
+        for ev in &evs {
+            if let ScanEvent::Counted(d) = ev {
+                totals.apply(d);
+            }
+        }
+        assert_eq!(totals.get(&gone), Some(1), "the root is its own entry");
+    }
+
+    #[test]
+    fn count_matches_the_walk() {
+        let (dir, folders) = nested();
+        let root = dir.path();
+        let counting = count(root, WalkOpts::default(), usize::MAX);
+        let deltas = count_all(&counting);
+        assert!(deltas.len() > 1, "counts arrive while the walk runs");
+        assert_eq!(counting.try_recv(), None, "nothing after the last delta");
+        let mut totals = Totals::new(root, None);
+        for d in &deltas {
+            totals.apply(d);
+        }
+        assert!(!totals.was_stopped());
+        let walked = walk::walk(root, &WalkOpts::default());
+        assert_eq!(totals.total(), walked.len() as u64);
+        for (folder, _) in &folders {
+            let under = walked
+                .iter()
+                .filter(|e| e.path().starts_with(folder))
+                .count();
+            assert_eq!(totals.get(folder).unwrap_or(0), under as u64);
+        }
+    }
+
+    #[test]
+    fn count_stops_at_its_cap() {
+        let (dir, _) = files(50);
+        let capped = count_all(&count(dir.path(), WalkOpts::default(), 10));
+        let mut totals = Totals::new(dir.path(), None);
+        for d in &capped {
+            totals.apply(d);
+        }
+        assert_eq!(totals.total(), 10);
+        assert!(totals.is_done() && totals.was_stopped());
+        // A cap the walk never goes past leaves the count whole.
+        let whole = count_all(&count(dir.path(), WalkOpts::default(), 50));
+        assert!(whole.iter().all(|d| !d.stopped));
+    }
+
+    #[test]
+    fn a_stopped_count_ends_at_its_next_entry() {
+        let (dir, _) = files(20);
+        let (tx, rx) = channel();
+        let stop = AtomicBool::new(true);
+        count_into(dir.path(), &WalkOpts::default(), usize::MAX, &stop, &tx);
+        drop(tx);
+        let got: Vec<CountDelta> = rx.into_iter().collect();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].done && got[0].stopped);
+        assert!(got[0].dirs.is_empty(), "nothing counted after the stop");
+    }
+
+    #[test]
+    fn dropping_a_count_walk_stops_it() {
+        let (dir, _) = files(300);
+        let counting = count(dir.path(), WalkOpts::default(), usize::MAX);
+        let stop = Arc::clone(&counting.stop);
+        drop(counting);
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "the drop asks the count to stop"
+        );
+        // The count thread lets go of the flag once it has ended.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Arc::strong_count(&stop) > 1 {
+            assert!(Instant::now() < deadline, "the count thread ended");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
     fn dropping_the_receiver_stops_the_scan() {
         let (dir, _) = files(400);
         let (rx, handle) = scan(dir.path(), ScanOpts::default());
-        // `Total` may come first when the walk outruns the first report.
+        // Counts and `Total` may come first when the walk outruns the first
+        // report.
         loop {
             match rx.recv() {
                 Ok(ScanEvent::Found(_)) => break,

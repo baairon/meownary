@@ -7,7 +7,16 @@
 //! directory is never entered (a link given as the root itself is resolved).
 //! meownary's own state directory (its trash store and undo journal) is always
 //! left out, so it never scans or cleans its own trash.
+//!
+//! Walk order is `Path` order: names are sorted within a folder and each
+//! subfolder is walked whole before its next sibling, so components compare
+//! one by one (`b/x` before `b-c` before `b.txt`, which string order gets
+//! wrong). That makes counting cheap: a [`Tally`] counts entries per folder
+//! as the walk finds them and hands out [`CountDelta`]s, [`Totals`] adds the
+//! deltas up per folder, and [`passed`] tells when the walk has moved beyond
+//! a folder, so its count is complete.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -194,6 +203,215 @@ pub fn short_io(e: &io::Error) -> String {
     }
 }
 
+/// How many entries a [`Tally`] counts between deltas.
+pub const COUNT_BATCH: usize = 256;
+
+/// Entries counted since the last delta, per folder (direct entries, not
+/// recursive), plus the walk frontier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CountDelta {
+    /// Each folder with how many entries the walk found directly in it since
+    /// the last delta, in walk order. A folder comes up again when the walk
+    /// returns to it after a subfolder. An entry equal to the walk's root (a
+    /// single-file root, or a root that cannot be read) counts toward the
+    /// root itself.
+    pub dirs: Vec<(PathBuf, u32)>,
+    /// The newest entry the walk has produced; `None` before the first one.
+    pub frontier: Option<PathBuf>,
+    /// The walk is over and this is its last delta.
+    pub done: bool,
+    /// The walk ended before it got through everything (it was stopped,
+    /// reached its cap or failed), so the counts fall short.
+    pub stopped: bool,
+}
+
+/// Counts walked entries per folder and hands the counts out as
+/// [`CountDelta`]s. A folder's direct entries come one after another until
+/// the walk enters a subfolder, so each run of them is a single counter.
+#[derive(Debug, Clone)]
+pub struct Tally {
+    root: PathBuf,
+    /// The folder the current run of entries is in, and how many of them
+    /// have not gone out in a delta yet.
+    run: Option<(PathBuf, u32)>,
+    /// Finished runs waiting for the next delta.
+    dirs: Vec<(PathBuf, u32)>,
+    /// Entries added since the last delta.
+    since: usize,
+    /// The newest entry; its buffer is reused from entry to entry.
+    last: Option<PathBuf>,
+}
+
+impl Tally {
+    /// A tally for a walk of `root`.
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            run: None,
+            dirs: Vec::new(),
+            since: 0,
+            last: None,
+        }
+    }
+
+    /// Count one walked entry toward the folder it is in. An entry equal to
+    /// the root counts toward the root itself.
+    pub fn add(&mut self, entry: &Path) {
+        let dir = if entry == self.root {
+            entry
+        } else {
+            entry.parent().unwrap_or(entry)
+        };
+        match &mut self.run {
+            Some((run_dir, n)) if run_dir.as_path() == dir => *n = n.saturating_add(1),
+            slot => {
+                if let Some(run) = slot.take().filter(|(_, n)| *n > 0) {
+                    self.dirs.push(run);
+                }
+                *slot = Some((dir.to_path_buf(), 1));
+            }
+        }
+        self.since += 1;
+        match &mut self.last {
+            Some(last) => entry.clone_into(last),
+            None => self.last = Some(entry.to_path_buf()),
+        }
+    }
+
+    /// The counts since the last delta, once [`COUNT_BATCH`] entries have
+    /// piled up, or sooner when `force` is set and any are pending. `None`
+    /// otherwise.
+    pub fn take(&mut self, force: bool) -> Option<CountDelta> {
+        let due = self.since >= COUNT_BATCH || (force && self.since > 0);
+        due.then(|| self.delta(false, false))
+    }
+
+    /// The last delta: whatever is still pending, with `done` set, and
+    /// `stopped` when the walk ended early.
+    pub fn finish(mut self, stopped: bool) -> CountDelta {
+        self.delta(true, stopped)
+    }
+
+    fn delta(&mut self, done: bool, stopped: bool) -> CountDelta {
+        let mut dirs = std::mem::take(&mut self.dirs);
+        if let Some((dir, n)) = &mut self.run
+            && *n > 0
+        {
+            dirs.push((dir.clone(), *n));
+            *n = 0;
+        }
+        self.since = 0;
+        CountDelta {
+            dirs,
+            frontier: self.last.clone(),
+            done,
+            stopped,
+        }
+    }
+}
+
+/// True once a walk whose newest entry is `frontier` has moved past
+/// everything under `dir`. Both are compared as `Path`s, never as strings.
+pub fn passed(frontier: &Path, dir: &Path) -> bool {
+    frontier > dir && !frontier.starts_with(dir)
+}
+
+/// Recursive entry counts per folder, built from [`CountDelta`]s. With a
+/// depth limit only the root and the folders down to that many levels under
+/// it are kept; deeper counts roll up into their ancestor at the limit.
+#[derive(Debug, Clone)]
+pub struct Totals {
+    root: PathBuf,
+    depth: Option<usize>,
+    /// Recursive counts of the folders with anything counted under them.
+    counts: HashMap<PathBuf, u64>,
+    /// Every entry counted.
+    total: u64,
+    frontier: Option<PathBuf>,
+    done: bool,
+    stopped: bool,
+}
+
+impl Totals {
+    /// Empty totals for a walk of `root`, keeping folders down to `depth`
+    /// levels under it (`None` keeps them all).
+    pub fn new(root: &Path, depth: Option<usize>) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            depth,
+            counts: HashMap::new(),
+            total: 0,
+            frontier: None,
+            done: false,
+            stopped: false,
+        }
+    }
+
+    /// Fold in one delta: each direct count goes to its folder and every
+    /// ancestor up to the root, leaving out folders below the depth limit.
+    pub fn apply(&mut self, d: &CountDelta) {
+        let limit = self.depth.unwrap_or(usize::MAX);
+        for (dir, n) in &d.dirs {
+            let n = u64::from(*n);
+            self.total += n;
+            let Ok(rel) = dir.strip_prefix(&self.root) else {
+                // Not under the root (never so in a walk of it): only the
+                // root's own count takes it.
+                bump(&mut self.counts, &self.root, n);
+                continue;
+            };
+            let levels = rel.components().count();
+            for (up, folder) in dir.ancestors().take(levels + 1).enumerate() {
+                if levels - up <= limit {
+                    bump(&mut self.counts, folder, n);
+                }
+            }
+        }
+        if d.frontier.is_some() {
+            self.frontier.clone_from(&d.frontier);
+        }
+        self.done |= d.done;
+        self.stopped |= d.stopped;
+    }
+
+    /// The recursive count under `dir` so far; `None` when nothing under it
+    /// has been counted yet, or it lies below the depth limit.
+    pub fn get(&self, dir: &Path) -> Option<u64> {
+        self.counts.get(dir).copied()
+    }
+
+    /// Every entry counted so far: the root's recursive count.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether `dir`'s count is final: the walk is done, or it has moved past
+    /// everything under `dir`. A stopped walk is done too, with short counts
+    /// (see [`was_stopped`](Self::was_stopped)).
+    pub fn is_final(&self, dir: &Path) -> bool {
+        self.done || self.frontier.as_deref().is_some_and(|f| passed(f, dir))
+    }
+
+    /// Whether the walk is over.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Whether the walk ended before it got through everything.
+    pub fn was_stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
+/// Add `n` to `dir`'s count, allocating its key only the first time.
+fn bump(counts: &mut HashMap<PathBuf, u64>, dir: &Path, n: u64) {
+    if let Some(c) = counts.get_mut(dir) {
+        *c += n;
+    } else {
+        counts.insert(dir.to_path_buf(), n);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +569,205 @@ mod tests {
         for attrs in [0x80, 0x20, 0x01, 0x02, 0x0000_0400, 0x0008_0000 | 0x20] {
             assert!(!cloud_only(attrs), "{attrs:#x}");
         }
+    }
+
+    /// `root` joined with a `/`-separated relative path.
+    fn at(root: &Path, rel: &str) -> PathBuf {
+        rel.split('/')
+            .fold(root.to_path_buf(), |p, part| p.join(part))
+    }
+
+    #[test]
+    fn tally_counts_runs_per_folder_in_walk_order() {
+        let root = Path::new("root");
+        // Walk order over a.txt, b/, c.txt, d/, an empty folder, a folder
+        // that cannot be listed (an entry of its own) and z.txt.
+        let walked = [
+            "a.txt",
+            "b/inner/z.bin",
+            "b/inner/zz.bin",
+            "b/y.bin",
+            "c.txt",
+            "d/e/f/g.bin",
+            "locked",
+            "z.txt",
+        ];
+        let mut tally = Tally::new(root);
+        for rel in walked {
+            tally.add(&at(root, rel));
+        }
+        let d = tally.finish(false);
+        let r = root.to_path_buf();
+        assert_eq!(
+            d.dirs,
+            [
+                (r.clone(), 1),
+                (at(root, "b/inner"), 2),
+                (at(root, "b"), 1),
+                (r.clone(), 1),
+                (at(root, "d/e/f"), 1),
+                (r.clone(), 2),
+            ]
+        );
+        assert_eq!(d.frontier, Some(at(root, "z.txt")));
+        assert!(d.done && !d.stopped);
+
+        let mut totals = Totals::new(root, None);
+        totals.apply(&d);
+        assert_eq!(totals.total(), 8);
+        assert_eq!(totals.get(root), Some(8));
+        assert_eq!(totals.get(&at(root, "b")), Some(3));
+        assert_eq!(totals.get(&at(root, "b/inner")), Some(2));
+        assert_eq!(totals.get(&at(root, "d")), Some(1));
+        assert_eq!(totals.get(&at(root, "d/e")), Some(1));
+        assert_eq!(totals.get(&at(root, "d/e/f")), Some(1));
+        assert_eq!(totals.get(&at(root, "empty")), None, "never counted");
+        assert_eq!(
+            totals.get(&at(root, "locked")),
+            None,
+            "an entry, not a folder"
+        );
+        assert!(totals.is_done() && !totals.was_stopped());
+    }
+
+    #[test]
+    fn tally_hands_out_a_delta_every_batch() {
+        let root = Path::new("root");
+        let mut tally = Tally::new(root);
+        assert_eq!(tally.take(true), None, "nothing pending");
+        let mut deltas = Vec::new();
+        for i in 0..600 {
+            tally.add(&root.join(format!("f{i:04}")));
+            deltas.extend(tally.take(false));
+        }
+        assert_eq!(deltas.len(), 2);
+        let batch = (root.to_path_buf(), COUNT_BATCH as u32);
+        assert!(deltas.iter().all(|d| d.dirs == [batch.clone()]));
+        assert_eq!(deltas[1].frontier, Some(root.join("f0511")));
+        assert!(deltas.iter().all(|d| !d.done && !d.stopped));
+        assert_eq!(tally.take(false), None, "88 pending is not a batch");
+        let forced = tally.take(true).unwrap();
+        assert_eq!(forced.dirs, [(root.to_path_buf(), 88)]);
+        assert_eq!(tally.take(true), None);
+        tally.add(&root.join("g"));
+        let last = tally.finish(true);
+        assert_eq!(last.dirs, [(root.to_path_buf(), 1)]);
+        assert!(last.done && last.stopped);
+
+        let mut totals = Totals::new(root, None);
+        for d in deltas.iter().chain([&forced, &last]) {
+            totals.apply(d);
+        }
+        assert_eq!(totals.total(), 601, "every entry once");
+        assert!(totals.is_done() && totals.was_stopped());
+    }
+
+    #[test]
+    fn an_entry_equal_to_the_root_counts_toward_the_root() {
+        // A single-file root, or a root that cannot be read, is its own only
+        // entry.
+        let root = Path::new("dir").join("only.bin");
+        let mut tally = Tally::new(&root);
+        tally.add(&root);
+        let d = tally.finish(false);
+        assert_eq!(d.dirs, [(root.clone(), 1)]);
+        let mut totals = Totals::new(&root, None);
+        totals.apply(&d);
+        assert_eq!(totals.get(&root), Some(1));
+        assert_eq!(totals.get(Path::new("dir")), None);
+        assert_eq!(totals.total(), 1);
+        // An empty walk still ends with a delta, holding nothing.
+        let empty = Tally::new(&root).finish(false);
+        assert_eq!(empty.dirs, []);
+        assert_eq!(empty.frontier, None);
+        assert!(empty.done);
+    }
+
+    #[test]
+    fn totals_roll_up_below_the_depth_limit() {
+        let root = Path::new("root");
+        let d = CountDelta {
+            dirs: vec![
+                (root.to_path_buf(), 2),
+                (at(root, "a"), 1),
+                (at(root, "a/b"), 3),
+                (at(root, "a/b/c/d"), 4),
+                (at(root, "e"), 5),
+            ],
+            frontier: Some(at(root, "e/x")),
+            done: false,
+            stopped: false,
+        };
+        let mut all = Totals::new(root, None);
+        all.apply(&d);
+        assert_eq!(all.get(root), Some(15));
+        assert_eq!(all.get(&at(root, "a")), Some(8));
+        assert_eq!(all.get(&at(root, "a/b")), Some(7));
+        assert_eq!(all.get(&at(root, "a/b/c")), Some(4));
+        assert_eq!(all.get(&at(root, "a/b/c/d")), Some(4));
+
+        let mut one = Totals::new(root, Some(1));
+        one.apply(&d);
+        assert_eq!(one.total(), 15);
+        assert_eq!(one.get(root), Some(15));
+        assert_eq!(one.get(&at(root, "a")), Some(8), "a/b and below roll up");
+        assert_eq!(one.get(&at(root, "a/b")), None);
+        assert_eq!(one.get(&at(root, "a/b/c/d")), None);
+        assert_eq!(one.get(&at(root, "e")), Some(5));
+
+        let mut flat = Totals::new(root, Some(0));
+        flat.apply(&d);
+        assert_eq!(flat.get(root), Some(15));
+        assert_eq!(flat.get(&at(root, "a")), None);
+    }
+
+    #[test]
+    fn passed_compares_paths_not_strings() {
+        let p = Path::new;
+        // Components compare one by one, so b/x sorts before the siblings
+        // b-c and b.txt, though string order puts b-c first.
+        assert!(p("b/x") < p("b-c") && p("b-c") < p("b.txt"));
+        assert!("b-c" < "b/x");
+        let b = p("b");
+        assert!(!passed(p("a"), b), "not there yet");
+        assert!(!passed(b, b), "at the folder itself");
+        assert!(!passed(p("b/x"), b), "inside it");
+        assert!(!passed(p("b/x/y/z"), b));
+        assert!(passed(p("b-c"), b));
+        assert!(passed(p("b.txt"), b));
+        assert!(passed(p("c"), b));
+        assert!(passed(p("b-c"), p("b/x")));
+        assert!(!passed(p("b-c"), p("b.txt")));
+        // Nothing under a root is ever past it.
+        assert!(!passed(p("/x/y"), p("/")));
+    }
+
+    #[test]
+    fn is_final_follows_the_frontier() {
+        let root = Path::new("root");
+        let mut totals = Totals::new(root, None);
+        assert!(!totals.is_final(root));
+        totals.apply(&CountDelta {
+            dirs: vec![(at(root, "b/inner"), 1), (at(root, "b"), 1)],
+            frontier: Some(at(root, "b/y.bin")),
+            done: false,
+            stopped: false,
+        });
+        assert!(totals.is_final(&at(root, "a")), "passed with nothing in it");
+        assert!(totals.is_final(&at(root, "b/inner")));
+        assert!(!totals.is_final(&at(root, "b")), "the walk is inside b");
+        assert!(!totals.is_final(&at(root, "c")), "not reached");
+        assert!(!totals.is_final(root));
+        // A delta without a frontier keeps the last one.
+        totals.apply(&CountDelta::default());
+        assert_eq!(totals.frontier, Some(at(root, "b/y.bin")));
+        assert!(!totals.is_final(&at(root, "c")));
+        totals.apply(&CountDelta {
+            done: true,
+            ..CountDelta::default()
+        });
+        assert!(totals.is_final(&at(root, "c")) && totals.is_final(root));
+        assert_eq!(totals.get(&at(root, "b")), Some(2));
     }
 
     #[cfg(unix)]

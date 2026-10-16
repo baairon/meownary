@@ -308,7 +308,8 @@ impl Runtime {
         let mut done = false;
         while batch.len() < BATCH_MAX {
             match rx.try_recv() {
-                Ok(ScanEvent::Found(r)) => batch.push(*r),
+                Ok(ScanEvent::Found(s)) => batch.push(s.report),
+                Ok(ScanEvent::Counted(_)) => {}
                 Ok(ScanEvent::Total(n)) => {
                     self.app.total = Some(n);
                     changed = true;
@@ -1191,10 +1192,10 @@ mod tests {
         let mut rt = Runtime::new(App::new("root"), Look::vivid());
         rt.scan_rx = Some(rx);
         let found = |name: &str| {
-            ScanEvent::Found(Box::new(FileReport::new(
-                PathBuf::from("root").join(name),
-                1,
-            )))
+            ScanEvent::Found(Box::new(scan::Scanned {
+                report: FileReport::new(PathBuf::from("root").join(name), 1),
+                error: None,
+            }))
         };
         tx.send(found("a")).unwrap();
         tx.send(found("b")).unwrap();
