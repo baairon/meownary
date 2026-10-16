@@ -92,7 +92,9 @@ fn string_table(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
         };
         if (4..=super::MAX_STRING).contains(&units) {
             let raw: Vec<u16> = bytes[at..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect();
             if let Ok(text) = String::from_utf16(&raw) {
@@ -126,7 +128,9 @@ fn manifest_names(view: &dyn FileView, off: u64, size: usize) -> Vec<String> {
             0
         };
         let units: Vec<u16> = bytes[start..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| u16::from_le_bytes([p[0], p[1]]))
             .collect();
         String::from_utf16(&units).ok()
@@ -238,7 +242,9 @@ fn certificate_names(table: &[u8]) -> Vec<String> {
                 };
                 let name = if tag == 0x1e {
                     let units: Vec<u16> = value
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|p| u16::from_be_bytes([p[0], p[1]]))
                         .collect();
                     String::from_utf16(&units).ok()
@@ -620,8 +626,7 @@ impl Walk<'_> {
         let d = self.img.dir(DIR_SECURITY)?;
         let off = u64::from(d.rva);
         let len = d.size as usize;
-        if len < 8
-            || len > MAX_CERT_BODY
+        if !(8..=MAX_CERT_BODY).contains(&len)
             || off < self.img.image_end()
             || off
                 .checked_add(len as u64)

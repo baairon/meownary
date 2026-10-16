@@ -406,7 +406,7 @@ fn url_candidates(text: &str) -> Vec<String> {
             let start = from + rel + scheme.len();
             let end = start
                 + lower[start..]
-                    .find(|c: char| matches!(c, '/' | ':' | '?' | '#' | ' ' | '\\'))
+                    .find(['/', ':', '?', '#', ' ', '\\'])
                     .unwrap_or(lower.len() - start);
             let host = &lower[start..end];
             if !host.contains('@')
@@ -481,10 +481,10 @@ fn functional_spans(text: &str) -> Vec<(usize, usize)> {
 /// once. The output is kept private to planning and never reported by name.
 pub(super) fn roots(hits: &[Hit], module: Option<&str>, extra: &Evidence) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
-    if let Some(stem) = module {
-        if let Some(root) = candidate(stem) {
-            roots.insert(root);
-        }
+    if let Some(stem) = module
+        && let Some(root) = candidate(stem)
+    {
+        roots.insert(root);
     }
     let mut corroborated: BTreeMap<String, BTreeSet<Source>> = BTreeMap::new();
     for (value, source) in extra {
