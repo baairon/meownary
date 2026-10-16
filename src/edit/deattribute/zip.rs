@@ -3,19 +3,25 @@
 //! on disk and the copy is rebuilt around the result:
 //!
 //! * a changed entry is re-deflated (or stored again if it was stored), with
-//!   its CRC and sizes recomputed in the local header, the data descriptor if
-//!   it has one, and the central directory;
+//!   its CRC and sizes recomputed in the local header (unless a data
+//!   descriptor left them zero there), the data descriptor if it has one, and
+//!   the central directory;
 //! * every other byte of the archive is copied untouched, so unchanged entries
 //!   keep their compressed data, and entry order, names, timestamps, external
 //!   attributes, extra fields and the archive comment all survive;
-//! * stored offsets after a changed entry are shifted, nothing else moves.
+//! * stored offsets after a changed entry are shifted, including those in a
+//!   ZIP64 end record and locator that some writers add without needing them;
+//!   nothing else moves.
 //!
-//! The original is only read. Encrypted entries, methods other than stored and
-//! deflate, and ZIP64 entries are skipped as `unsupported entry`, an entry over
-//! 256 MiB uncompressed is skipped as `entry too large`, and an archive that
-//! would expand past 1 GiB is refused. Nested archives are never opened.
+//! The original is only read. Encrypted entries and methods other than stored
+//! and deflate are skipped as `unsupported entry`, an entry over 256 MiB
+//! uncompressed is skipped as `entry too large`, and a nested archive is named
+//! and never opened. A ZIP64 or multi-disk archive, one whose changed entry
+//! shares bytes with another entry, and one that would expand past 1 GiB are
+//! refused. A signed package (a signed JAR layout, an APK signing block, a
+//! wheel's RECORD, a NuGet signature) is left alone whole, as any change would
+//! break its signature.
 
-use std::cell::Cell;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -24,19 +30,25 @@ use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::decompress_to_vec_with_limit;
 
 use crate::parsers;
-use crate::scan::WindowedFile;
-use crate::util::bytes::{slice, u16_le, u32_le};
+use crate::scan::{WindowedFile, guard};
+use crate::util::bytes::{slice, u16_le, u32_le, u64_le};
 
-use super::mem::{ArchiveOutcome, SliceView, deattribute_with};
-use super::{Reason, check_output, is_deattributed};
+use super::mem::{ArchiveOutcome, MemOutcome, SliceView, deattribute_with_mode, is_container};
+use super::{Mode, Reason, check_output, is_deattributed};
 use crate::edit::{EditError, fsio};
 
 const LOCAL_SIG: &[u8] = b"PK\x03\x04";
 const CENTRAL_SIG: &[u8] = b"PK\x01\x02";
 const DESCRIPTOR_SIG: &[u8] = b"PK\x07\x08";
+const ZIP64_END_SIG: &[u8] = b"PK\x06\x06";
+const ZIP64_LOCATOR_SIG: &[u8] = b"PK\x06\x07";
+const APK_SIG_BLOCK: &[u8] = b"APK Sig Block 42";
 const EOCD_LEN: usize = 22;
 const LOCAL_LEN: usize = 30;
 const CENTRAL_LEN: usize = 46;
+const ZIP64_END_LEN: usize = 56;
+const ZIP64_LOCATOR_LEN: usize = 20;
+const ZIP64_EXTRA: u16 = 0x0001;
 const STORED: u16 = 0;
 const DEFLATED: u16 = 8;
 const ENCRYPTED: u16 = 1;
@@ -103,6 +115,10 @@ struct Analysis {
     brand: usize,
     patch: usize,
     skipped: Vec<(String, Reason)>,
+    /// Offset of the classic end record.
+    eocd: usize,
+    /// Offsets of a ZIP64 end record and its locator, when the archive has them.
+    zip64_end: Option<(usize, usize)>,
 }
 
 /// CRC-32 (IEEE) of `data`.
@@ -137,13 +153,28 @@ fn refuse(why: &str) -> EditError {
     EditError::Refused(why.to_string())
 }
 
+fn multi_disk() -> EditError {
+    refuse("archives split over several disks are not supported")
+}
+
 /// Deattribute every file inside the ZIP at `original`, writing the result to
 /// `out` unless `dry_run`. The outcome always carries the entry skips;
-/// `entries_cleaned == 0` means no copy was (or would be) written.
+/// `entries_cleaned == 0` means no copy was (or would be) written. A signed
+/// package comes back that way too, with the entry that signs it skipped as
+/// `signed package`.
 pub fn deattribute_zip(
     original: &Path,
     out: &Path,
     dry_run: bool,
+) -> Result<ArchiveOutcome, EditError> {
+    deattribute_zip_mode(original, out, dry_run, Mode::Basic)
+}
+
+pub fn deattribute_zip_mode(
+    original: &Path,
+    out: &Path,
+    dry_run: bool,
+    mode: Mode,
 ) -> Result<ArchiveOutcome, EditError> {
     if is_deattributed(original) {
         return Err(refuse("the file is already a deattributed copy"));
@@ -162,7 +193,7 @@ pub fn deattribute_zip(
     if data.len() as u64 != meta.len() {
         return Err(EditError::Changed);
     }
-    let found = analyze(&data)?;
+    let found = analyze_mode(&data, mode)?;
     let outcome = ArchiveOutcome {
         output: out.to_path_buf(),
         entries_cleaned: found.changes.len(),
@@ -179,29 +210,28 @@ pub fn deattribute_zip(
     }
     check_output(out)?;
     let modified = meta.modified().ok();
-    let moved = Cell::new(false);
-    let written = fsio::replace_atomic_with(out, |file| {
-        #[cfg(unix)]
-        file.set_permissions(meta.permissions())?;
-        let mut w = BufWriter::new(&*file);
-        assemble(&data, &found, &mut w).map_err(|e| match e {
-            EditError::Io(e) => e,
-            other => io::Error::other(other.to_string()),
-        })?;
+    let (tmp, file) = fsio::create_temp_beside(out)?;
+    let result = (|| {
+        let mut w = BufWriter::new(&file);
+        assemble(&data, &found, &mut w)?;
         w.flush()?;
+        drop(w);
+        file.sync_all()?;
+        drop(file);
         let same = fs::metadata(original)
             .is_ok_and(|m| m.len() == meta.len() && m.modified().ok() == modified);
         if !same {
-            moved.set(true);
-            return Err(io::Error::other("changed while it was being copied"));
+            return Err(EditError::Changed);
         }
-        Ok(())
-    });
-    if moved.get() {
-        return Err(EditError::Changed);
+        super::tar::finish(&tmp, out, &meta)
+    })();
+    match result {
+        Ok(()) => Ok(outcome),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    written?;
-    Ok(outcome)
 }
 
 /// How many files (not folders) the ZIP at `path` holds.
@@ -216,22 +246,43 @@ pub fn zip_file_count(path: &Path) -> Option<usize> {
     )
 }
 
+/// Whether cleaning the copy at `output` again in `mode` would change no entry.
+pub fn verify_copy(output: &Path, mode: Mode) -> bool {
+    let Ok(data) = fs::read(output) else {
+        return false;
+    };
+    analyze_mode(&data, mode).is_ok_and(|found| found.changes.is_empty())
+}
+
+/// Whether an entry that came back with nothing to blank is itself an archive,
+/// which is then named as a nested archive instead of passing as clean. The
+/// tar walker asks the same question of its entries.
+pub(super) fn nested(cleaned: &MemOutcome, name: &str, data: &[u8]) -> bool {
+    if cleaned.bytes.is_some() || !cleaned.skipped.is_empty() {
+        return false;
+    }
+    let view = SliceView::new(name, data);
+    guard::guarded(|| parsers::identify(&view).0).is_ok_and(is_container)
+}
+
 /// Read the archive, clean every supported entry in memory and collect the
 /// replacements.
+#[cfg(test)]
 fn analyze(data: &[u8]) -> Result<Analysis, EditError> {
+    analyze_mode(data, Mode::Basic)
+}
+
+fn analyze_mode(data: &[u8], mode: Mode) -> Result<Analysis, EditError> {
     let view = SliceView::new("archive.zip", data);
     let arch = parsers::zip::parse(&view).ok_or_else(|| refuse("not a readable zip"))?;
     if arch.zip64 {
         return Err(refuse("zip64 archives are not supported"));
     }
-    let entries = read_central(data, &arch)?;
-    let total: u64 = entries.iter().filter(|e| !e.dir).map(|e| e.size).sum();
-    if total > MAX_TOTAL {
-        return Err(refuse("the archive would expand past its size limit"));
-    }
-
-    let registry = parsers::registry();
     let cd = arch.cd_offset as usize;
+    let cd_end = cd + arch.cd_size as usize;
+    let eocd = end_record(data, &arch, cd_end)?;
+    let zip64_end = zip64_end(data, &arch, cd_end, eocd)?;
+    let entries = read_central(data, &arch)?;
     let mut out = Analysis {
         arch,
         entries: Vec::new(),
@@ -239,8 +290,28 @@ fn analyze(data: &[u8]) -> Result<Analysis, EditError> {
         brand: 0,
         patch: 0,
         skipped: Vec::new(),
+        eocd,
+        zip64_end,
     };
-    for (index, e) in entries.iter().enumerate() {
+    if let Some(name) = signature(data, cd, &entries) {
+        out.skipped.push((name, Reason::SignedContainer));
+        out.entries = entries;
+        return Ok(out);
+    }
+
+    let spans: Vec<Option<Span>> = entries.iter().map(|e| span_of(data, e, cd)).collect();
+    let total: u64 = entries
+        .iter()
+        .zip(&spans)
+        .filter(|(e, span)| !e.dir && !unsupported(e) && span.is_some() && e.size <= MAX_ENTRY)
+        .map(|(e, _)| e.size)
+        .sum();
+    if total > MAX_TOTAL {
+        return Err(refuse("the archive would expand past its size limit"));
+    }
+
+    let registry = parsers::registry();
+    for (index, (e, span)) in entries.iter().zip(&spans).enumerate() {
         if e.dir {
             continue;
         }
@@ -248,7 +319,7 @@ fn analyze(data: &[u8]) -> Result<Analysis, EditError> {
             out.skipped.push((e.name.clone(), Reason::UnsupportedEntry));
             continue;
         }
-        let Some(span) = span_of(data, e, cd) else {
+        let Some(span) = span else {
             out.skipped.push((e.name.clone(), Reason::UnsupportedEntry));
             continue;
         };
@@ -259,18 +330,21 @@ fn analyze(data: &[u8]) -> Result<Analysis, EditError> {
             out.skipped.push((e.name.clone(), Reason::EntryTooLarge));
             continue;
         }
-        let Some(plain) = unpack(data, e, &span) else {
+        let Some(plain) = unpack(data, e, span) else {
             out.skipped.push((e.name.clone(), Reason::UnsupportedEntry));
             continue;
         };
-        let cleaned = deattribute_with(e.file_name(), &plain, &registry);
-        for reason in cleaned.skipped {
+        let cleaned = deattribute_with_mode(e.file_name(), &plain, &registry, mode);
+        if nested(&cleaned, e.file_name(), &plain) {
+            out.skipped.push((e.name.clone(), Reason::NestedArchive));
+        }
+        for &reason in &cleaned.skipped {
             out.skipped.push((e.name.clone(), reason));
         }
         let Some(blanked) = cleaned.bytes else {
             continue;
         };
-        match rebuild(data, e, &span, index, &blanked) {
+        match rebuild(data, e, span, index, &blanked) {
             Some(change) => {
                 out.brand += cleaned.brand;
                 out.patch += cleaned.patch;
@@ -279,21 +353,179 @@ fn analyze(data: &[u8]) -> Result<Analysis, EditError> {
             None => out.skipped.push((e.name.clone(), Reason::UnsupportedEntry)),
         }
     }
-    out.entries = entries;
     out.changes.sort_by_key(|c| c.start);
-    let mut edge = 0usize;
-    for c in &out.changes {
-        if c.start < edge || c.end > cd {
-            return Err(refuse("the archive's entries overlap"));
-        }
-        edge = c.end;
-    }
+    check_overlap(&entries, &spans, &out.changes, cd)?;
+    out.entries = entries;
     Ok(out)
 }
 
-/// Walk the central directory into entries, keeping every record's offset.
+/// Offset of the classic end record, refusing an archive split over disks.
+fn end_record(
+    data: &[u8],
+    arch: &parsers::zip::ZipArchive,
+    cd_end: usize,
+) -> Result<usize, EditError> {
+    let bad = || refuse("the end record is unreadable");
+    let eocd = (arch.comment_offset as usize)
+        .checked_sub(EOCD_LEN)
+        .filter(|&at| at >= cd_end)
+        .ok_or_else(bad)?;
+    let rec = slice(data, eocd, EOCD_LEN).ok_or_else(bad)?;
+    let field = |at| u16_le(rec, at).ok_or_else(bad);
+    let (disk, cd_disk, on_disk, total) = (field(4)?, field(6)?, field(8)?, field(10)?);
+    if disk != 0 || cd_disk != 0 || on_disk != total {
+        return Err(multi_disk());
+    }
+    Ok(eocd)
+}
+
+/// The ZIP64 end record and locator some writers (`zip -fz`, streaming ones)
+/// add even when no classic field is saturated, as (record, locator) offsets.
+/// Readers that find a locator trust the record over the classic fields, so it
+/// must agree with them now and is shifted along with them in the copy.
+fn zip64_end(
+    data: &[u8],
+    arch: &parsers::zip::ZipArchive,
+    cd_end: usize,
+    eocd: usize,
+) -> Result<Option<(usize, usize)>, EditError> {
+    let Some(loc) = eocd
+        .checked_sub(ZIP64_LOCATOR_LEN)
+        .filter(|&at| at >= cd_end && slice(data, at, 4) == Some(ZIP64_LOCATOR_SIG))
+    else {
+        return Ok(None);
+    };
+    let bad = || refuse("the zip64 end record is unreadable");
+    let l = slice(data, loc, ZIP64_LOCATOR_LEN).ok_or_else(bad)?;
+    let (rec_disk, stored, disks) = (
+        u32_le(l, 4).ok_or_else(bad)?,
+        u64_le(l, 8).ok_or_else(bad)?,
+        u32_le(l, 16).ok_or_else(bad)?,
+    );
+    if rec_disk != 0 || disks > 1 {
+        return Err(multi_disk());
+    }
+    let rec = usize::try_from(stored)
+        .ok()
+        .and_then(|at| at.checked_add(usize::try_from(arch.shift).ok()?))
+        .filter(|&at| at >= cd_end && at.saturating_add(ZIP64_END_LEN) <= loc)
+        .ok_or_else(bad)?;
+    let r = slice(data, rec, ZIP64_END_LEN).ok_or_else(bad)?;
+    if &r[..4] != ZIP64_END_SIG {
+        return Err(bad());
+    }
+    if u32_le(r, 16) != Some(0) || u32_le(r, 20) != Some(0) {
+        return Err(multi_disk());
+    }
+    let on_disk = u64_le(r, 24).ok_or_else(bad)?;
+    let total = u64_le(r, 32).ok_or_else(bad)?;
+    let size = u64_le(r, 40).ok_or_else(bad)?;
+    let offset = u64_le(r, 48).ok_or_else(bad)?;
+    if on_disk != total
+        || total != arch.declared_entries
+        || size != arch.cd_size
+        || offset.checked_add(arch.shift) != Some(arch.cd_offset)
+    {
+        return Err(refuse("the zip64 end record disagrees with the end record"));
+    }
+    Ok(Some((rec, loc)))
+}
+
+/// The entry (or block) that marks the archive as a signed package, whose
+/// signature or hash list any changed entry would break.
+fn signature(data: &[u8], cd: usize, entries: &[Entry]) -> Option<String> {
+    if cd >= APK_SIG_BLOCK.len() && data.get(cd - APK_SIG_BLOCK.len()..cd) == Some(APK_SIG_BLOCK) {
+        return Some("<apk signing block>".into());
+    }
+    entries
+        .iter()
+        .find(|e| signs(&e.name))
+        .map(|e| e.name.clone())
+}
+
+/// Whether an entry path is a signature or a signed hash list: JAR signature
+/// files, a wheel's RECORD, or a NuGet package signature.
+fn signs(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if let Some(file) = upper.strip_prefix("META-INF/")
+        && !file.contains('/')
+        && [".SF", ".RSA", ".DSA", ".EC"]
+            .iter()
+            .any(|ext| file.len() > ext.len() && file.ends_with(ext))
+    {
+        return true;
+    }
+    upper == ".SIGNATURE.P7S"
+        || (upper.ends_with(".DIST-INFO/RECORD") && upper.matches('/').count() == 1)
+}
+
+/// Refuse when a changed entry's bytes are shared with any other entry: two
+/// records naming one local header, or a local header inside another entry's
+/// data. Rewriting such bytes would corrupt the other entry, or leave it
+/// holding the very credit that was blanked here.
+fn check_overlap(
+    entries: &[Entry],
+    spans: &[Option<Span>],
+    changes: &[Change],
+    cd: usize,
+) -> Result<(), EditError> {
+    let overlap = || refuse("the archive's entries overlap");
+    let mut ranges: Vec<(usize, usize)> = entries
+        .iter()
+        .zip(spans)
+        .map(|(e, span)| {
+            let end = span
+                .as_ref()
+                .map_or(e.local.saturating_add(LOCAL_LEN), |s| {
+                    s.data_end + s.descriptor
+                });
+            (e.local, end)
+        })
+        .collect();
+    ranges.sort_unstable();
+    // The furthest any range reaches among those sorted before each index.
+    let reach: Vec<usize> = ranges
+        .iter()
+        .scan(0usize, |far, r| {
+            *far = (*far).max(r.1);
+            Some(*far)
+        })
+        .collect();
+    for c in changes {
+        if c.end > cd {
+            return Err(overlap());
+        }
+        let before = ranges.partition_point(|r| r.0 < c.start);
+        if before > 0 && reach[before - 1] > c.start {
+            return Err(overlap());
+        }
+        // The change's own range starts at `c.start`; any other one starting
+        // inside it overlaps.
+        if ranges.partition_point(|r| r.0 < c.end) - before > 1 {
+            return Err(overlap());
+        }
+    }
+    Ok(())
+}
+
+/// Whether an extra field carries a ZIP64 record.
+fn has_zip64_extra(extra: &[u8]) -> bool {
+    let mut i = 0usize;
+    while let (Some(id), Some(len)) = (u16_le(extra, i), u16_le(extra, i + 2)) {
+        if id == ZIP64_EXTRA {
+            return true;
+        }
+        i += 4 + usize::from(len);
+    }
+    false
+}
+
+/// Walk the central directory into entries, keeping every record's offset. A
+/// record on another disk or with any ZIP64 field refuses the archive, since
+/// the offsets rewritten here would no longer be the ones readers use.
 fn read_central(data: &[u8], arch: &parsers::zip::ZipArchive) -> Result<Vec<Entry>, EditError> {
     let bad = || refuse("the central directory is unreadable");
+    let zip64 = || refuse("zip64 entries are not supported");
     let cd = usize::try_from(arch.cd_offset).map_err(|_| bad())?;
     let cd_end = cd
         .checked_add(usize::try_from(arch.cd_size).map_err(|_| bad())?)
@@ -314,16 +546,25 @@ fn read_central(data: &[u8], arch: &parsers::zip::ZipArchive) -> Result<Vec<Entr
         if end > cd_end {
             return Err(bad());
         }
+        if u16_le(head, 34) != Some(0) {
+            return Err(multi_disk());
+        }
         let name = &data[pos + CENTRAL_LEN..pos + CENTRAL_LEN + name_len];
+        let extra = &data[pos + CENTRAL_LEN + name_len..pos + CENTRAL_LEN + name_len + extra_len];
+        let csize = u32_le(head, 20).ok_or_else(bad)?;
+        let size = u32_le(head, 24).ok_or_else(bad)?;
         let stored_offset = u32_le(head, 42).ok_or_else(bad)?;
+        if [csize, size, stored_offset].contains(&u32::MAX) || has_zip64_extra(extra) {
+            return Err(zip64());
+        }
         entries.push(Entry {
             name: String::from_utf8_lossy(name).into_owned(),
             rec: pos,
             flags: u16_le(head, 8).ok_or_else(bad)?,
             method: u16_le(head, 10).ok_or_else(bad)?,
             crc: u32_le(head, 16).ok_or_else(bad)?,
-            csize: u64::from(u32_le(head, 20).ok_or_else(bad)?),
-            size: u64::from(u32_le(head, 24).ok_or_else(bad)?),
+            csize: u64::from(csize),
+            size: u64::from(size),
             stored_offset,
             local: usize::try_from(stored_offset)
                 .ok()
@@ -336,13 +577,9 @@ fn read_central(data: &[u8], arch: &parsers::zip::ZipArchive) -> Result<Vec<Entr
     Ok(entries)
 }
 
-/// Whether the entry cannot be read: encrypted, an unknown method, or ZIP64.
+/// Whether the entry cannot be read: encrypted or an unknown method.
 fn unsupported(e: &Entry) -> bool {
-    e.flags & (ENCRYPTED | STRONG_ENCRYPTION) != 0
-        || !matches!(e.method, STORED | DEFLATED)
-        || e.csize == u64::from(u32::MAX)
-        || e.size == u64::from(u32::MAX)
-        || e.stored_offset == u32::MAX
+    e.flags & (ENCRYPTED | STRONG_ENCRYPTION) != 0 || !matches!(e.method, STORED | DEFLATED)
 }
 
 /// Locate the entry's local header, data and descriptor, or `None` when the
@@ -404,7 +641,8 @@ fn unpack(data: &[u8], e: &Entry, span: &Span) -> Option<Vec<u8>> {
 }
 
 /// The replacement bytes for one entry: its local header with the new CRC and
-/// sizes, the new data, and a data descriptor if the entry had one.
+/// sizes, the new data, and a data descriptor if the entry had one. `None` when
+/// the local header carries a ZIP64 extra, whose sizes would go stale.
 fn rebuild(data: &[u8], e: &Entry, span: &Span, index: usize, plain: &[u8]) -> Option<Change> {
     let packed = match e.method {
         STORED => plain.to_vec(),
@@ -414,9 +652,19 @@ fn rebuild(data: &[u8], e: &Entry, span: &Span, index: usize, plain: &[u8]) -> O
     let csize = u32::try_from(packed.len()).ok()?;
     let size = u32::try_from(plain.len()).ok()?;
     let mut bytes = data.get(e.local..e.local + span.header)?.to_vec();
-    bytes[14..18].copy_from_slice(&crc.to_le_bytes());
-    bytes[18..22].copy_from_slice(&csize.to_le_bytes());
-    bytes[22..26].copy_from_slice(&size.to_le_bytes());
+    let name_len = usize::from(u16_le(&bytes, 26)?);
+    if has_zip64_extra(bytes.get(LOCAL_LEN + name_len..)?) {
+        return None;
+    }
+    // With a data descriptor the local fields are normally zero and readers
+    // take the values from the descriptor and the central record; they stay
+    // zero then, and are only rewritten when the writer filled them in.
+    let zeroed = e.flags & HAS_DESCRIPTOR != 0 && bytes[14..26].iter().all(|&b| b == 0);
+    if !zeroed {
+        bytes[14..18].copy_from_slice(&crc.to_le_bytes());
+        bytes[18..22].copy_from_slice(&csize.to_le_bytes());
+        bytes[22..26].copy_from_slice(&size.to_le_bytes());
+    }
     bytes.extend_from_slice(&packed);
     if span.descriptor > 0 {
         if span.descriptor == 16 {
@@ -437,16 +685,24 @@ fn rebuild(data: &[u8], e: &Entry, span: &Span, index: usize, plain: &[u8]) -> O
     })
 }
 
+/// Add `moved` to the little-endian u64 at `at` in `buf`.
+fn shift_u64(buf: &mut [u8], at: usize, moved: i64) -> Result<(), EditError> {
+    let bad = || refuse("the zip64 end record is unreadable");
+    let old = u64_le(buf, at).ok_or_else(bad)?;
+    let new = old
+        .checked_add_signed(moved)
+        .ok_or_else(|| refuse("the copy would be too large"))?;
+    buf[at..at + 8].copy_from_slice(&new.to_le_bytes());
+    Ok(())
+}
+
 /// Write the copy: the original with each changed entry replaced, the central
-/// directory patched to match, and the end record pointing at it.
+/// directory patched to match, and the end records pointing at it.
 fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), EditError> {
     let arch = &found.arch;
     let cd = arch.cd_offset as usize;
     let cd_end = cd + arch.cd_size as usize;
-    let eocd = (arch.comment_offset as usize)
-        .checked_sub(EOCD_LEN)
-        .filter(|&at| at >= cd_end)
-        .ok_or_else(|| refuse("the end record is unreadable"))?;
+    let eocd = found.eocd;
 
     // After each change, how far later offsets have moved.
     let mut shifts: Vec<(usize, i64)> = Vec::with_capacity(found.changes.len());
@@ -475,6 +731,14 @@ fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), Edit
         central[rec + 20..rec + 24].copy_from_slice(&c.csize.to_le_bytes());
         central[rec + 24..rec + 28].copy_from_slice(&c.size.to_le_bytes());
     }
+    // Between the central directory and the end record: a ZIP64 end record
+    // (central directory offset at byte 48) and its locator (record offset at
+    // byte 8) both move with everything else.
+    let mut between = data[cd_end..eocd].to_vec();
+    if let Some((rec, loc)) = found.zip64_end {
+        shift_u64(&mut between, rec - cd_end + 48, moved)?;
+        shift_u64(&mut between, loc - cd_end + 8, moved)?;
+    }
 
     let mut cursor = 0usize;
     for c in &found.changes {
@@ -484,7 +748,7 @@ fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), Edit
     }
     w.write_all(&data[cursor..cd])?;
     w.write_all(&central)?;
-    w.write_all(&data[cd_end..eocd])?;
+    w.write_all(&between)?;
     let mut end_record = data[eocd..].to_vec();
     let stored_cd =
         u32_le(&end_record, 16).ok_or_else(|| refuse("the end record is unreadable"))?;
@@ -805,7 +1069,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_nested_archive_is_not_opened() {
+    fn a_nested_archive_is_named_and_not_opened() {
         let dir = tempfile::tempdir().unwrap();
         let (_, exe, _) = fixture();
         let inner = build(&[item("deep.exe", &exe, true)], b"");
@@ -815,7 +1079,10 @@ pub(crate) mod tests {
         let out = dir.path().join("n.deattributed.zip");
         let done = deattribute_zip(&path, &out, false).unwrap();
         assert_eq!(done.entries_cleaned, 0);
-        assert!(done.skipped.is_empty());
+        assert_eq!(
+            done.skipped,
+            vec![("inner.zip".to_string(), Reason::NestedArchive)]
+        );
         assert!(!out.exists());
     }
 
@@ -853,5 +1120,348 @@ pub(crate) mod tests {
         let path = dir.path().join("c.zip");
         fs::write(&path, &original).unwrap();
         assert_eq!(zip_file_count(&path), Some(2));
+    }
+
+    /// Offsets of the classic end record and the central directory in a
+    /// synthetic archive with no comment.
+    fn ends(zip: &[u8]) -> (usize, usize) {
+        let eocd = zip.len() - EOCD_LEN;
+        (eocd, u32_le(zip, eocd + 16).unwrap() as usize)
+    }
+
+    /// Put an unsaturated ZIP64 end record and locator between the central
+    /// directory and the end record, as `zip -fz` does.
+    fn with_zip64_end(zip: &[u8]) -> Vec<u8> {
+        let (eocd, cd) = ends(zip);
+        let entries = u64::from(u16_le(zip, eocd + 10).unwrap());
+        let cd_size = u64::from(u32_le(zip, eocd + 12).unwrap());
+        let mut out = zip[..eocd].to_vec();
+        let rec = out.len() as u64;
+        out.extend_from_slice(ZIP64_END_SIG);
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&45u16.to_le_bytes());
+        out.extend_from_slice(&45u16.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&entries.to_le_bytes());
+        out.extend_from_slice(&entries.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&(cd as u64).to_le_bytes());
+        out.extend_from_slice(ZIP64_LOCATOR_SIG);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&rec.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&zip[eocd..]);
+        out
+    }
+
+    /// Insert `bytes` right before the central directory, shifting its offset.
+    fn before_central(zip: &[u8], bytes: &[u8]) -> Vec<u8> {
+        let (eocd, cd) = ends(zip);
+        let mut out = zip[..cd].to_vec();
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(&zip[cd..]);
+        let moved = (cd + bytes.len()) as u32;
+        out[eocd + bytes.len() + 16..eocd + bytes.len() + 20].copy_from_slice(&moved.to_le_bytes());
+        out
+    }
+
+    /// The central record offsets of every entry.
+    fn records(zip: &[u8]) -> Vec<usize> {
+        let view = MemView::new("x.zip", zip.to_vec());
+        let arch = parse(&view).unwrap();
+        read_central(zip, &arch)
+            .unwrap()
+            .iter()
+            .map(|e| e.rec)
+            .collect()
+    }
+
+    fn clean_bytes(path: &Path, bytes: &[u8]) -> Result<ArchiveOutcome, EditError> {
+        fs::write(path, bytes).unwrap();
+        let out = path.with_extension("deattributed.zip");
+        deattribute_zip(path, &out, false)
+    }
+
+    #[test]
+    fn an_unsaturated_zip64_end_record_moves_with_the_central_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, text) = fixture();
+        let plain = build(
+            &[item("a.txt", &text, true), item("tool.exe", &exe, true)],
+            b"",
+        );
+        let original = with_zip64_end(&plain);
+        let view = MemView::new("x.zip", original.clone());
+        assert!(
+            !parse(&view).unwrap().zip64,
+            "the classic fields are not saturated"
+        );
+        let path = dir.path().join("z.zip");
+        fs::write(&path, &original).unwrap();
+        let out = dir.path().join("z.deattributed.zip");
+        assert_eq!(
+            deattribute_zip(&path, &out, false).unwrap().entries_cleaned,
+            1
+        );
+
+        let copy = fs::read(&out).unwrap();
+        let (eocd, cd) = ends(&copy);
+        let (_, old_cd) = ends(&original);
+        assert_ne!(cd, old_cd, "the change moved the central directory");
+        let loc = eocd - ZIP64_LOCATOR_LEN;
+        assert_eq!(&copy[loc..loc + 4], ZIP64_LOCATOR_SIG);
+        let rec = u64_le(&copy, loc + 8).unwrap() as usize;
+        assert_eq!(&copy[rec..rec + 4], ZIP64_END_SIG);
+        assert_eq!(u64_le(&copy, rec + 48), Some(cd as u64));
+        assert_eq!(rec, cd + u32_le(&copy, eocd + 12).unwrap() as usize);
+        let (after, _) = read_back(&copy);
+        assert!(!after[1].plain.windows(10).any(|w| w == b"patched by"));
+        assert!(verify_copy(&out, Mode::Basic));
+    }
+
+    #[test]
+    fn a_zip64_end_record_that_disagrees_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        let mut original = with_zip64_end(&build(&[item("tool.exe", &exe, true)], b""));
+        let (eocd, _) = ends(&original);
+        let rec = u64_le(&original, eocd - ZIP64_LOCATOR_LEN + 8).unwrap() as usize;
+        original[rec + 48] ^= 1;
+        let path = dir.path().join("d.zip");
+        assert!(matches!(
+            clean_bytes(&path, &original),
+            Err(EditError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn a_change_sharing_bytes_with_another_entry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, text) = fixture();
+        let mut original = build(
+            &[item("tool.exe", &exe, true), item("b.txt", &text, false)],
+            b"",
+        );
+        // A second record naming the first entry's local header.
+        let recs = records(&original);
+        original[recs[1] + 42..recs[1] + 46].copy_from_slice(&0u32.to_le_bytes());
+        let path = dir.path().join("o.zip");
+        assert!(matches!(
+            clean_bytes(&path, &original),
+            Err(EditError::Refused(_))
+        ));
+        assert!(!dir.path().join("o.deattributed.zip").exists());
+
+        // A local header inside the changed entry's data.
+        let mut inside = build(
+            &[item("tool.exe", &exe, false), item("b.txt", &text, false)],
+            b"",
+        );
+        let recs = records(&inside);
+        inside[recs[1] + 42..recs[1] + 46].copy_from_slice(&100u32.to_le_bytes());
+        let path = dir.path().join("i.zip");
+        assert!(matches!(
+            clean_bytes(&path, &inside),
+            Err(EditError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn signed_packages_are_left_alone_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        for signer in [
+            "META-INF/CERT.SF",
+            "meta-inf/release.rsa",
+            "pkg-1.0.dist-info/RECORD",
+            ".signature.p7s",
+        ] {
+            let original = build(
+                &[
+                    item(signer, b"invented signature", false),
+                    item("tool.exe", &exe, true),
+                ],
+                b"",
+            );
+            let path = dir.path().join("s.zip");
+            let done = clean_bytes(&path, &original).unwrap();
+            assert_eq!(done.entries_cleaned, 0, "{signer}");
+            assert_eq!(
+                done.skipped,
+                vec![(signer.to_string(), Reason::SignedContainer)]
+            );
+            assert!(!dir.path().join("s.deattributed.zip").exists());
+        }
+        for unsigned in ["META-INF/MANIFEST.MF", "META-INF/sub/x.SF", "docs/RECORD"] {
+            let original = build(
+                &[
+                    item(unsigned, b"plain", false),
+                    item("tool.exe", &exe, true),
+                ],
+                b"",
+            );
+            let found = analyze(&original).unwrap();
+            assert_eq!(found.changes.len(), 1, "{unsigned}");
+        }
+
+        let apk = before_central(
+            &build(&[item("tool.exe", &exe, true)], b""),
+            b"\0\0\0\0\0\0\0\0APK Sig Block 42",
+        );
+        let found = analyze(&apk).unwrap();
+        assert!(found.changes.is_empty());
+        assert_eq!(found.skipped[0].1, Reason::SignedContainer);
+    }
+
+    #[test]
+    fn a_descriptor_entry_keeps_zero_local_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        let mut streamed = item("late.exe", &exe, true);
+        streamed.flags = HAS_DESCRIPTOR;
+        let original = build(&[streamed], b"");
+        let path = dir.path().join("b.zip");
+        assert_eq!(clean_bytes(&path, &original).unwrap().entries_cleaned, 1);
+        let copy = fs::read(dir.path().join("b.deattributed.zip")).unwrap();
+        assert_eq!(
+            copy[14..26],
+            [0; 12],
+            "crc and sizes stay in the descriptor"
+        );
+        let (after, _) = read_back(&copy);
+        assert!(!after[0].plain.windows(10).any(|w| w == b"patched by"));
+        let csize = after[0].packed.len();
+        let desc = LOCAL_LEN + "late.exe".len() + 4 + csize;
+        assert_eq!(&copy[desc..desc + 4], DESCRIPTOR_SIG);
+        assert_eq!(u32_le(&copy, desc + 4), Some(crc32(&after[0].plain)));
+        assert_eq!(u32_le(&copy, desc + 8), Some(csize as u32));
+    }
+
+    #[test]
+    fn multi_disk_and_zip64_archives_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        let base = build(
+            &[item("tool.exe", &exe, true), item("b.exe", &exe, false)],
+            b"",
+        );
+        let (eocd, _) = ends(&base);
+        let rec = records(&base)[1];
+        let name_len = "b.exe".len();
+        type Edit = Box<dyn Fn(&mut Vec<u8>)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            ("entries on this disk", Box::new(move |z| z[eocd + 8] = 1)),
+            ("record on disk 1", Box::new(move |z| z[rec + 34] = 1)),
+            (
+                "saturated size",
+                Box::new(move |z| z[rec + 24..rec + 28].fill(0xFF)),
+            ),
+            (
+                "zip64 extra",
+                Box::new(move |z| {
+                    let at = rec + CENTRAL_LEN + name_len;
+                    z[at..at + 2].copy_from_slice(&ZIP64_EXTRA.to_le_bytes());
+                }),
+            ),
+        ];
+        for (what, edit) in cases {
+            let mut z = base.clone();
+            edit(&mut z);
+            let path = dir.path().join("m.zip");
+            assert!(
+                matches!(clean_bytes(&path, &z), Err(EditError::Refused(_))),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_entries_do_not_count_toward_the_size_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        let mut secret = item("secret.exe", &exe, false);
+        secret.flags = ENCRYPTED;
+        let mut original = build(&[secret, item("ok.exe", &exe, false)], b"");
+        let rec = records(&original)[0];
+        original[rec + 24..rec + 28].copy_from_slice(&0xF000_0000u32.to_le_bytes());
+        let path = dir.path().join("big.zip");
+        let done = clean_bytes(&path, &original).unwrap();
+        assert_eq!(done.entries_cleaned, 1);
+        assert_eq!(
+            done.skipped,
+            vec![("secret.exe".to_string(), Reason::UnsupportedEntry)]
+        );
+    }
+
+    #[test]
+    fn a_read_only_stale_copy_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        let original = build(&[item("x.exe", &exe, true)], b"");
+        let path = dir.path().join("ro.zip");
+        fs::write(&path, &original).unwrap();
+        let out = dir.path().join("ro.deattributed.zip");
+        fs::write(&out, b"stale").unwrap();
+        let mut perms = fs::metadata(&out).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&out, perms).unwrap();
+
+        deattribute_zip(&path, &out, false).unwrap();
+        let (after, _) = read_back(&fs::read(&out).unwrap());
+        assert!(!after[0].plain.windows(10).any(|w| w == b"patched by"));
+        let entries = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 2, "no temp file is left");
+    }
+
+    #[test]
+    fn a_fresh_copy_verifies_and_the_original_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, text) = fixture();
+        let original = build(
+            &[item("a.exe", &exe, true), item("b.txt", &text, false)],
+            b"",
+        );
+        let path = dir.path().join("v.zip");
+        fs::write(&path, &original).unwrap();
+        let out = dir.path().join("v.deattributed.zip");
+        for mode in [Mode::Basic, Mode::Deep] {
+            deattribute_zip_mode(&path, &out, false, mode).unwrap();
+            assert!(verify_copy(&out, mode));
+            assert!(!verify_copy(&path, mode));
+        }
+    }
+
+    #[test]
+    fn an_entry_cleans_to_the_same_bytes_alone_in_a_zip_and_in_a_targz() {
+        use super::super::mem::deattribute_bytes_mode;
+        use super::super::tar::tests::{end, entry, gz_member, headers, inflate_copy};
+        use super::super::tar::{copy_name, deattribute_tar_mode};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, exe, _) = fixture();
+        for mode in [Mode::Basic, Mode::Deep] {
+            let alone = deattribute_bytes_mode("tool.exe", &exe, mode)
+                .bytes
+                .expect("blanked");
+
+            let zip = dir.path().join("same.zip");
+            fs::write(&zip, build(&[item("bin/tool.exe", &exe, true)], b"")).unwrap();
+            let out = dir.path().join("same.deattributed.zip");
+            deattribute_zip_mode(&zip, &out, false, mode).unwrap();
+            let (after, _) = read_back(&fs::read(&out).unwrap());
+            assert_eq!(after[0].plain, alone);
+
+            let mut t = Vec::new();
+            entry(&mut t, "bin/tool.exe", b'0', &exe);
+            end(&mut t);
+            let gz = dir.path().join("same.tar.gz");
+            fs::write(&gz, gz_member(&t, false)).unwrap();
+            let out = copy_name(&gz);
+            deattribute_tar_mode(&gz, true, &out, mode)
+                .unwrap()
+                .unwrap();
+            let inflated = inflate_copy(&fs::read(&out).unwrap());
+            let (_, size, at) = headers(&inflated)[0];
+            assert_eq!(inflated[at..at + size as usize], alone[..]);
+        }
     }
 }

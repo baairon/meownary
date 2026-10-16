@@ -12,7 +12,7 @@ use crate::scan::reader::{HEADER_WINDOW, MAX_READ, TAIL_WINDOW};
 use crate::scan::{FileView, Registry, guard};
 use crate::util::hash::hash_hex;
 
-use super::{Kind, Reason, plan};
+use super::{Kind, Mode, Reason, plan_mode};
 
 /// What deattributing one file's bytes did.
 #[derive(Debug, Default)]
@@ -105,12 +105,21 @@ impl FileView for SliceView<'_> {
 /// used only for identity hints. `bytes` is `Some` only when at least one blank
 /// was applied; the length never changes.
 pub fn deattribute_bytes(name: &str, data: &[u8]) -> MemOutcome {
-    deattribute_with(name, data, &parsers::registry())
+    deattribute_bytes_mode(name, data, Mode::Basic)
+}
+
+pub fn deattribute_bytes_mode(name: &str, data: &[u8], mode: Mode) -> MemOutcome {
+    deattribute_with_mode(name, data, &parsers::registry(), mode)
 }
 
 /// [`deattribute_bytes`] with the probe registry supplied, so an archive builds
 /// it once for all of its entries.
-pub(super) fn deattribute_with(name: &str, data: &[u8], registry: &Registry) -> MemOutcome {
+pub(super) fn deattribute_with_mode(
+    name: &str,
+    data: &[u8],
+    registry: &Registry,
+    mode: Mode,
+) -> MemOutcome {
     let view = SliceView::new(name, data);
     let mut report = FileReport::new(view.path.clone(), data.len() as u64);
     let mut panicked = false;
@@ -143,7 +152,7 @@ pub(super) fn deattribute_with(name: &str, data: &[u8], registry: &Registry) -> 
     report.findings = findings;
     report.partial = panicked;
 
-    let file_plan = match guard::guarded(|| plan(&report, &view)) {
+    let file_plan = match guard::guarded(|| plan_mode(&report, &view, mode)) {
         Ok(p) => p,
         Err(()) => {
             return MemOutcome {
@@ -178,7 +187,15 @@ pub(super) fn deattribute_with(name: &str, data: &[u8], registry: &Registry) -> 
             note(&mut out.skipped, Reason::Changed);
             continue;
         }
-        buf.get_or_insert_with(|| data.to_vec())[span].fill(fill);
+        if let Some(replacement) = &target.replacement {
+            if replacement.len() != span.len() {
+                note(&mut out.skipped, Reason::Unsafe);
+                continue;
+            }
+            buf.get_or_insert_with(|| data.to_vec())[span].copy_from_slice(replacement);
+        } else {
+            buf.get_or_insert_with(|| data.to_vec())[span].fill(fill);
+        }
         match target.kind {
             Kind::Brand => out.brand += 1,
             Kind::Patch => out.patch += 1,

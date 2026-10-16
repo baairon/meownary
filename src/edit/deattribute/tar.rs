@@ -1,8 +1,13 @@
 //! tar and tar.gz deattribution. Each regular file inside is handed to
-//! [`deattribute_bytes`]; an entry that comes back changed has its data region
-//! overwritten in place, and since the length never changes the header, the
-//! padding and every other entry stay byte for byte as they were. A `.tar.gz`
-//! is inflated, cleaned the same way and deflated again into one member.
+//! [`deattribute_bytes`](super::mem::deattribute_bytes); an entry that comes
+//! back changed has only its changed bytes overwritten in place, and since the
+//! length never changes the header, the padding and every other entry stay
+//! byte for byte as they were. A `.tar.gz` is inflated, cleaned the same way
+//! and deflated again into one member.
+//!
+//! Sparse entries are skipped as `unsupported entry`, a nested archive is named
+//! and never opened, and a walk that stops at a header it cannot read names the
+//! rest of the archive instead of passing over it quietly.
 //!
 //! The original is only ever read. The copy goes through a temp file beside it
 //! and is renamed over the copy path, so a failure leaves nothing behind.
@@ -19,7 +24,7 @@ use crate::edit::engine::EditError;
 use crate::edit::fsio;
 
 use super::Reason;
-use super::mem::{ArchiveOutcome, deattribute_bytes};
+use super::mem::{ArchiveOutcome, deattribute_with_mode};
 
 const BLOCK: u64 = 512;
 const CHKSUM: usize = 148;
@@ -27,6 +32,11 @@ const CHKSUM: usize = 148;
 const META_MAX: u64 = 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const DEFLATE_LEVEL: u8 = 6;
+/// Unchanged stretches shorter than this between two changed ones are folded
+/// into a single patch.
+const RUN_GAP: usize = 16;
+/// The skip name for everything past a header the walk could not read.
+pub(super) const TAIL: &str = "<rest of archive>";
 
 #[derive(Debug, Clone, Copy)]
 struct Limits {
@@ -74,22 +84,63 @@ fn is_copy(path: &Path) -> bool {
 
 /// Write the deattributed copy of the tar (`gz` false) or tar.gz (`gz` true) at
 /// `original` to `out`. `Ok(None)` means nothing inside had anything to blank
-/// (or the input is not a tar), and nothing is written.
+/// or to report (or the input is not a tar), and nothing is written. An outcome
+/// with `entries_cleaned == 0` carries skips only, and nothing is written
+/// either.
 pub fn deattribute_tar(
     original: &Path,
     gz: bool,
     out: &Path,
 ) -> Result<Option<ArchiveOutcome>, EditError> {
-    run(original, gz, Some(out), LIMITS)
+    deattribute_tar_mode(original, gz, out, super::Mode::Basic)
+}
+
+pub fn deattribute_tar_mode(
+    original: &Path,
+    gz: bool,
+    out: &Path,
+    mode: super::Mode,
+) -> Result<Option<ArchiveOutcome>, EditError> {
+    run_mode(original, gz, Some(out), LIMITS, mode)
 }
 
 /// The same work as [`deattribute_tar`] without writing anything. The outcome's
 /// `output` is [`copy_name`] of the original.
 pub fn plan_tar(original: &Path, gz: bool) -> Result<Option<ArchiveOutcome>, EditError> {
-    run(original, gz, None, LIMITS)
+    plan_tar_mode(original, gz, super::Mode::Basic)
 }
 
-/// One entry's replacement data and where it goes in the (uncompressed) tar.
+pub fn plan_tar_mode(
+    original: &Path,
+    gz: bool,
+    mode: super::Mode,
+) -> Result<Option<ArchiveOutcome>, EditError> {
+    run_mode(original, gz, None, LIMITS, mode)
+}
+
+/// Whether cleaning the copy at `output` again in `mode` would change no entry.
+pub fn verify_copy(output: &Path, gz: bool, mode: super::Mode) -> bool {
+    let found = if gz {
+        let Ok(data) = fs::read(output) else {
+            return false;
+        };
+        gunzip(&data, LIMITS).and_then(|tar| {
+            let len = tar.len() as u64;
+            scan_mode(&mut Cursor::new(&tar), len, LIMITS, mode)
+        })
+    } else {
+        let Ok(mut file) = File::open(output) else {
+            return false;
+        };
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        scan_mode(&mut file, meta.len(), LIMITS, mode)
+    };
+    matches!(found, Ok(Some(scan)) if scan.patches.is_empty())
+}
+
+/// One changed stretch of an entry and where it goes in the (uncompressed) tar.
 struct Patch {
     offset: u64,
     bytes: Vec<u8>,
@@ -98,19 +149,22 @@ struct Patch {
 #[derive(Default)]
 struct Scan {
     patches: Vec<Patch>,
+    /// Entries with at least one patch.
+    entries: usize,
     brand: usize,
     patch: usize,
     skipped: Vec<(String, Reason)>,
 }
 
 impl Scan {
+    /// `None` when there is nothing to write and nothing to report.
     fn outcome(self, output: PathBuf) -> Option<ArchiveOutcome> {
-        if self.patches.is_empty() {
+        if self.patches.is_empty() && self.skipped.is_empty() {
             return None;
         }
         Some(ArchiveOutcome {
             output,
-            entries_cleaned: self.patches.len(),
+            entries_cleaned: self.entries,
             brand: self.brand,
             patch: self.patch,
             skipped: self.skipped,
@@ -118,11 +172,22 @@ impl Scan {
     }
 }
 
+#[cfg(test)]
 fn run(
     original: &Path,
     gz: bool,
     out: Option<&Path>,
     limits: Limits,
+) -> Result<Option<ArchiveOutcome>, EditError> {
+    run_mode(original, gz, out, limits, super::Mode::Basic)
+}
+
+fn run_mode(
+    original: &Path,
+    gz: bool,
+    out: Option<&Path>,
+    limits: Limits,
+    mode: super::Mode,
 ) -> Result<Option<ArchiveOutcome>, EditError> {
     if is_copy(original) {
         return Err(EditError::Refused(
@@ -137,24 +202,20 @@ fn run(
         return Err(EditError::Refused("not a regular file".into()));
     }
     if let Some(out) = out {
-        match fs::symlink_metadata(out) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return Err(EditError::Symlink(out.to_path_buf()));
-            }
-            Ok(m) if !m.is_file() => {
-                return Err(EditError::Refused(
-                    "the copy's path is taken by something that is not a file".into(),
-                ));
-            }
-            _ => {}
-        }
+        super::check_output(out)?;
     }
     let output = out.map_or_else(|| copy_name(original), Path::to_path_buf);
     if gz {
-        run_gz(original, &meta, out, output, limits)
+        run_gz(original, &meta, out, output, limits, mode)
     } else {
-        run_plain(original, &meta, out, output, limits)
+        run_plain(original, &meta, out, output, limits, mode)
     }
+}
+
+/// Whether `now` still describes the file `then` was read from: same length and
+/// modification time.
+fn unchanged(then: &fs::Metadata, now: &fs::Metadata) -> bool {
+    now.len() == then.len() && now.modified().ok() == then.modified().ok()
 }
 
 fn run_plain(
@@ -163,24 +224,31 @@ fn run_plain(
     out: Option<&Path>,
     output: PathBuf,
     limits: Limits,
+    mode: super::Mode,
 ) -> Result<Option<ArchiveOutcome>, EditError> {
     let size = meta.len();
     if size > limits.total {
         return Err(too_big(limits));
     }
     let mut src = File::open(original)?;
-    let Some(scan) = scan(&mut src, size, limits)? else {
+    if !unchanged(meta, &src.metadata()?) {
+        return Err(EditError::Changed);
+    }
+    let Some(scan) = scan_mode(&mut src, size, limits, mode)? else {
         return Ok(None);
     };
     let Some(out) = out else {
         return Ok(scan.outcome(output));
     };
     if scan.patches.is_empty() {
-        return Ok(None);
+        return Ok(scan.outcome(output));
     }
     let (tmp, file) = fsio::create_temp_beside(out)?;
     let result = (|| {
         copy_plain(&mut src, file, &scan.patches, size)?;
+        if !fs::metadata(original).is_ok_and(|now| unchanged(meta, &now)) {
+            return Err(EditError::Changed);
+        }
         finish(&tmp, out, meta)
     })();
     match result {
@@ -217,31 +285,34 @@ fn run_gz(
     out: Option<&Path>,
     output: PathBuf,
     limits: Limits,
+    mode: super::Mode,
 ) -> Result<Option<ArchiveOutcome>, EditError> {
     if meta.len() > limits.total {
         return Err(too_big(limits));
     }
     let data = fs::read(original)?;
-    if data.len() as u64 != meta.len() {
+    if data.len() as u64 != meta.len()
+        || !fs::metadata(original).is_ok_and(|now| unchanged(meta, &now))
+    {
         return Err(EditError::Changed);
     }
-    let (head, mut tar) = gunzip(&data, limits)?;
+    let mut tar = gunzip(&data, limits)?;
     drop(data);
     let tar_len = tar.len() as u64;
-    let Some(scan) = scan(&mut Cursor::new(&tar), tar_len, limits)? else {
+    let Some(scan) = scan_mode(&mut Cursor::new(&tar), tar_len, limits, mode)? else {
         return Ok(None);
     };
     let Some(out) = out else {
         return Ok(scan.outcome(output));
     };
     if scan.patches.is_empty() {
-        return Ok(None);
+        return Ok(scan.outcome(output));
     }
     for p in &scan.patches {
         let at = p.offset as usize;
         tar[at..at + p.bytes.len()].copy_from_slice(&p.bytes);
     }
-    let packed = gzip(&head, &tar);
+    let packed = gzip(&tar);
     drop(tar);
     let (tmp, mut file) = fsio::create_temp_beside(out)?;
     let result = (|| {
@@ -259,20 +330,46 @@ fn run_gz(
     }
 }
 
-/// Keep the original's mode, rename the temp file over the copy and sync the
-/// folder.
-fn finish(tmp: &Path, out: &Path, meta: &fs::Metadata) -> Result<(), EditError> {
-    // Keep the original's mode (an executable stays executable). Windows only
-    // has a read-only bit, which would block the next run's replace, so it is
-    // left clear there.
+/// Give the temp file the original's mode, rename it over the copy and sync the
+/// folder. The zip writer finishes its copies here too.
+pub(super) fn finish(tmp: &Path, out: &Path, meta: &fs::Metadata) -> Result<(), EditError> {
+    // Keep the original's mode (an executable stays executable) but never
+    // setuid or setgid. Windows only has a read-only bit, which would block the
+    // next run's replace, so it is left clear there.
     #[cfg(unix)]
-    fs::set_permissions(tmp, meta.permissions())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o1777;
+        fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
+    }
     #[cfg(not(unix))]
     let _ = meta;
+    clear_read_only(out)?;
     fs::rename(tmp, out)?;
     if let Some(dir) = out.parent() {
         fsio::sync_dir(dir);
     }
+    Ok(())
+}
+
+/// Windows refuses to rename over a read-only file, so an older copy left
+/// read-only would wedge every later run; its bit is cleared first. Elsewhere
+/// the folder's permissions decide and nothing is needed.
+fn clear_read_only(out: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        if let Ok(m) = fs::symlink_metadata(out)
+            && m.is_file()
+            && m.permissions().readonly()
+        {
+            let mut perms = m.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(out, perms)?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = out;
     Ok(())
 }
 
@@ -320,7 +417,7 @@ fn number(field: &[u8]) -> Option<u64> {
 
 /// Whether the stored checksum matches the sum of the header bytes with the
 /// checksum field read as spaces, summed unsigned or (as old tars did) signed.
-fn header_ok(h: &[u8; 512]) -> bool {
+pub(super) fn header_ok(h: &[u8; 512]) -> bool {
     let Some(stored) = number(&h[CHKSUM..CHKSUM + 8]) else {
         return false;
     };
@@ -360,6 +457,8 @@ fn header_name(h: &[u8; 512]) -> String {
 struct Pax {
     path: Option<String>,
     size: Option<u64>,
+    /// Any `GNU.sparse.*` key: the entry's data is a sparse map, not the file.
+    sparse: bool,
 }
 
 impl Pax {
@@ -394,129 +493,344 @@ impl Pax {
                         .ok()
                         .and_then(|s| s.trim().parse().ok());
                 }
+                key if key.starts_with(b"GNU.sparse.") => self.sparse = true,
                 _ => {}
             }
         }
     }
 }
 
-fn read_at<R: Read + Seek>(r: &mut R, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    r.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
+/// Somewhere a tar is read from front to back.
+pub(super) trait Source {
+    /// Fill `buf` as far as the source allows; short only at its end.
+    fn fill(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Move `len` bytes forward; `false` when the source ends first.
+    fn skip(&mut self, len: u64) -> io::Result<bool>;
+    /// Bytes read or skipped so far.
+    fn pos(&self) -> u64;
+    /// Bytes left, when the length is known up front.
+    fn remaining(&self) -> Option<u64>;
 }
 
-/// Offset of the next header after `size` data bytes at `data_off`, or `None`
-/// when the data runs past the end or the arithmetic overflows.
-fn skip_to(data_off: u64, size: u64, total: u64) -> Option<u64> {
-    let end = data_off.checked_add(size)?;
-    if end > total {
-        return None;
+/// A tar of known length that can seek: a file or an inflated buffer.
+pub(super) struct Seekable<R> {
+    inner: R,
+    pos: u64,
+    total: u64,
+}
+
+impl<R: Read + Seek> Seekable<R> {
+    pub(super) fn new(mut inner: R, total: u64) -> io::Result<Self> {
+        inner.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            inner,
+            pos: 0,
+            total,
+        })
     }
-    size.checked_add(BLOCK - 1)
-        .map(|s| s / BLOCK * BLOCK)
-        .and_then(|padded| data_off.checked_add(padded))
 }
 
-/// Walk the headers of a tar `total` bytes long and collect the replacement data
-/// for every regular file that has a credit. `Ok(None)` when the first block is
-/// not a tar header. A bad checksum, a truncated entry or the end-of-archive
-/// block stops the walk; everything before it still counts.
-fn scan<R: Read + Seek>(r: &mut R, total: u64, limits: Limits) -> Result<Option<Scan>, EditError> {
-    let mut scan = Scan::default();
+impl<R: Read + Seek> Source for Seekable<R> {
+    fn fill(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.total - self.pos;
+        let n = usize::try_from(left).map_or(buf.len(), |left| left.min(buf.len()));
+        self.inner.read_exact(&mut buf[..n])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn skip(&mut self, len: u64) -> io::Result<bool> {
+        match self.pos.checked_add(len).filter(|&end| end <= self.total) {
+            Some(end) => {
+                self.inner.seek(SeekFrom::Start(end))?;
+                self.pos = end;
+                Ok(true)
+            }
+            None => {
+                self.pos = self.total;
+                Ok(false)
+            }
+        }
+    }
+
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    fn remaining(&self) -> Option<u64> {
+        Some(self.total - self.pos)
+    }
+}
+
+/// A tar read front to back with no length known, such as one still inflating.
+pub(super) struct Stream<R> {
+    inner: R,
+    pos: u64,
+}
+
+impl<R: Read> Stream<R> {
+    pub(super) fn new(inner: R) -> Self {
+        Self { inner, pos: 0 }
+    }
+}
+
+impl<R: Read> Source for Stream<R> {
+    fn fill(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut n = 0;
+        while n < buf.len() {
+            match self.inner.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn skip(&mut self, len: u64) -> io::Result<bool> {
+        let n = io::copy(&mut (&mut self.inner).take(len), &mut io::sink())?;
+        self.pos += n;
+        Ok(n == len)
+    }
+
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    fn remaining(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// One entry, with pax and GNU long-name records already applied.
+pub(super) struct Header {
+    pub(super) name: String,
+    pub(super) flag: u8,
+    /// Data bytes that follow the header (and any sparse extension blocks).
+    pub(super) size: u64,
+    /// GNU sparse (type `S`, or pax `GNU.sparse.*` keys): the data is packed
+    /// chunks, not the file as it reads.
+    pub(super) sparse: bool,
+}
+
+impl Header {
+    /// Whether the entry is a file (regular, contiguous or sparse) rather than
+    /// a link, folder, device or tar bookkeeping.
+    pub(super) fn is_file(&self) -> bool {
+        matches!(self.flag, 0 | b'0' | b'7' | b'S') && !self.name.ends_with('/')
+    }
+}
+
+/// Where a walk stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stop {
+    /// The end-of-archive block, or the end of the input between entries.
+    End,
+    /// A header that does not check out, or an entry cut short.
+    Tail,
+}
+
+/// Size rounded up to whole blocks.
+fn padded(size: u64) -> Option<u64> {
+    size.checked_add(BLOCK - 1).map(|s| s / BLOCK * BLOCK)
+}
+
+/// Walk every entry in `src`, handing each header to `visit` with the source
+/// at the entry's data. `visit` returns whether it read all `size` data bytes;
+/// the walk skips them otherwise, so links, folders and devices that carry a
+/// size are passed over by it without being read. `Ok(None)` when the first
+/// block is not a tar header.
+pub(super) fn walk<S: Source>(
+    src: &mut S,
+    mut visit: impl FnMut(&Header, &mut S) -> Result<bool, EditError>,
+) -> Result<Option<Stop>, EditError> {
     let mut global = Pax::default();
     let mut next_pax = Pax::default();
     let mut long_name: Option<String> = None;
-    let mut off = 0u64;
     let mut first = true;
-    while off.checked_add(BLOCK).is_some_and(|end| end <= total) {
-        let h: [u8; 512] = read_at(r, off, BLOCK as usize)?
-            .try_into()
-            .map_err(|_| io::Error::other("short tar block"))?;
-        if h.iter().all(|&b| b == 0) || !header_ok(&h) {
-            if first {
-                return Ok(None);
-            }
-            break;
+    let mut h = [0u8; BLOCK as usize];
+    loop {
+        let got = src.fill(&mut h)?;
+        let end = h[..got].iter().all(|&b| b == 0);
+        if got < h.len() || end || !header_ok(&h) {
+            return Ok(match (first, end) {
+                (true, _) => None,
+                (false, true) => Some(Stop::End),
+                (false, false) => Some(Stop::Tail),
+            });
         }
         first = false;
         let Some(hsize) = number(&h[124..136]) else {
-            break;
+            return Ok(Some(Stop::Tail));
         };
         let flag = h[156];
-        let data_off = off + BLOCK;
         if matches!(flag, b'L' | b'K' | b'x' | b'g') {
-            let Some(next) = skip_to(data_off, hsize, total) else {
-                break;
+            let Some(mut rest) = padded(hsize) else {
+                return Ok(Some(Stop::Tail));
             };
             if hsize <= META_MAX {
-                let data = read_at(r, data_off, hsize as usize)?;
+                let mut data = vec![0u8; hsize as usize];
+                if src.fill(&mut data)? < data.len() {
+                    return Ok(Some(Stop::Tail));
+                }
                 match flag {
                     b'L' => long_name = Some(cstr_lossy(&data)),
                     b'x' => next_pax.parse(&data),
                     b'g' => global.parse(&data),
                     _ => {}
                 }
+                rest -= hsize;
             }
-            off = next;
+            if !src.skip(rest)? {
+                return Ok(Some(Stop::Tail));
+            }
             continue;
         }
         let pax = std::mem::take(&mut next_pax);
-        let size = match flag {
-            b'1' | b'2' | b'5' => 0,
-            _ => pax.size.or(global.size).unwrap_or(hsize),
-        };
+        let sparse = flag == b'S' || pax.sparse;
+        let size = pax.size.or(global.size).unwrap_or(hsize);
         let name = pax
             .path
             .or_else(|| long_name.take())
             .or_else(|| global.path.clone())
             .unwrap_or_else(|| header_name(&h));
         long_name = None;
-        let Some(next) = skip_to(data_off, size, total) else {
-            break;
-        };
-        let regular = matches!(flag, 0 | b'0' | b'7') && !name.ends_with('/');
-        if regular && size > 0 {
-            if size > limits.entry {
-                scan.skipped.push((name, Reason::EntryTooLarge));
-            } else {
-                let data = read_at(r, data_off, size as usize)?;
-                let outcome = deattribute_bytes(&name, &data);
-                scan.skipped.extend(
-                    outcome
-                        .skipped
-                        .into_iter()
-                        .map(|reason| (name.clone(), reason)),
-                );
-                if let Some(bytes) = outcome.bytes
-                    && bytes.len() == data.len()
-                {
-                    scan.brand += outcome.brand;
-                    scan.patch += outcome.patch;
-                    scan.patches.push(Patch {
-                        offset: data_off,
-                        bytes,
-                    });
+        if flag == b'S' && h[482] != 0 {
+            // Old GNU sparse: more chunk maps follow in extension blocks, each
+            // flagging at byte 504 whether another one comes after it.
+            let mut ext = [0u8; BLOCK as usize];
+            loop {
+                if src.fill(&mut ext)? < ext.len() {
+                    return Ok(Some(Stop::Tail));
+                }
+                if ext[504] == 0 {
+                    break;
                 }
             }
         }
-        off = next;
+        let Some(pad) = padded(size) else {
+            return Ok(Some(Stop::Tail));
+        };
+        if src.remaining().is_some_and(|left| left < size) {
+            return Ok(Some(Stop::Tail));
+        }
+        let header = Header {
+            name,
+            flag,
+            size,
+            sparse,
+        };
+        if !visit(&header, src)? && !src.skip(size)? {
+            return Ok(Some(Stop::Tail));
+        }
+        // A last entry without its padding loses nothing.
+        if !src.skip(pad - size)? {
+            return Ok(Some(Stop::End));
+        }
     }
-    Ok(Some(scan))
+}
+
+/// Walk the headers of a tar `total` bytes long and collect the changed bytes
+/// of every regular file that has a credit. `Ok(None)` when the first block is
+/// not a tar header. A bad checksum or a truncated entry stops the walk and is
+/// named as the rest of the archive; everything before it still counts.
+#[cfg(test)]
+fn scan<R: Read + Seek>(r: &mut R, total: u64, limits: Limits) -> Result<Option<Scan>, EditError> {
+    scan_mode(r, total, limits, super::Mode::Basic)
+}
+
+fn scan_mode<R: Read + Seek>(
+    r: &mut R,
+    total: u64,
+    limits: Limits,
+    mode: super::Mode,
+) -> Result<Option<Scan>, EditError> {
+    let registry = crate::parsers::registry();
+    let mut src = Seekable::new(r, total)?;
+    let mut scan = Scan::default();
+    let stop = walk(&mut src, |entry, src| {
+        if !entry.is_file() || entry.size == 0 {
+            return Ok(false);
+        }
+        let name = &entry.name;
+        if entry.sparse {
+            scan.skipped.push((name.clone(), Reason::UnsupportedEntry));
+            return Ok(false);
+        }
+        if entry.size > limits.entry {
+            scan.skipped.push((name.clone(), Reason::EntryTooLarge));
+            return Ok(false);
+        }
+        let at = src.pos();
+        let mut data = vec![0u8; entry.size as usize];
+        if src.fill(&mut data)? < data.len() {
+            return Err(EditError::Changed);
+        }
+        let file_name = name.rsplit('/').next().unwrap_or(name);
+        let outcome = deattribute_with_mode(file_name, &data, &registry, mode);
+        if super::zip::nested(&outcome, file_name, &data) {
+            scan.skipped.push((name.clone(), Reason::NestedArchive));
+        }
+        for &reason in &outcome.skipped {
+            scan.skipped.push((name.clone(), reason));
+        }
+        if let Some(bytes) = outcome.bytes
+            && bytes.len() == data.len()
+        {
+            let runs = changed_runs(at, &data, &bytes);
+            if !runs.is_empty() {
+                scan.entries += 1;
+                scan.brand += outcome.brand;
+                scan.patch += outcome.patch;
+                scan.patches.extend(runs);
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(stop.map(|stop| {
+        if stop == Stop::Tail {
+            scan.skipped.push((TAIL.into(), Reason::ArchiveTail));
+        }
+        scan
+    }))
+}
+
+/// The stretches where `new` differs from `old` (same length) as patches at
+/// `at`, with short unchanged gaps folded in, so a patch holds only what moved
+/// and not the whole entry.
+fn changed_runs(at: u64, old: &[u8], new: &[u8]) -> Vec<Patch> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < old.len() {
+        if old[i] == new[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        let mut j = end;
+        while j < old.len() && j - end < RUN_GAP {
+            if old[j] != new[j] {
+                end = j + 1;
+            }
+            j += 1;
+        }
+        out.push(Patch {
+            offset: at + start as u64,
+            bytes: new[start..end].to_vec(),
+        });
+        i = end;
+    }
+    out
 }
 
 // ---- gzip -----------------------------------------------------------------
 
-/// The parts of the first gzip header the rewritten member keeps.
-struct GzHead {
-    mtime: [u8; 4],
-    os: u8,
-}
-
-/// Parse one member header; returns the kept fields and the header's length.
-/// FEXTRA, FNAME, FCOMMENT and FHCRC are skipped over, not kept.
-fn gz_header(d: &[u8]) -> Option<(GzHead, usize)> {
+/// The length of one member header. FEXTRA, FNAME, FCOMMENT and FHCRC are
+/// skipped over, never kept.
+fn gz_header(d: &[u8]) -> Option<usize> {
     if d.len() < 10 || d[0] != 0x1F || d[1] != 0x8B || d[2] != 8 || d[3] & 0xE0 != 0 {
         return None;
     }
@@ -535,31 +849,23 @@ fn gz_header(d: &[u8]) -> Option<(GzHead, usize)> {
     if flg & 0x02 != 0 {
         pos = pos.checked_add(2)?;
     }
-    (pos <= d.len()).then(|| {
-        (
-            GzHead {
-                mtime: [d[4], d[5], d[6], d[7]],
-                os: d[9],
-            },
-            pos,
-        )
-    })
+    (pos <= d.len()).then_some(pos)
 }
 
 /// Inflate every member of a gzip file into one buffer, checking each member's
 /// CRC32 and ISIZE. Anything after the last member other than NUL padding is an
 /// error, since the rewritten file would silently drop it.
-fn gunzip(data: &[u8], limits: Limits) -> Result<(GzHead, Vec<u8>), EditError> {
+fn gunzip(data: &[u8], limits: Limits) -> Result<Vec<u8>, EditError> {
     let mut out = Vec::new();
-    let mut head = None;
+    let mut members = 0usize;
     let mut pos = 0usize;
     while pos < data.len() {
         let rest = &data[pos..];
-        if head.is_some() && rest.iter().all(|&b| b == 0) {
+        if members > 0 && rest.iter().all(|&b| b == 0) {
             break;
         }
-        let (h, hlen) = gz_header(rest).ok_or_else(|| corrupt("bad member header"))?;
-        head.get_or_insert(h);
+        let hlen = gz_header(rest).ok_or_else(|| corrupt("bad member header"))?;
+        members += 1;
         let body = &rest[hlen..];
         let start = out.len();
         let used = inflate_raw(body, &mut out, limits.total as usize)?;
@@ -574,7 +880,10 @@ fn gunzip(data: &[u8], limits: Limits) -> Result<(GzHead, Vec<u8>), EditError> {
         }
         pos += hlen + used + 8;
     }
-    head.map(|h| (h, out)).ok_or_else(|| corrupt("empty file"))
+    if members == 0 {
+        return Err(corrupt("empty file"));
+    }
+    Ok(out)
 }
 
 /// Inflate one raw deflate stream from the start of `input`, appending to
@@ -601,13 +910,14 @@ fn inflate_raw(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize, E
     }
 }
 
-/// One gzip member: the kept mtime and OS byte, no optional fields.
-fn gzip(head: &GzHead, tar: &[u8]) -> Vec<u8> {
+/// One gzip member however many the original had. Its header has no optional
+/// fields, an mtime of 0 and the "unknown" OS byte, so the copy carries neither
+/// the original's stored file name, comment or packing time nor the system it
+/// was packed on, and the same tar always packs to the same bytes.
+fn gzip(tar: &[u8]) -> Vec<u8> {
     let body = compress_to_vec(tar, DEFLATE_LEVEL);
     let mut out = Vec::with_capacity(body.len() + 18);
-    out.extend_from_slice(&[0x1F, 0x8B, 8, 0]);
-    out.extend_from_slice(&head.mtime);
-    out.extend_from_slice(&[0, head.os]);
+    out.extend_from_slice(&[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF]);
     out.extend_from_slice(&body);
     out.extend_from_slice(&crc32(tar).to_le_bytes());
     out.extend_from_slice(&(tar.len() as u32).to_le_bytes());
@@ -644,7 +954,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const CREDIT: &[u8] = b"patched by Invented\0";
@@ -653,7 +963,7 @@ mod tests {
         format!("{v:0w$o}\0", w = width - 1).into_bytes()
     }
 
-    fn header(name: &str, flag: u8, size: u64) -> [u8; 512] {
+    pub(crate) fn header(name: &str, flag: u8, size: u64) -> [u8; 512] {
         let mut h = [0u8; 512];
         h[..name.len()].copy_from_slice(name.as_bytes());
         h[100..108].copy_from_slice(&octal(0o644, 8));
@@ -665,12 +975,17 @@ mod tests {
         h[156] = flag;
         h[257..263].copy_from_slice(b"ustar\0");
         h[263..265].copy_from_slice(b"00");
-        let sum: u64 = h.iter().map(|&b| b as u64).sum();
-        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        rechecksum(&mut h);
         h
     }
 
-    fn entry(out: &mut Vec<u8>, name: &str, flag: u8, data: &[u8]) {
+    fn rechecksum(h: &mut [u8; 512]) {
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| b as u64).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    }
+
+    pub(crate) fn entry(out: &mut Vec<u8>, name: &str, flag: u8, data: &[u8]) {
         out.extend_from_slice(&header(name, flag, data.len() as u64));
         out.extend_from_slice(data);
         out.resize(out.len().next_multiple_of(512), 0);
@@ -685,14 +1000,14 @@ mod tests {
         format!("{len} {key}={value}\n").into_bytes()
     }
 
-    fn fake_pe() -> Vec<u8> {
+    pub(crate) fn fake_pe() -> Vec<u8> {
         let mut v = vec![0u8; 256];
         v[..16].copy_from_slice(b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00");
         v.extend_from_slice(CREDIT);
         v
     }
 
-    fn end(out: &mut Vec<u8>) {
+    pub(crate) fn end(out: &mut Vec<u8>) {
         out.resize(out.len() + 1024, 0);
     }
 
@@ -728,7 +1043,7 @@ mod tests {
     }
 
     /// Every header in `t` as (typeflag, size, data offset), checking checksums.
-    fn walk(t: &[u8]) -> Vec<(u8, u64, usize)> {
+    pub(crate) fn headers(t: &[u8]) -> Vec<(u8, u64, usize)> {
         let mut out = Vec::new();
         let mut off = 0usize;
         while off + 512 <= t.len() {
@@ -744,7 +1059,7 @@ mod tests {
         out
     }
 
-    fn gz_member(chunk: &[u8], extras: bool) -> Vec<u8> {
+    pub(crate) fn gz_member(chunk: &[u8], extras: bool) -> Vec<u8> {
         let mut m = vec![0x1F, 0x8B, 8];
         m.push(if extras { 0x08 | 0x10 } else { 0 });
         m.extend_from_slice(&0x1234_5678u32.to_le_bytes());
@@ -756,6 +1071,11 @@ mod tests {
         m.extend_from_slice(&crc32(chunk).to_le_bytes());
         m.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
         m
+    }
+
+    /// The tar inside a gzip copy.
+    pub(crate) fn inflate_copy(data: &[u8]) -> Vec<u8> {
+        gunzip(data, LIMITS).unwrap()
     }
 
     fn count(dir: &Path) -> usize {
@@ -814,8 +1134,8 @@ mod tests {
         assert_eq!(copy.len(), tar.len());
         assert!(!find(&copy, CREDIT));
         assert!(find(&tar, CREDIT));
-        let before = walk(&tar);
-        assert_eq!(walk(&copy), before, "same headers and sizes");
+        let before = headers(&tar);
+        assert_eq!(headers(&copy), before, "same headers and sizes");
         let pes: Vec<_> = before
             .iter()
             .filter(|e| e.1 == 276 && e.0 == b'0')
@@ -856,12 +1176,12 @@ mod tests {
 
         let copy = fs::read(&out).unwrap();
         assert_eq!(&copy[..4], &[0x1F, 0x8B, 8, 0], "no FNAME or FCOMMENT");
-        assert_eq!(&copy[4..8], &0x1234_5678u32.to_le_bytes(), "mtime kept");
-        assert_eq!(copy[9], 3, "OS byte kept");
+        assert_eq!(&copy[4..8], &[0; 4], "no packing time");
+        assert_eq!(copy[9], 0xFF, "no packing system");
         assert!(!find(&copy, b"Invented"));
-        let (_, inflated) = gunzip(&copy, LIMITS).unwrap();
+        let inflated = gunzip(&copy, LIMITS).unwrap();
         assert_eq!(inflated, want);
-        assert_eq!(walk(&inflated), walk(&tar));
+        assert_eq!(headers(&inflated), headers(&tar));
     }
 
     #[test]
@@ -908,7 +1228,9 @@ mod tests {
         let src = dir.path().join("a.tar");
         fs::write(&src, &tar).unwrap();
         let out = copy_name(&src);
-        assert!(run(&src, false, Some(&out), limits).unwrap().is_none());
+        let done = run(&src, false, Some(&out), limits).unwrap().unwrap();
+        assert_eq!(done.entries_cleaned, 0);
+        assert_eq!(done.skipped.len(), 3);
         assert!(!out.exists());
     }
 
@@ -1006,5 +1328,213 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_bad_checksum_mid_archive_names_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = Vec::new();
+        entry(&mut t, "first.exe", b'0', &fake_pe());
+        let broken = t.len();
+        entry(&mut t, "second.exe", b'0', &fake_pe());
+        end(&mut t);
+        t[broken] ^= 0x20;
+        let src = dir.path().join("a.tar");
+        fs::write(&src, &t).unwrap();
+        let out = copy_name(&src);
+        let done = deattribute_tar(&src, false, &out).unwrap().unwrap();
+        assert_eq!(done.entries_cleaned, 1);
+        assert_eq!(done.skipped, vec![(TAIL.to_string(), Reason::ArchiveTail)]);
+        let copy = fs::read(&out).unwrap();
+        assert_eq!(copy.len(), t.len());
+        assert!(!find(&copy[..broken], CREDIT));
+        assert_eq!(copy[broken..], t[broken..], "the unread rest is kept as is");
+    }
+
+    #[test]
+    fn a_truncated_entry_names_the_rest() {
+        let mut t = Vec::new();
+        entry(&mut t, "first.exe", b'0', &fake_pe());
+        t.extend_from_slice(&header("cut.exe", b'0', 4096));
+        t.extend_from_slice(&fake_pe());
+        let s = scan(&mut Cursor::new(&t), t.len() as u64, LIMITS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.entries, 1);
+        assert_eq!(s.skipped, vec![(TAIL.to_string(), Reason::ArchiveTail)]);
+    }
+
+    #[test]
+    fn gnu_sparse_entries_and_their_extension_blocks_are_skipped() {
+        let pe = fake_pe();
+        let mut t = Vec::new();
+        let mut h = header("holey.exe", b'S', pe.len() as u64);
+        h[257..265].copy_from_slice(b"ustar  \0");
+        h[482] = 1;
+        rechecksum(&mut h);
+        t.extend_from_slice(&h);
+        // One extension block holding a chunk map, with no further block after it.
+        let mut ext = [0u8; 512];
+        ext[..12].copy_from_slice(b"00000000000\0");
+        t.extend_from_slice(&ext);
+        t.extend_from_slice(&pe);
+        t.resize(t.len().next_multiple_of(512), 0);
+        entry(
+            &mut t,
+            "PaxHeader/y",
+            b'x',
+            &pax_record("GNU.sparse.major", "1"),
+        );
+        entry(&mut t, "paxsparse.exe", b'0', &pe);
+        entry(&mut t, "after.exe", b'0', &pe);
+        end(&mut t);
+        let s = scan(&mut Cursor::new(&t), t.len() as u64, LIMITS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.entries, 1, "only the entry after them is cleaned");
+        assert_eq!(
+            s.skipped,
+            vec![
+                ("holey.exe".to_string(), Reason::UnsupportedEntry),
+                ("paxsparse.exe".to_string(), Reason::UnsupportedEntry),
+            ]
+        );
+        let last = t.len() - 1024 - 512;
+        assert!(s.patches.iter().all(|p| p.offset as usize >= last));
+    }
+
+    #[test]
+    fn links_and_folders_with_a_size_are_passed_over_unread() {
+        let pe = fake_pe();
+        let mut t = Vec::new();
+        entry(&mut t, "hard.exe", b'1', &pe);
+        entry(&mut t, "soft.exe", b'2', b"");
+        entry(&mut t, "folder/", b'5', &pe);
+        let tail = t.len();
+        entry(&mut t, "real.exe", b'0', &pe);
+        end(&mut t);
+        let s = scan(&mut Cursor::new(&t), t.len() as u64, LIMITS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.entries, 1);
+        assert!(s.skipped.is_empty(), "{:?}", s.skipped);
+        assert!(s.patches.iter().all(|p| p.offset as usize > tail));
+    }
+
+    #[test]
+    fn patches_hold_only_the_changed_bytes() {
+        let tar = sample_tar();
+        let s = scan(&mut Cursor::new(&tar), tar.len() as u64, LIMITS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.entries, 3);
+        let held: usize = s.patches.iter().map(|p| p.bytes.len()).sum();
+        assert!(held <= 3 * CREDIT.len(), "{held} bytes held");
+        for p in &s.patches {
+            let at = p.offset as usize;
+            assert_ne!(tar[at], p.bytes[0]);
+            assert_ne!(tar[at + p.bytes.len() - 1], *p.bytes.last().unwrap());
+        }
+    }
+
+    #[test]
+    fn changed_runs_fold_short_gaps_and_split_long_ones() {
+        let old = [0u8; 64];
+        let mut new = old;
+        new[2] = 1;
+        new[5] = 1;
+        new[40] = 1;
+        let runs = changed_runs(100, &old, &new);
+        let got: Vec<_> = runs.iter().map(|p| (p.offset, p.bytes.len())).collect();
+        assert_eq!(got, [(102, 4), (140, 1)]);
+        assert!(changed_runs(0, &old, &old).is_empty());
+    }
+
+    #[test]
+    fn a_fresh_copy_verifies_and_the_original_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = sample_tar();
+        let plain = dir.path().join("v.tar");
+        let packed = dir.path().join("v.tar.gz");
+        fs::write(&plain, &tar).unwrap();
+        fs::write(&packed, gz_member(&tar, true)).unwrap();
+        for (src, gz) in [(&plain, false), (&packed, true)] {
+            let out = copy_name(src);
+            deattribute_tar(src, gz, &out).unwrap().unwrap();
+            assert!(verify_copy(&out, gz, super::super::Mode::Basic));
+            assert!(!verify_copy(src, gz, super::super::Mode::Basic));
+        }
+    }
+
+    #[test]
+    fn a_read_only_stale_copy_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("ro.tar");
+        let tar = sample_tar();
+        fs::write(&src, &tar).unwrap();
+        let out = copy_name(&src);
+        fs::write(&out, b"stale").unwrap();
+        let mut perms = fs::metadata(&out).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&out, perms).unwrap();
+
+        deattribute_tar(&src, false, &out).unwrap().unwrap();
+        let copy = fs::read(&out).unwrap();
+        assert_eq!(copy.len(), tar.len());
+        assert!(!find(&copy, CREDIT));
+        assert_eq!(count(dir.path()), 2, "no temp file is left");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_copy_never_gains_setuid_or_setgid() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("m.tar");
+        fs::write(&src, sample_tar()).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o6755)).unwrap();
+        let out = copy_name(&src);
+        deattribute_tar(&src, false, &out).unwrap().unwrap();
+        let mode = fs::metadata(&out).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn a_nested_archive_is_named_and_not_opened() {
+        use super::super::zip::tests::{build, item};
+        let inner = build(&[item("deep.exe", &fake_pe(), true)], b"");
+        let mut t = Vec::new();
+        entry(&mut t, "bundle/inner.zip", b'0', &inner);
+        end(&mut t);
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("n.tar");
+        fs::write(&src, &t).unwrap();
+        let out = copy_name(&src);
+        let done = deattribute_tar(&src, false, &out).unwrap().unwrap();
+        assert_eq!(done.entries_cleaned, 0);
+        assert_eq!(
+            done.skipped,
+            vec![("bundle/inner.zip".to_string(), Reason::NestedArchive)]
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn the_shared_walker_reads_streams_too() {
+        let tar = sample_tar();
+        let mut names = Vec::new();
+        let stop = walk(&mut Stream::new(&tar[..]), |h, _| {
+            if h.is_file() {
+                names.push(h.name.clone());
+            }
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(stop, Some(Stop::End));
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[3], "pax/dir/paxed.dll");
+        let cut = &tar[..tar.len() - 1024 - 300];
+        let stop = walk(&mut Stream::new(cut), |_, _| Ok(false)).unwrap();
+        assert_eq!(stop, Some(Stop::Tail));
     }
 }

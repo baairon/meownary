@@ -63,10 +63,17 @@ pub enum Reason {
     Changed,
     Io,
     /// An archive entry that cannot be read: encrypted, an unknown method,
-    /// ZIP64 or corrupt.
+    /// sparse or corrupt.
     UnsupportedEntry,
     /// An archive entry over the size limit.
     EntryTooLarge,
+    /// An archive inside an archive, which is never opened.
+    NestedArchive,
+    /// The rest of an archive past a header that could not be read.
+    ArchiveTail,
+    /// A signed package (APK, signed JAR, wheel, NuGet) whose signature the
+    /// copy would break.
+    SignedContainer,
 }
 
 impl Reason {
@@ -79,6 +86,9 @@ impl Reason {
             Self::Io => "io error",
             Self::UnsupportedEntry => "unsupported entry",
             Self::EntryTooLarge => "entry too large",
+            Self::NestedArchive => "nested archive",
+            Self::ArchiveTail => "rest of the archive is unreadable",
+            Self::SignedContainer => "signed package",
         }
     }
 }
@@ -513,15 +523,24 @@ pub fn deattribute_archive(
     kind: ArchiveKind,
     dry_run: bool,
 ) -> Result<ArchiveOutcome, EditError> {
+    deattribute_archive_mode(original, kind, dry_run, Mode::Basic)
+}
+
+pub fn deattribute_archive_mode(
+    original: &Path,
+    kind: ArchiveKind,
+    dry_run: bool,
+    mode: Mode,
+) -> Result<ArchiveOutcome, EditError> {
     let output = deattributed_name(original);
     let found = match kind {
-        ArchiveKind::Zip => return zip::deattribute_zip(original, &output, dry_run),
+        ArchiveKind::Zip => return zip::deattribute_zip_mode(original, &output, dry_run, mode),
         ArchiveKind::Tar | ArchiveKind::TarGz => {
             let gz = kind == ArchiveKind::TarGz;
             if dry_run {
-                tar::plan_tar(original, gz)?
+                tar::plan_tar_mode(original, gz, mode)?
             } else {
-                tar::deattribute_tar(original, gz, &output)?
+                tar::deattribute_tar_mode(original, gz, &output, mode)?
             }
         }
     };
@@ -674,6 +693,20 @@ pub fn verify_copy(
     Verified {
         clean: replanned.is_ok_and(|p| p.targets.is_empty()),
         partial: again.report.partial,
+    }
+}
+
+/// Check an archive copy from [`deattribute_archive_mode`]: it reads as the
+/// same kind of archive and cleaning it again in the same mode changes no entry.
+pub fn verify_archive_copy(output: &Path, kind: ArchiveKind, mode: Mode) -> Verified {
+    let clean = match kind {
+        ArchiveKind::Zip => zip::verify_copy(output, mode),
+        ArchiveKind::Tar => tar::verify_copy(output, false, mode),
+        ArchiveKind::TarGz => tar::verify_copy(output, true, mode),
+    };
+    Verified {
+        clean,
+        partial: false,
     }
 }
 
