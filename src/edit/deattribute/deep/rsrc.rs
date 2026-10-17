@@ -60,7 +60,7 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
             names.push(single_byte(&raw));
         }
         match &res.kind {
-            b"PiPL" => {
+            b"PiPL" | b"PIPL" => {
                 match read_full(view, res.off, res.len as usize)
                     .and_then(|raw| Pipl::parse(&raw, res.off))
                 {

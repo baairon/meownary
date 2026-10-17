@@ -136,7 +136,7 @@ inspect and test the copy before using it.
 
 | Format | Deep also changes |
 |---|---|
-| PE | strings in initialized data sections; string table, dialog and message table resources; the .NET `#US` heap, and the assembly's Company, Product, Title, Description and Copyright values, each rewritten to its own label; Adobe plug-in property lists (PiPL), where the plug-in name becomes `Effect`, a category naming the vendor becomes `Effects`, and an After Effects match name of 18 characters or more becomes a neutral id of the same length; the export directory's DLL name, rewritten to a neutral same-length `module` name; COFF, export, resource and debug timestamps; the PDB path and RSDS GUID, the image name in a MISC record, and an embedded portable PDB, cleared along with its debug entry; POGO, VC feature and REPRO debug records; the Authenticode directory, cleared so the copy is cleanly unsigned |
+| PE | recognized identity bytes in data and code sections and the overlay past them, including RTTI, exports, URLs, registry keys and licensing strings; parsed import DLL/function names and thunk tables stay byte-exact; string table, dialog and message table resources; the .NET `#US` heap and assembly attribution; Adobe plug-in property lists named `PiPL` or `PIPL`, with neutral effect names and same-length match ids of at least three characters; the export directory's DLL name, rewritten to a neutral same-length `module` name; build and debug stamps, PDB paths, and the Authenticode directory, cleared so the copy is unsigned |
 | ELF | strings in `.rodata`, `.data`, `.comment`, `.debug_str` and `.debug_line_str` |
 | Mach-O | strings in `__TEXT` `__cstring`, `__const`, `__ustring` and `__oslogstring`, and `__DATA` `__const` and `__data`; the source and object file paths of debug stabs; the embedded code signature, blanked with `LC_CODE_SIGNATURE` emptied so the copy is cleanly unsigned |
 | Resource fork | `STR ` and `STR#` strings and PiPL properties, in a raw Macintosh resource fork or an AppleDouble `._` file |
@@ -144,32 +144,26 @@ inspect and test the copy before using it.
 | Anything else | patch credits, copyright marks and build paths in NUL-terminated strings, only where the bytes around them do not look compressed or encrypted |
 
 A name counts when the file states it outright, in a copyright line, a version
-CompanyName, the export's module name, a .NET AssemblyCompany, a PiPL match
-name or a code signature's identifier, or when two independent hints agree:
-product names, manifest identities, PDB and image names, certificate names,
-link hosts and registry keys. An all-caps product mark counts once it appears
-three times, one of them in a class name or UI string. Each name is blanked
-where it stands as a whole word or a capitalized part of one, and the rest of
-the string stays readable: `Acme license expired` keeps `license expired`.
+CompanyName, the export's module name, a .NET AssemblyCompany, a PiPL field or
+a code signature's identifier, or when independent hints agree. In PE deep
+mode, registry and install paths can establish a vendor, and a product found
+in both a class and a display string can establish its name. Recognized names
+are removed wherever their readable bytes occur in PE sections or the overlay past them, including
+joined identifiers and UTF-16 strings, except inside parsed import names and thunk tables. This can
+break code and host linkage.
 
 Deep never touches:
 
-- code sections; in a PE, a name found in one is reported as
-  `identity in code`;
-- PE import tables, the export address, name and ordinal tables and their
-  forwarders, TLS, relocations, load config, exception tables, resource
-  directory nodes and names, RTTI names, PiPL entry points, or .NET metadata
-  besides the `#US` heap and those assembly values;
-- PE version resources, which the basic pass handles by key, or manifests;
+- PE structural fields such as import and export address arrays, parsed import
+  names and thunk tables, relocations, load config, and resource directory offsets;
 - ELF `.dynstr`, `.symtab`, `.dynamic`, notes, unwind data or Go build info;
 - Mach-O symbol names, `__LINKEDIT` data besides stab paths and the code
   signature, Objective-C class and selector names, or a section holding
   instructions;
 - the names of resources in a resource fork, which the host looks up;
-- URLs and registry keys, kept byte for byte even inside a string that is
-  cleaned around them.
+- URLs and registry keys outside PE files.
 
-Outside the structures above, a string is swept only when it stands alone:
+Outside PE deep mode and the structures above, a string is swept only when it stands alone:
 between NUL bytes as UTF-8, Windows ANSI or UTF-16 text of up to 65,536
 characters, or as a short string led by its own length byte. Text embedded in
 a larger blob is left as it is.
@@ -243,9 +237,9 @@ reports `nothing to blank inside the archive`.
 | `unsafe edit` | the blank is not rated safe, it overlaps a blank with another fill, planning failed internally, or the copy's path is a symbolic link or not a file |
 | `changed since scan` | the original's size or bytes changed after planning |
 | `io error` | the walk could not read the file (a cloud-only placeholder is never opened), the original could not be opened, or the copy could not be written |
-| `identity in code` | a vendor or product name the deep sweep found sits in a PE code section, which it never edits |
-| `functional name kept` | a name the deep sweep found is part of an import, export, RTTI class name, plug-in entry point or resource name, which stays byte for byte |
-| `functional value kept` | a name the deep sweep found is part of a URL or registry key, which stays byte for byte |
+| `identity in code` | a non-PE sweep found an identity in code it cannot edit |
+| `functional name kept` | a name in a resource fork or other protected linkage could not be edited |
+| `functional value kept` | a URL or registry key outside PE deep mode was kept |
 | `malformed metadata` | a structure that can name the vendor (a PiPL list, .NET metadata, an embedded PDB, a code signature, a resource map) could not be read safely, so it is left as it is |
 | `deep scan budget reached` | the deep sweep stopped at its 256 MiB read limit, or a record was too large to read |
 | `unsupported entry` | an archive entry that is encrypted, ZIP64, corrupt or uses an unknown method |
@@ -278,8 +272,10 @@ encryption info.
 - Nothing printed names matched text, titles, notes, evidence or signature ids.
 - After writing, each copy is checked: it must be the original byte for byte
   apart from the planned spans, keep its format, and plan nothing more in the
-  same mode. An archive copy must read as the same kind of archive and clean to
-  nothing more. A copy that fails prints `verification incomplete for <copy>`.
+  same mode. A PE deep copy is also checked against readable identities learned
+  from its original, including code and overlay bytes. A name the sweep could not learn from the original is not checked. An archive copy must
+  read as the same kind of archive and clean to nothing more. A copy that fails
+  prints `verification incomplete for <copy>` and exits 75.
 - Exit 75 means some file was not fully read, planned, written or verified. It
   wins over exit 1, which means something matched and no copy was written.
 

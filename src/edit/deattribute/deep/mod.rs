@@ -1,9 +1,8 @@
-//! The opt-in deep pass. It sweeps the strings of whatever regions a format
-//! says hold plain data (never code, and never tables the loader resolves by
-//! content) for credits, licensing and vendor marks, and adds same-length
-//! rewrites of build fields for PE images. Every edit keeps the file's length
-//! and layout, so the copy still parses and disassembles even when it no
-//! longer loads.
+//! The opt-in deep pass. It sweeps native data for credits, licensing and
+//! vendor marks. PE images also replace learned identity bytes across their
+//! raw sections, including code and linkage names. Every edit keeps the
+//! file's length and layout, so the copy still parses even when it no longer
+//! loads.
 //!
 //! The sweep is a pure function of the file's bytes and format: it never looks
 //! at the file's name or path, iterates only ordered collections, and plans
@@ -48,6 +47,22 @@ pub(super) struct Deep {
     pub rewrites: Vec<Rewrite>,
     pub caveats: Vec<Caveat>,
     pub skipped: Vec<Reason>,
+    /// Readable identities learned from the original PE for copy verification.
+    pub audit_terms: BTreeSet<String>,
+}
+
+pub(super) fn residual_category(
+    original: &dyn FileView,
+    output: &dyn FileView,
+) -> Option<&'static str> {
+    let planned = pe::sweep(original);
+    pe::residual_category(output, &planned.audit_terms).or_else(|| {
+        planned
+            .skipped
+            .iter()
+            .any(|reason| matches!(reason, Reason::MalformedMetadata | Reason::DeepBudget))
+            .then_some("unreadable PE metadata")
+    })
 }
 
 /// One same-length rewrite: its kind, offset and new bytes.
@@ -144,6 +159,7 @@ pub(super) enum Encoding {
 pub(super) enum Source {
     Company,
     Product,
+    MatchName,
     Pdb,
     Manifest,
     Url,
@@ -196,9 +212,9 @@ fn single_byte(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Printable ASCII, or a byte of a multi-byte UTF-8 sequence.
+/// Printable ASCII, common line controls, or a byte of a multi-byte UTF-8 sequence.
 fn textual(b: u8) -> bool {
-    (0x20..=0x7e).contains(&b) || b >= 0x80
+    (0x20..=0x7e).contains(&b) || matches!(b, b'\t' | b'\n' | b'\r') || b >= 0x80
 }
 
 /// Collect the NUL-bounded strings of `bytes`, which sit at file offset
@@ -777,8 +793,8 @@ fn redaction_spans(text: &str, roots: &BTreeSet<String>) -> Vec<(usize, usize, K
     merged
 }
 
-/// Same-length replacements outside protected ranges. RTTI names are never
-/// edited: exception matching across modules compares them.
+/// Same-length replacements outside protected ranges. PE deep mode follows
+/// this conservative pass with its own raw identity replacement.
 fn redact_hits(hits: &[Hit], roots: &BTreeSet<String>, protected: &Protected) -> Vec<Rewrite> {
     hits.iter()
         .filter(|h| !h.text.starts_with(".?AV") && !h.text.starts_with(".?AU"))

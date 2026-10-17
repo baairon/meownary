@@ -225,18 +225,72 @@ fn deep_pe_blanks_correlated_strings_and_rewrites_build_fields() {
 }
 
 #[test]
-fn deep_pe_never_touches_code_imports_exports_or_rtti() {
+fn deep_pe_scrubs_readable_identity_in_code_linkage_and_rtti() {
     let source = pe_fixture(0x1234);
     let out = deep("x.dll", &source);
-    assert_eq!(&out[0xa00..0xc00], &source[0xa00..0xc00], "code section");
-    assert_eq!(&out[0x800..0x8c0], &source[0x800..0x8c0], "import tables");
-    assert_eq!(&out[0x320..0x330], &source[0x320..0x330], "exported name");
+    assert!(!has(&out[0xa00..0xc00], b"NovaFlow"), "code string");
+    assert_eq!(
+        &out[0x800..0x8c0],
+        &source[0x800..0x8c0],
+        "import descriptors, thunks, DLL name and function name"
+    );
+    assert!(!has(&out[0x320..0x330], b"NovaFlow"), "exported name");
     assert_eq!(&out[0x240..0x264], &source[0x240..0x264], "export arrays");
-    assert!(has(&out, b".?AVNovaFlowInternal@@"));
-    assert!(has(&out, b".?AVVFXQObject@@"));
+    assert!(!has(&out, b".?AVNovaFlowInternal@@"));
+    assert!(!has(&out, b".?AVVFXQObject@@"));
     assert!(
         has(&out, b"dispatched by the scheduler"),
         "word-bounded match"
+    );
+}
+
+#[test]
+fn deep_pe_scrubs_correlated_vendor_initials_in_identifiers() {
+    let mut source = pe_fixture(0x1234);
+    put(&mut source, 0x5c0, b"NFL_HOME_DIR\0");
+    put(&mut source, 0x600, b"NFL_SERVER\0");
+    put(&mut source, 0x620, b"failed to reach nflserver\n\0");
+    put(&mut source, 0x650, b"..\\OpenCL\\NFOpenCLMultiDevs.cpp\0");
+    put(&mut source, 0x690, b".?AVNFallocator@nf@@\0");
+    put(&mut source, 0xa60, b"NFL_QUIT_LIC_FAIL\0");
+    let out = deep("x.aex", &source);
+    for identity in [
+        b"NFL_HOME_DIR".as_slice(),
+        b"NFL_SERVER",
+        b"nflserver",
+        b"NFOpenCLMultiDevs",
+        b"NFallocator",
+        b"@nf@@",
+        b"NFL_QUIT_LIC_FAIL",
+    ] {
+        assert!(
+            !has(&out, identity),
+            "{}",
+            String::from_utf8_lossy(identity)
+        );
+    }
+    let terms = pe::sweep(&SliceView::new("x", &source)).audit_terms;
+    assert_eq!(
+        pe::residual_category(&SliceView::new("x", &out), &terms),
+        Some("PE data")
+    );
+}
+
+#[test]
+fn deep_pe_preserves_import_module_names_during_raw_identity_scrub() {
+    let mut source = pe_fixture(0x1234);
+    put(&mut source, 0x350, b"Copyright 2024 Basehost\0");
+    put(&mut source, 0x5c0, b"Basehost settings\0");
+    put(&mut source, 0x880, b"BASEHOST32.dll\0");
+
+    let out = deep("x.aex", &source);
+
+    assert_eq!(&out[0x880..0x880 + 15], b"BASEHOST32.dll\0");
+    assert!(!has(&out[0x5c0..0x5c0 + 17], b"Basehost"));
+    let terms = pe::sweep(&SliceView::new("x", &source)).audit_terms;
+    assert_eq!(
+        pe::residual_category(&SliceView::new("x", &out), &terms),
+        Some("PE data")
     );
 }
 
@@ -266,7 +320,7 @@ fn version_identity_cleans_length_prefixed_resource_text_without_erasing_message
 }
 
 #[test]
-fn manifest_url_and_registry_correlate_without_rewriting_functional_values() {
+fn manifest_url_and_registry_names_are_scrubbed_in_deep_mode() {
     let mut source = resource_pe("Microsoft", "Glimmer");
     let url = b"https://license.glimmer.example/activate\0";
     let key = b"HKCU\\Software\\Glimmer\\Settings\0";
@@ -278,17 +332,11 @@ fn manifest_url_and_registry_correlate_without_rewriting_functional_values() {
         b"Glimmer license invalid; retry later\0",
     );
     let out = deep("x.exe", &source);
-    assert!(has(&out, url), "URL kept byte-exact");
-    assert!(has(&out, key), "registry key kept byte-exact");
-    assert!(has(&out, b"Glimmer.Plugin"), "manifest identity kept");
+    assert!(!has(&out, url), "URL identity removed");
+    assert!(!has(&out, key), "registry identity removed");
+    assert!(!has(&out, b"Glimmer.Plugin"), "manifest identity removed");
     assert!(!has(&out[0x750..0x790], b"Glimmer license invalid"));
     assert!(has(&out[0x750..0x790], b"license invalid; retry later"));
-    assert!(
-        deattribute_bytes_mode("x.exe", &source, Mode::Deep)
-            .skipped
-            .contains(&Reason::FunctionalValue),
-        "the kept URL and key are reported"
-    );
     assert!(
         deattribute_bytes_mode("x.exe", &out, Mode::Deep)
             .bytes
@@ -327,13 +375,13 @@ fn one_weak_source_does_not_establish_a_root_and_mixed_messages_keep_endpoints()
 }
 
 #[test]
-fn a_resource_leaf_pointing_into_code_is_never_swept() {
+fn a_resource_leaf_pointing_into_code_does_not_block_code_string_scrubbing() {
     let mut source = resource_pe("Glimmer Labs", "Neutral");
     put_u32(&mut source, 0xc80, 0x2020);
     put_u32(&mut source, 0xc84, 80);
-    let code = &source[0xa00..0xc00];
     let out = deep("x.exe", &source);
-    assert_eq!(&out[0xa00..0xc00], code);
+    assert!(!has(&out[0xa00..0xc00], b"NovaFlow"));
+    assert!(PeImage::parse(&SliceView::new("x", &out)).is_some());
 }
 
 #[test]
@@ -753,11 +801,13 @@ fn read_full_refuses_ranges_past_the_file_before_allocating() {
 }
 
 #[test]
-fn identities_left_in_code_linkage_or_rtti_are_reported() {
+fn identities_in_code_linkage_and_rtti_are_removed() {
     let out = deattribute_bytes_mode("x.dll", &pe_fixture(0x1234), Mode::Deep);
-    assert!(out.skipped.contains(&Reason::IdentityInCode));
-    assert!(out.skipped.contains(&Reason::FunctionalName));
-    assert!(!out.skipped.contains(&Reason::FunctionalValue));
+    let bytes = out.bytes.expect("deep copy");
+    assert!(!has(&bytes[0x300..0x800], b"NovaFlow"));
+    assert!(!has(&bytes[0xa00..0xc00], b"NovaFlow"));
+    assert!(!out.skipped.contains(&Reason::IdentityInCode));
+    assert!(!out.skipped.contains(&Reason::FunctionalName));
 
     // With the identity only in display strings there is nothing to report.
     let mut quiet = pe_fixture(0x1234);
@@ -776,14 +826,18 @@ fn identities_left_in_code_linkage_or_rtti_are_reported() {
         assert!(!out.skipped.contains(&reason), "{reason:?}");
     }
 
-    // A class named after the vendor is a functional name too.
+    // A class named after the vendor is edited on the next source too.
     put(&mut quiet, 0x400, b".?AVNovaFlowInternal@@\0");
     let out = deattribute_bytes_mode("x.dll", &quiet, Mode::Deep);
-    assert!(out.skipped.contains(&Reason::FunctionalName));
+    assert!(!has(
+        &out.bytes.expect("deep copy")[0x400..0x420],
+        b"NovaFlow"
+    ));
+    assert!(!out.skipped.contains(&Reason::FunctionalName));
 }
 
 #[test]
-fn export_forwarders_inside_the_export_directory_stay_byte_exact() {
+fn export_forwarders_lose_the_identity_but_keep_their_framing() {
     let mut source = pe_fixture(0x1234);
     // The directory's range covers its arrays, names and one forwarder.
     put_u32(&mut source, OPT + 116, 0x140);
@@ -791,7 +845,8 @@ fn export_forwarders_inside_the_export_directory_stay_byte_exact() {
     let forwarder = b"NovaFlowCore.NovaFlowActivate\0";
     put(&mut source, 0x2c0, forwarder);
     let out = deep("x.dll", &source);
-    assert_eq!(&out[0x2c0..0x2c0 + forwarder.len()], forwarder);
+    assert!(!has(&out[0x2c0..0x2c0 + forwarder.len()], b"NovaFlow"));
+    assert_eq!(out[0x2c0 + forwarder.len() - 1], 0);
     assert!(has(&out, b"module_____.AEX\0"));
 }
 
@@ -992,7 +1047,7 @@ fn pipl_lists_parse_in_both_byte_orders_and_keep_entry_points() {
             [
                 ("NovaFlow Glow".to_string(), Source::Product),
                 ("Glimmer".to_string(), Source::Product),
-                ("Glimmer NovaFlow Glow".to_string(), Source::Company),
+                ("Glimmer NovaFlow Glow".to_string(), Source::MatchName),
             ]
         );
         let (rewrites, skipped) = list.rewrites(&BTreeSet::from(["glimmer".to_string()]));
@@ -1056,6 +1111,117 @@ fn a_pipl_resource_gets_neutral_names_and_a_derived_match_name() {
             .bytes
             .is_none()
     );
+}
+
+#[test]
+fn uppercase_pipl_and_short_match_name_are_scrubbed() {
+    let raw = pipl_list(
+        true,
+        &[
+            (b"kind", b"eFKT".to_vec()),
+            (b"name", pstr(b"NovaFlow")),
+            (b"eMNA", pstr(b"Nova")),
+            (b"8664", b"NovaFlowMain\0".to_vec()),
+        ],
+    );
+    let (mut source, at) = rsrc_pe(&[(Res::Named("PIPL"), raw.clone())]);
+    put(&mut source, 0x5c0, b"Software\\Glimmer\0");
+    put(&mut source, 0x600, b"C:\\Program Files\\GlimmerEffects\\\0");
+    put(&mut source, 0x680, b"https://wyday.example/limelm/api/\0");
+    put(&mut source, 0x720, &utf16z("Glimmer license"));
+    let out = deep("x.aex", &source);
+    let leaf = &out[at[0]..at[0] + raw.len()];
+    assert!(has(leaf, b"\x08Effect  "));
+    let id = find(&raw, b"\x04Nova") + 1;
+    assert!(leaf[id..id + 4].starts_with(b"de"));
+    assert!(!has(leaf, b"NovaFlow"));
+    assert!(!has(&out, b"Glimmer"));
+    assert!(!has(&out, b"wyday"));
+    assert!(!has(&out, b"limelm"));
+    assert!(!has(&out, &utf16z("Glimmer")[..14]));
+    assert!(PeImage::parse(&SliceView::new("x", &out)).is_some());
+    let terms = pe::sweep(&SliceView::new("x", &source)).audit_terms;
+    assert_eq!(
+        pe::residual_category(&SliceView::new("x", &out), &terms),
+        Some("PE data")
+    );
+    assert!(
+        deattribute_bytes_mode("x.aex", &out, Mode::Deep)
+            .bytes
+            .is_none()
+    );
+}
+
+#[test]
+fn class_and_display_strings_establish_a_product_missing_from_pipl() {
+    let raw = pipl_list(
+        true,
+        &[
+            (b"name", pstr(b"Motion Vectors: Create")),
+            (b"eMNA", pstr(b"Create Motion Vectors 3.x")),
+        ],
+    );
+    let (mut source, at) = rsrc_pe(&[(Res::Named("PIPL"), raw)]);
+    put(&mut source, 0x4f0, b".?AVRVTwixtor4@@\0");
+    put(&mut source, 0x5c0, b"Twixtor Pro GUI\0");
+    let out = deep("x.aex", &source);
+    assert!(!has(&out, b"Twixtor"));
+    assert!(!has(&out[at[0]..], b"Motion Vectors: Create"));
+    assert!(
+        deattribute_bytes_mode("x.aex", &out, Mode::Deep)
+            .bytes
+            .is_none()
+    );
+}
+
+#[test]
+fn malformed_uppercase_pipl_is_reported_and_overlay_identity_is_scrubbed() {
+    let (mut source, _) = rsrc_pe(&[(Res::Named("PIPL"), vec![1, 0, 0, 0, 0])]);
+    let result = deattribute_bytes_mode("x.aex", &source, Mode::Deep);
+    assert!(result.skipped.contains(&Reason::MalformedMetadata));
+    source.extend_from_slice(b"NovaFlow private build\0");
+    let out = deep("x.aex", &source);
+    assert!(
+        !has(&out[0xc00..], b"NovaFlow"),
+        "overlay identity scrubbed"
+    );
+    let terms = pe::sweep(&SliceView::new("x", &source)).audit_terms;
+    assert_eq!(
+        pe::residual_category(&SliceView::new("x", &out), &terms),
+        Some("PE data")
+    );
+}
+
+#[test]
+fn copy_verification_reports_identity_left_in_a_protected_import_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("example.aex");
+    let mut source = pe_fixture(0x1234);
+    source.extend_from_slice(b"NovaFlow private build\0");
+    std::fs::write(&path, &source).unwrap();
+    let report = crate::scan::scan_file_detailed(&path, &crate::parsers::registry()).report;
+    let view = crate::scan::WindowedFile::open(&path).unwrap();
+    let plan = crate::edit::deattribute::plan_mode(&report, &view, Mode::Deep);
+    drop(view);
+    let output = crate::edit::deattribute::write_deattributed(
+        &path,
+        report.format.as_deref(),
+        report.size,
+        &plan.targets,
+    )
+    .unwrap();
+    let verified = crate::edit::deattribute::verify_copy(
+        &path,
+        &output,
+        report.format.as_deref(),
+        &plan.targets,
+        Mode::Deep,
+    );
+    assert!(!verified.ok(), "{verified:?}");
+    assert_eq!(verified.residual, Some("PE data"));
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(!has(&bytes[0xc00..], b"NovaFlow"));
+    assert!(has(&bytes[0x880..0x8c0], b"NovaFlowCore.dll"));
 }
 
 /// CLR metadata whose assembly carries Company, Product and FileVersion

@@ -30,11 +30,12 @@ use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::decompress_to_vec_with_limit;
 
 use crate::parsers;
+use crate::parsers::pe::image::PeImage;
 use crate::scan::{WindowedFile, guard};
 use crate::util::bytes::{slice, u16_le, u32_le, u64_le};
 
 use super::mem::{ArchiveOutcome, MemOutcome, SliceView, deattribute_with_mode, is_container};
-use super::{Mode, Reason, check_output, is_deattributed};
+use super::{Mode, Reason, check_output, deep, is_deattributed};
 use crate::edit::{EditError, fsio};
 
 const LOCAL_SIG: &[u8] = b"PK\x03\x04";
@@ -246,12 +247,62 @@ pub fn zip_file_count(path: &Path) -> Option<usize> {
     )
 }
 
-/// Whether cleaning the copy at `output` again in `mode` would change no entry.
-pub fn verify_copy(output: &Path, mode: Mode) -> bool {
+/// Whether the copy is stable and its PE entries have no original identity left.
+pub fn verify_copy(original: &Path, output: &Path, mode: Mode) -> (bool, Option<&'static str>) {
     let Ok(data) = fs::read(output) else {
-        return false;
+        return (false, None);
     };
-    analyze_mode(&data, mode).is_ok_and(|found| found.changes.is_empty())
+    if !analyze_mode(&data, mode).is_ok_and(|found| found.changes.is_empty()) {
+        return (false, None);
+    }
+    if mode != Mode::Deep {
+        return (true, None);
+    }
+    let Ok(source) = fs::read(original) else {
+        return (false, None);
+    };
+    match pe_residual_in_entries(&source, &data) {
+        Ok(category) => (category.is_none(), category),
+        Err(()) => (false, None),
+    }
+}
+
+fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'static str>, ()> {
+    let entries = |data: &[u8]| {
+        let view = SliceView::new("archive.zip", data);
+        let arch = parsers::zip::parse(&view).ok_or(())?;
+        let central = read_central(data, &arch).map_err(|_| ())?;
+        Ok::<_, ()>((arch, central))
+    };
+    let (source_arch, source_entries) = entries(source)?;
+    let (output_arch, output_entries) = entries(output)?;
+    if source_entries.len() != output_entries.len() {
+        return Err(());
+    }
+    for (before, after) in source_entries.iter().zip(&output_entries) {
+        if before.name != after.name || before.size != after.size {
+            return Err(());
+        }
+        if before.dir || before.size > MAX_ENTRY || unsupported(before) {
+            continue;
+        }
+        let source_span = span_of(source, before, source_arch.cd_offset as usize).ok_or(())?;
+        let output_span = span_of(output, after, output_arch.cd_offset as usize).ok_or(())?;
+        let original_bytes = unpack(source, before, &source_span).ok_or(())?;
+        let copy_bytes = unpack(output, after, &output_span).ok_or(())?;
+        let original_view = SliceView::new(before.file_name(), &original_bytes);
+        if PeImage::parse(&original_view).is_none() {
+            continue;
+        }
+        let copy_view = SliceView::new(after.file_name(), &copy_bytes);
+        if PeImage::parse(&copy_view).is_none() {
+            return Err(());
+        }
+        if let Some(category) = deep::residual_category(&original_view, &copy_view) {
+            return Ok(Some(category));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether an entry that came back with nothing to blank is itself an archive,
@@ -1216,7 +1267,7 @@ pub(crate) mod tests {
         assert_eq!(rec, cd + u32_le(&copy, eocd + 12).unwrap() as usize);
         let (after, _) = read_back(&copy);
         assert!(!after[1].plain.windows(10).any(|w| w == b"patched by"));
-        assert!(verify_copy(&out, Mode::Basic));
+        assert!(verify_copy(&path, &out, Mode::Basic).0);
     }
 
     #[test]
@@ -1426,8 +1477,8 @@ pub(crate) mod tests {
         let out = dir.path().join("v.deattributed.zip");
         for mode in [Mode::Basic, Mode::Deep] {
             deattribute_zip_mode(&path, &out, false, mode).unwrap();
-            assert!(verify_copy(&out, mode));
-            assert!(!verify_copy(&path, mode));
+            assert!(verify_copy(&path, &out, mode).0);
+            assert!(!verify_copy(&path, &path, mode).0);
         }
     }
 

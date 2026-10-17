@@ -1443,7 +1443,12 @@ pub fn write_copies_with(plan: &Plan, root: &Path, progress: &mut dyn Progress) 
             match wrote {
                 Ok(Ok(done)) if done.entries_cleaned > 0 => {
                     let ok = guarded(|| {
-                        deattribute::verify_archive_copy(&done.output, archive.kind, mode)
+                        deattribute::verify_archive_copy(
+                            &item.path,
+                            &done.output,
+                            archive.kind,
+                            mode,
+                        )
                     })
                     .is_ok_and(|v| v.ok());
                     saved(

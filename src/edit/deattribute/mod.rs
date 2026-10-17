@@ -743,10 +743,13 @@ pub fn write_deattributed(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verified {
     /// The copy holds exactly the original with the planned spans replaced,
-    /// keeps the original's format, and plans nothing more in the same mode.
+    /// keeps the original's format, plans nothing more, and passes the PE
+    /// original-identity audit in deep mode.
     pub clean: bool,
     /// The rescan of the copy was partial, so `clean` could not be confirmed.
     pub partial: bool,
+    /// The first section category still holding a readable original identity.
+    pub residual: Option<&'static str>,
 }
 
 impl Verified {
@@ -757,7 +760,14 @@ impl Verified {
     const FAILED: Self = Self {
         clean: false,
         partial: false,
+        residual: None,
     };
+}
+
+/// Report an original PE identity that deep mode has no planned edit for.
+pub fn unedited_pe_identity(path: &Path) -> Option<&'static str> {
+    let view = crate::scan::WindowedFile::open(path).ok()?;
+    deep::residual_category(&view, &view)
 }
 
 /// Check a copy written by [`write_deattributed`]: byte for byte it is the
@@ -782,23 +792,37 @@ pub fn verify_copy(
         return Verified::FAILED;
     };
     let replanned = crate::scan::guard::guarded(|| plan_mode(&again.report, &view, mode));
+    let residual = if mode == Mode::Deep && format == Some("pe") {
+        crate::scan::WindowedFile::open(original)
+            .ok()
+            .and_then(|source| deep::residual_category(&source, &view))
+    } else {
+        None
+    };
     Verified {
-        clean: replanned.is_ok_and(|p| p.targets.is_empty()),
+        clean: replanned.is_ok_and(|p| p.targets.is_empty()) && residual.is_none(),
         partial: again.report.partial,
+        residual,
     }
 }
 
 /// Check an archive copy from [`deattribute_archive_mode`]: it reads as the
 /// same kind of archive and cleaning it again in the same mode changes no entry.
-pub fn verify_archive_copy(output: &Path, kind: ArchiveKind, mode: Mode) -> Verified {
-    let clean = match kind {
-        ArchiveKind::Zip => zip::verify_copy(output, mode),
-        ArchiveKind::Tar => tar::verify_copy(output, false, mode),
-        ArchiveKind::TarGz => tar::verify_copy(output, true, mode),
+pub fn verify_archive_copy(
+    original: &Path,
+    output: &Path,
+    kind: ArchiveKind,
+    mode: Mode,
+) -> Verified {
+    let (clean, residual) = match kind {
+        ArchiveKind::Zip => zip::verify_copy(original, output, mode),
+        ArchiveKind::Tar => (tar::verify_copy(output, false, mode), None),
+        ArchiveKind::TarGz => (tar::verify_copy(output, true, mode), None),
     };
     Verified {
         clean,
         partial: false,
+        residual,
     }
 }
 

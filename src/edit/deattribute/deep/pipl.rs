@@ -109,7 +109,7 @@ impl Pipl {
             .iter()
             .filter_map(|field| {
                 let source = match &field.key {
-                    b"eMNA" => Source::Company,
+                    b"eMNA" => Source::MatchName,
                     b"name" | b"catg" => Source::Product,
                     _ => return None,
                 };
@@ -123,7 +123,7 @@ impl Pipl {
             .collect()
     }
 
-    /// Rewrite identity properties and leave entry points byte-exact.
+    /// Rewrite identity properties. The PE-wide pass can edit entry points later.
     pub(super) fn rewrites(&self, roots: &BTreeSet<String>) -> (Vec<Rewrite>, Vec<Reason>) {
         let mut out = Vec::new();
         let mut skipped = Vec::new();
@@ -153,7 +153,7 @@ impl Pipl {
             let next = match &field.key {
                 b"name" => Some(neutral(raw.len(), b"Effect")),
                 b"catg" if mine => Some(neutral(raw.len(), b"Effects")),
-                b"eMNA" if raw.len() >= 18 && !is_neutral_id(raw) => {
+                b"eMNA" if raw.len() >= 3 && !is_neutral_id(raw) => {
                     let mut id = match_id(raw, 0);
                     let mut salt = 1;
                     while ids.contains(&id) {
@@ -163,7 +163,7 @@ impl Pipl {
                     ids.insert(id.clone());
                     Some(id)
                 }
-                b"eMNA" if raw.len() < 18 => {
+                b"eMNA" if raw.len() < 3 => {
                     skipped.push(Reason::FunctionalName);
                     None
                 }

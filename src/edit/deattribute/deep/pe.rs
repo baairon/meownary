@@ -1,16 +1,12 @@
-//! The PE part of the deep pass. The sweep reads only initialized data
-//! sections, and inside them never touches a byte the loader or a
-//! disassembler resolves by content: import and delay-import names and thunk
-//! tables, export names and their arrays, TLS, load config, relocations,
-//! exception data, the resource directory, version and manifest resources,
-//! and .NET metadata other than the user string heap. Version and manifest
-//! values can still identify a vendor, and RT_STRING leaves have their own
-//! length-prefixed parser. The rewrites are fixed
-//! fields: the export module name, COFF, export, resource and debug
-//! timestamps, CodeView PDB paths and GUIDs, POGO, VC feature and repro
-//! records, and the Authenticode directory slot and detached certificate.
+//! The PE part of the deep pass. Structured parsers mine identities and keep
+//! fixed-size resource fields valid. A second pass replaces those identities
+//! wherever their readable bytes occur in raw sections, including code and
+//! exports. Parsed import names and thunk tables remain byte-exact.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+use aho_corasick::AhoCorasickBuilder;
 
 use crate::model::{ContainerKind, Marker, Region};
 use crate::parsers::pe::image::{
@@ -24,8 +20,8 @@ use super::super::{Caveat, Kind, Reason, Target};
 use super::dotnet;
 use super::pipl::Pipl;
 use super::{
-    Deep, Encoding, Evidence, Hit, Protected, Rewrite, Source, fill_marker, read_full, redact_hits,
-    region_strings, residuals, roots, single_byte, strings,
+    Deep, Encoding, Evidence, Hit, Protected, Rewrite, Source, candidate, fill_marker, read_full,
+    redact_hits, region_strings, registry_candidates, roots, single_byte, strings,
 };
 
 const DIR_IMPORT: usize = 1;
@@ -63,6 +59,370 @@ const MAX_NAME: usize = 512;
 const MAX_DEBUG_BODY: usize = 64 * 1024;
 const MAX_RESOURCE_STRING: usize = 256 * 1024;
 const MAX_CERT_BODY: usize = 4 * 1024 * 1024;
+
+/// These are library identifiers, not host APIs. Deep mode can sacrifice licensing.
+const LICENSE_TERMS: &[&str] = &[
+    "limelm",
+    "wyday",
+    "floatinglicenses",
+    "turboactivate",
+    "turbofloat",
+];
+
+fn identity_terms(roots: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut terms: BTreeSet<String> = roots.iter().filter(|s| s.len() >= 4).cloned().collect();
+    terms.extend(LICENSE_TERMS.iter().map(|s| (*s).to_string()));
+    // Some vendors punctuate the same mark in display copy and class names.
+    for root in roots {
+        if let Some(tail) = root.strip_prefix("re")
+            && tail.len() >= 5
+        {
+            terms.insert(format!("re:{tail}"));
+        }
+    }
+    terms
+}
+
+/// Expand a corroborated vendor's mixed-case initials only in identifiers that
+/// carry those initials as a prefix. Short initials alone are too ambiguous to
+/// search through executable bytes.
+fn vendor_alias_terms(
+    hits: &[Hit],
+    roots: &BTreeSet<String>,
+    module: Option<&str>,
+    evidence: &Evidence,
+) -> BTreeSet<String> {
+    let mut explicit = BTreeSet::new();
+    if let Some(root) = module.and_then(candidate) {
+        explicit.insert(root);
+    }
+    for (value, source) in evidence {
+        if *source == Source::Company
+            && let Some(root) = candidate(value)
+        {
+            explicit.insert(root);
+        }
+    }
+    for hit in hits {
+        explicit.extend(registry_candidates(&hit.text));
+        if let Some(vendor) = super::copyright_vendor(&hit.text) {
+            explicit.insert(vendor);
+        }
+    }
+    explicit.retain(|root| roots.contains(root));
+
+    let mut aliases = BTreeSet::new();
+    for root in explicit {
+        for hit in hits {
+            let lower = hit.text.to_ascii_lowercase();
+            for (at, _) in lower.match_indices(&root) {
+                let Some(surface) = hit.text.get(at..at + root.len()) else {
+                    continue;
+                };
+                let bytes = surface.as_bytes();
+                if !bytes.first().is_some_and(u8::is_ascii_uppercase) {
+                    continue;
+                }
+                let second = (1..bytes.len()).find(|&i| {
+                    bytes[i].is_ascii_uppercase()
+                        && (bytes[i - 1].is_ascii_lowercase()
+                            || (i >= 2
+                                && bytes[i - 1].is_ascii_uppercase()
+                                && bytes.get(i + 1).is_some_and(u8::is_ascii_lowercase)))
+                });
+                if let Some(i) = second {
+                    aliases.insert(format!(
+                        "{}{}",
+                        (bytes[0] as char).to_ascii_lowercase(),
+                        (bytes[i] as char).to_ascii_lowercase()
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut terms = BTreeSet::new();
+    for alias in aliases {
+        let mut tags: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut tokens = Vec::new();
+        for hit in hits {
+            let text = hit
+                .text
+                .strip_prefix(".?AV")
+                .or_else(|| hit.text.strip_prefix(".?AU"))
+                .unwrap_or(&hit.text);
+            for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                let raw = token.as_bytes();
+                if raw.len() < 4
+                    || !raw[..2].eq_ignore_ascii_case(alias.as_bytes())
+                    || !raw[..2].iter().all(u8::is_ascii_uppercase)
+                {
+                    tokens.push(token.to_string());
+                    continue;
+                }
+                terms.insert(token.to_ascii_lowercase());
+                tokens.push(token.to_string());
+                if raw[2].is_ascii_uppercase() && raw.get(3) == Some(&b'_') {
+                    tags.entry(token[..3].to_ascii_lowercase())
+                        .or_default()
+                        .insert(token.to_string());
+                }
+            }
+            let namespace = format!("@{alias}@@");
+            if hit.text.to_ascii_lowercase().contains(&namespace) {
+                terms.insert(namespace);
+            }
+        }
+        for (tag, found) in tags {
+            if found.len() >= 2 {
+                terms.extend(
+                    tokens
+                        .iter()
+                        .filter(|token| {
+                            token.to_ascii_lowercase().starts_with(&tag) && token.len() >= 4
+                        })
+                        .map(|token| token.to_ascii_lowercase()),
+                );
+            }
+        }
+    }
+    terms
+}
+
+fn matcher(terms: &BTreeSet<String>) -> Option<(aho_corasick::AhoCorasick, Vec<bool>)> {
+    let mut patterns = Vec::new();
+    let mut wide = Vec::new();
+    for term in terms {
+        if !term.is_ascii() || term.len() < 4 {
+            continue;
+        }
+        patterns.push(term.as_bytes().to_vec());
+        wide.push(false);
+        patterns.push(term.bytes().flat_map(|b| [b, 0]).collect());
+        wide.push(true);
+    }
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(patterns)
+        .ok()
+        .map(|ac| (ac, wide))
+}
+
+/// Search every raw section and the overlay past the loaded image, including
+/// executable sections. A hit is a fixed-width textual byte sequence, so the PE
+/// directory layout remains readable even if the plug-in's runtime behavior
+/// does not.
+fn identity_bytes(
+    view: &dyn FileView,
+    img: &PeImage,
+    terms: &BTreeSet<String>,
+    protected: &Protected,
+    detached: Option<(u64, u64)>,
+    edit: bool,
+) -> (Vec<Rewrite>, Option<&'static str>, bool) {
+    let Some((ac, wide)) = matcher(terms) else {
+        return (Vec::new(), None, false);
+    };
+    let mut spans: Vec<(u64, u64, &'static str)> = img
+        .sections
+        .iter()
+        .map(|section| {
+            let category =
+                if section.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
+                    "PE code"
+                } else if section.name.starts_with(b".rsrc") {
+                    "PE resource"
+                } else {
+                    "PE data"
+                };
+            (
+                u64::from(section.raw_ptr),
+                u64::from(section.raw_size),
+                category,
+            )
+        })
+        .collect();
+    spans.extend(overlay_spans(view.size(), img.image_end(), detached));
+    let mut edits = BTreeMap::new();
+    let mut budget = super::MAX_TOTAL;
+    for (start, size, category) in spans {
+        if size == 0 {
+            continue;
+        }
+        if size > budget {
+            return (Vec::new(), None, true);
+        }
+        budget -= size;
+        let Some(bytes) = read_full(view, start, size as usize) else {
+            return (Vec::new(), None, true);
+        };
+        for hit in ac.find_overlapping_iter(&bytes) {
+            let start = start + hit.start() as u64;
+            let end = start + hit.len() as u64;
+            if protected.overlaps(start, end) {
+                continue;
+            }
+            if !edit {
+                return (Vec::new(), Some(category), false);
+            }
+            let base = start;
+            let is_wide = wide[hit.pattern().as_usize()];
+            for index in 0..hit.len() {
+                if !is_wide || index % 2 == 0 {
+                    edits.insert(base + index as u64, b' ');
+                }
+            }
+        }
+    }
+    let mut rewrites: Vec<Rewrite> = Vec::new();
+    for (off, byte) in edits {
+        if let Some((_, start, bytes)) = rewrites.last_mut()
+            && *start + bytes.len() as u64 == off
+        {
+            bytes.push(byte);
+        } else {
+            rewrites.push((Kind::Brand, off, vec![byte]));
+        }
+    }
+    (rewrites, None, false)
+}
+
+/// The file past the loaded image, less a detached certificate that the sweep
+/// clears. Each span is `(start, len, category)`.
+fn overlay_spans(
+    size: u64,
+    image_end: u64,
+    detached: Option<(u64, u64)>,
+) -> Vec<(u64, u64, &'static str)> {
+    if image_end >= size {
+        return Vec::new();
+    }
+    match detached.filter(|&(off, _)| off >= image_end && off < size) {
+        Some((off, len)) => {
+            let end = off.saturating_add(len).min(size);
+            vec![
+                (image_end, off - image_end, "PE overlay"),
+                (end, size - end, "PE overlay"),
+            ]
+        }
+        None => vec![(image_end, size - image_end, "PE overlay")],
+    }
+}
+
+pub(super) fn residual_category(
+    view: &dyn FileView,
+    terms: &BTreeSet<String>,
+) -> Option<&'static str> {
+    let img = PeImage::parse(view)?;
+    let (ac, _) = matcher(terms)?;
+    let size = usize::try_from(view.size()).ok()?;
+    let Some(bytes) = read_full(view, 0, size) else {
+        return Some("PE scan budget");
+    };
+    let hit = ac.find(&bytes)?;
+    let at = hit.start() as u64;
+    Some(
+        match img.sections.iter().find(|section| {
+            at >= u64::from(section.raw_ptr)
+                && at < u64::from(section.raw_ptr) + u64::from(section.raw_size)
+        }) {
+            Some(section)
+                if section.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 =>
+            {
+                "PE code"
+            }
+            Some(section) if section.name.starts_with(b".rsrc") => "PE resource",
+            Some(_) => "PE data",
+            None if at < u64::from(img.size_of_headers) => "PE header",
+            None => "PE overlay",
+        },
+    )
+}
+
+fn merge_rewrites(rewrites: Vec<Rewrite>) -> Vec<Rewrite> {
+    let mut bytes = BTreeMap::new();
+    for (_, off, value) in rewrites {
+        for (i, b) in value.into_iter().enumerate() {
+            bytes.insert(off + i as u64, b);
+        }
+    }
+    let mut merged: Vec<Rewrite> = Vec::new();
+    for (off, byte) in bytes {
+        if let Some((_, start, value)) = merged.last_mut()
+            && *start + value.len() as u64 == off
+        {
+            value.push(byte);
+        } else {
+            merged.push((Kind::Brand, off, vec![byte]));
+        }
+    }
+    merged
+}
+
+fn aggressive_roots(
+    hits: &[Hit],
+    evidence: &Evidence,
+    mut roots: BTreeSet<String>,
+) -> BTreeSet<String> {
+    for (value, source) in evidence {
+        if *source == Source::Product
+            && value.bytes().all(|b| b.is_ascii_alphanumeric())
+            && let Some(root) = candidate(value)
+        {
+            roots.insert(root);
+        }
+    }
+    for hit in hits {
+        roots.extend(registry_candidates(&hit.text));
+        let lower = hit.text.to_ascii_lowercase();
+        if lower.contains("program files") {
+            for folder in hit.text.split('\\') {
+                let name = folder.trim().to_ascii_lowercase();
+                let stem = name.strip_suffix("effects").unwrap_or(&name);
+                if stem.len() >= 5
+                    && name != "program files"
+                    && name != "program files (x86)"
+                    && let Some(root) = candidate(stem)
+                {
+                    roots.insert(root);
+                }
+            }
+        }
+    }
+    let mut class_names = BTreeSet::new();
+    for hit in hits {
+        let Some(class) = hit
+            .text
+            .strip_prefix(".?AV")
+            .or_else(|| hit.text.strip_prefix(".?AU"))
+        else {
+            continue;
+        };
+        let bytes = class.as_bytes();
+        if bytes.len() < 8
+            || !bytes[..3].iter().all(u8::is_ascii_uppercase)
+            || !bytes[3].is_ascii_lowercase()
+        {
+            continue;
+        }
+        let tail = &class[2..];
+        let end = tail[1..]
+            .find(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '@')
+            .map_or(tail.len(), |n| n + 1);
+        if end >= 5 {
+            class_names.insert(tail[..end].to_ascii_lowercase());
+        }
+    }
+    for name in class_names {
+        if hits
+            .iter()
+            .any(|h| !h.text.starts_with(".?A") && h.text.to_ascii_lowercase().starts_with(&name))
+        {
+            roots.insert(name);
+        }
+    }
+    roots
+}
 
 /// The neutral stem a deep copy's export module name is rewritten to.
 pub(super) const NEUTRAL_MODULE: &[u8] = b"module";
@@ -443,13 +803,12 @@ struct Walk<'a> {
     view: &'a dyn FileView,
     img: &'a PeImage,
     protected: Protected,
+    import_protected: Protected,
     rewrites: Vec<Rewrite>,
     caveats: Vec<Caveat>,
     resource_hits: Vec<Hit>,
     structured_hits: Vec<Hit>,
     pipls: Vec<Pipl>,
-    /// Import, export and module names the loader resolves.
-    linkage: Vec<String>,
     evidence: Evidence,
     skipped: Vec<Reason>,
 }
@@ -479,15 +838,19 @@ impl Walk<'_> {
         }
     }
 
-    /// Protect the NUL-terminated name at `rva`, returning its offset and bytes.
+    /// Locate the NUL-terminated name at `rva`, returning its offset and bytes.
     fn name_at(&mut self, rva: u32) -> Option<(u64, Vec<u8>)> {
         let off = self.img.rva_to_off(rva)?;
         let bytes = self.view.read_at(off, MAX_NAME).ok()?;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         self.protected.add(off, end as u64 + 1);
-        self.linkage
-            .push(String::from_utf8_lossy(&bytes[..end]).into_owned());
         Some((off, bytes[..end].to_vec()))
+    }
+
+    fn import_name_at(&mut self, rva: u32) {
+        if let Some((off, name)) = self.name_at(rva) {
+            self.import_protected.add(off, name.len() as u64 + 1);
+        }
     }
 
     /// Protect a thunk array at `rva` and every hint/name entry it points to.
@@ -509,12 +872,14 @@ impl Walk<'_> {
                 return;
             };
             self.protected.add(at, width as u64);
+            self.import_protected.add(at, width as u64);
             let ordinal = value >> (width * 8 - 1) != 0;
             if !ordinal && let Ok(name_rva) = u32::try_from(value & 0x7fff_ffff) {
                 // A hint/name entry: a two-byte hint, then the name.
-                self.name_at(name_rva.wrapping_add(2));
+                self.import_name_at(name_rva.wrapping_add(2));
                 if let Some(off) = self.img.rva_to_off(name_rva) {
                     self.protected.add(off, 2);
+                    self.import_protected.add(off, 2);
                 }
             }
             at += width as u64;
@@ -525,6 +890,9 @@ impl Walk<'_> {
         let Some(d) = self.img.dir(DIR_IMPORT) else {
             return;
         };
+        if let Some(off) = self.img.rva_to_off(d.rva) {
+            self.import_protected.add(off, u64::from(d.size));
+        }
         let Some(mut at) = self.img.rva_to_off(d.rva) else {
             return;
         };
@@ -540,7 +908,7 @@ impl Walk<'_> {
             else {
                 return;
             };
-            self.name_at(name);
+            self.import_name_at(name);
             self.thunks(if lookup != 0 { lookup } else { iat });
             at += 20;
         }
@@ -550,6 +918,9 @@ impl Walk<'_> {
         let Some(d) = self.img.dir(DIR_DELAY_IMPORT) else {
             return;
         };
+        if let Some(off) = self.img.rva_to_off(d.rva) {
+            self.import_protected.add(off, u64::from(d.size));
+        }
         let Some(mut at) = self.img.rva_to_off(d.rva) else {
             return;
         };
@@ -567,7 +938,7 @@ impl Walk<'_> {
             };
             // Version 1 descriptors hold RVAs; the older form holds VAs.
             if attrs & 1 != 0 {
-                self.name_at(name);
+                self.import_name_at(name);
                 self.thunks(names);
             }
             at += 32;
@@ -608,10 +979,6 @@ impl Walk<'_> {
         }
         let module = self.name_at(name_rva)?;
         let rewritable = module.1.len() >= 4 && module.1.iter().all(|b| (0x20..=0x7e).contains(b));
-        // A rewritten module name no longer carries the identity.
-        if rewritable {
-            self.linkage.pop();
-        }
         rewritable.then_some(module)
     }
 
@@ -681,7 +1048,7 @@ impl Walk<'_> {
                         && len == 4
                         && let Some(raw) = read_full(self.view, off + 2, 8)
                     {
-                        named_pipl = raw == b"P\0i\0P\0L\0";
+                        named_pipl = raw == b"P\0i\0P\0L\0" || raw == b"P\0I\0P\0L\0";
                     }
                 }
             }
@@ -971,20 +1338,6 @@ impl Walk<'_> {
         Some(fill_marker(off, len as u64, 0))
     }
 
-    /// Executable sections, read only to report identities left in code.
-    fn code_regions(&self) -> Vec<(u64, u64)> {
-        self.img
-            .sections
-            .iter()
-            .filter(|s| {
-                s.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0
-                    && s.raw_size != 0
-                    && u64::from(s.raw_ptr) + u64::from(s.raw_size) <= self.view.size()
-            })
-            .map(|s| (u64::from(s.raw_ptr), u64::from(s.raw_size)))
-            .collect()
-    }
-
     /// Initialized data sections past the headers that hold no code.
     fn data_regions(&self) -> Vec<(u64, u64)> {
         let headers = u64::from(self.img.size_of_headers).max(self.img.table_end);
@@ -1095,12 +1448,12 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         view,
         img: &img,
         protected: Protected::default(),
+        import_protected: Protected::default(),
         rewrites: Vec::new(),
         caveats: Vec::new(),
         resource_hits: Vec::new(),
         structured_hits: Vec::new(),
         pipls: Vec::new(),
-        linkage: Vec::new(),
         evidence: Vec::new(),
         skipped: Vec::new(),
     };
@@ -1120,6 +1473,13 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         DIR_CLR,
     ] {
         w.dir_range(dir);
+    }
+    for dir in [DIR_IMPORT, DIR_IAT, DIR_DELAY_IMPORT, DIR_BOUND_IMPORT] {
+        if let Some(d) = img.dir(dir)
+            && let Some(off) = img.rva_to_off(d.rva)
+        {
+            w.import_protected.add(off, u64::from(d.size));
+        }
     }
     w.imports();
     w.delay_imports();
@@ -1167,10 +1527,20 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         let name = std::str::from_utf8(name).ok()?;
         name.split(['.', '_']).next()
     });
-    let roots = roots(&all_hits, stem, &w.evidence);
-    let code = region_strings(view, &w.code_regions(), &mut w.skipped);
-    let residual = residuals(&hits, &code, &w.linkage, &roots);
-    w.skipped.extend(residual);
+    let roots = aggressive_roots(&all_hits, &w.evidence, roots(&all_hits, stem, &w.evidence));
+    let mut audit_terms = identity_terms(&roots);
+    let code_regions: Vec<(u64, u64)> = img
+        .sections
+        .iter()
+        .filter(|section| {
+            section.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0
+        })
+        .map(|section| (u64::from(section.raw_ptr), u64::from(section.raw_size)))
+        .collect();
+    let mut alias_hits = all_hits.clone();
+    alias_hits.extend(region_strings(view, &code_regions, &mut w.skipped));
+    audit_terms.extend(vendor_alias_terms(&alias_hits, &roots, stem, &w.evidence));
+    // Deep PE rewrites the readable identity bytes in these ranges below.
     let mut rewrites = redact_hits(&hits, &roots, &w.protected);
     rewrites.extend(redact_hits(
         &w.structured_hits,
@@ -1178,10 +1548,29 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         &Protected::default(),
     ));
     rewrites.extend(redact_hits(&user, &roots, &Protected::default()));
+    let detached = certificate
+        .as_ref()
+        .map(|marker| (marker.region.offset, marker.region.len));
+    let (identity_rewrites, _, budget_hit) = identity_bytes(
+        view,
+        &img,
+        &audit_terms,
+        &w.import_protected,
+        detached,
+        true,
+    );
+    if budget_hit {
+        w.skipped.push(Reason::DeepBudget);
+    }
+    rewrites.extend(identity_rewrites);
     for pipl in &w.pipls {
         let (planned, skipped) = pipl.rewrites(&roots);
         rewrites.extend(planned);
-        w.skipped.extend(skipped);
+        w.skipped.extend(
+            skipped
+                .into_iter()
+                .filter(|reason| *reason != Reason::FunctionalName),
+        );
     }
     let blanks = certificate
         .into_iter()
@@ -1204,9 +1593,10 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
 
     Deep {
         blanks,
-        rewrites: w.rewrites.into_iter().chain(rewrites).collect(),
+        rewrites: merge_rewrites(rewrites.into_iter().chain(w.rewrites).collect()),
         caveats: w.caveats,
         skipped: w.skipped,
+        audit_terms,
     }
 }
 

@@ -1326,11 +1326,18 @@ fn deattribute_archive_file(
         step.open = emit_archive_skip(sink, path, None, reason, json_out);
         return step;
     }
-    let verified =
-        (!dry_run).then(|| deattribute::verify_archive_copy(&outcome.output, kind, mode).ok());
+    let verification =
+        (!dry_run).then(|| deattribute::verify_archive_copy(path, &outcome.output, kind, mode));
+    let verified = verification.map(deattribute::Verified::ok);
     if verified == Some(false) {
         step.partial = true;
         step.unverified = 1;
+        if let Some(category) = verification.and_then(|result| result.residual) {
+            sink.note(&format!(
+                "readable attribution remains in {category} of {}",
+                display_path(&outcome.output)
+            ));
+        }
         sink.note(&format!(
             "verification incomplete for {}",
             display_path(&outcome.output)
@@ -1374,6 +1381,17 @@ fn deattribute_plain_file(
         }
     }
     if plan.targets.is_empty() {
+        if mode == deattribute::Mode::Deep
+            && r.format.as_deref() == Some("pe")
+            && let Some(category) = deattribute::unedited_pe_identity(&r.path)
+        {
+            step.partial = true;
+            step.unverified = 1;
+            sink.note(&format!(
+                "readable attribution remains in {category} of {}",
+                display_path(&r.path)
+            ));
+        }
         return step;
     }
     let outcome = if dry_run {
@@ -1412,12 +1430,19 @@ fn deattribute_plain_file(
         step.open = false;
         return step;
     }
-    let verified = (!dry_run).then(|| {
-        deattribute::verify_copy(&r.path, &output, r.format.as_deref(), &plan.targets, mode).ok()
+    let verification = (!dry_run).then(|| {
+        deattribute::verify_copy(&r.path, &output, r.format.as_deref(), &plan.targets, mode)
     });
+    let verified = verification.map(deattribute::Verified::ok);
     if verified == Some(false) {
         step.partial = true;
         step.unverified = 1;
+        if let Some(category) = verification.and_then(|result| result.residual) {
+            sink.note(&format!(
+                "readable attribution remains in {category} of {}",
+                display_path(&output)
+            ));
+        }
         sink.note(&format!(
             "verification incomplete for {}",
             display_path(&output)
