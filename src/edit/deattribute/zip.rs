@@ -6,9 +6,8 @@
 //!   its CRC and sizes recomputed in the local header (unless a data
 //!   descriptor left them zero there), the data descriptor if it has one, and
 //!   the central directory;
-//! * every other byte of the archive is copied untouched, so unchanged entries
-//!   keep their compressed data, and entry order, names, timestamps, external
-//!   attributes, extra fields and the archive comment all survive;
+//! * unchanged entries keep their compressed data and order; deep mode also
+//!   neutralizes learned attribution in archive names and comments;
 //! * stored offsets after a changed entry are shifted, including those in a
 //!   ZIP64 end record and locator that some writers add without needing them;
 //!   nothing else moves.
@@ -25,6 +24,7 @@
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
 
 use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::decompress_to_vec_with_limit;
@@ -108,11 +108,18 @@ struct Change {
     size: u32,
 }
 
+struct MetadataPatch {
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
 /// What reading the archive found.
 struct Analysis {
     arch: parsers::zip::ZipArchive,
     entries: Vec<Entry>,
     changes: Vec<Change>,
+    metadata: Vec<MetadataPatch>,
+    metadata_entries: BTreeSet<usize>,
     brand: usize,
     patch: usize,
     skipped: Vec<(String, Reason)>,
@@ -197,12 +204,19 @@ pub fn deattribute_zip_mode(
     let found = analyze_mode(&data, mode)?;
     let outcome = ArchiveOutcome {
         output: out.to_path_buf(),
-        entries_cleaned: found.changes.len(),
+        entries_cleaned: found
+            .changes
+            .iter()
+            .map(|c| c.index)
+            .chain(found.metadata_entries.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .len()
+            .max(usize::from(!found.metadata.is_empty())),
         brand: found.brand,
         patch: found.patch,
         skipped: found.skipped.clone(),
     };
-    if found.changes.is_empty() {
+    if found.changes.is_empty() && found.metadata.is_empty() {
         return Ok(outcome);
     }
     if dry_run {
@@ -252,7 +266,9 @@ pub fn verify_copy(original: &Path, output: &Path, mode: Mode) -> (bool, Option<
     let Ok(data) = fs::read(output) else {
         return (false, None);
     };
-    if !analyze_mode(&data, mode).is_ok_and(|found| found.changes.is_empty()) {
+    if !analyze_mode(&data, mode)
+        .is_ok_and(|found| found.changes.is_empty() && found.metadata.is_empty())
+    {
         return (false, None);
     }
     if mode != Mode::Deep {
@@ -279,8 +295,9 @@ fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'stati
     if source_entries.len() != output_entries.len() {
         return Err(());
     }
+    let mut terms = BTreeSet::new();
     for (before, after) in source_entries.iter().zip(&output_entries) {
-        if before.name != after.name || before.size != after.size {
+        if before.size != after.size {
             return Err(());
         }
         if before.dir || before.size > MAX_ENTRY || unsupported(before) {
@@ -294,6 +311,7 @@ fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'stati
         if PeImage::parse(&original_view).is_none() {
             continue;
         }
+        terms.extend(deep::pe_terms(&original_view));
         let copy_view = SliceView::new(after.file_name(), &copy_bytes);
         if PeImage::parse(&copy_view).is_none() {
             return Err(());
@@ -302,7 +320,46 @@ fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'stati
             return Ok(Some(category));
         }
     }
+    if metadata_contains_terms(output, &output_arch, &output_entries, &terms)? {
+        return Ok(Some("ZIP metadata"));
+    }
     Ok(None)
+}
+
+fn metadata_contains_terms(
+    data: &[u8],
+    arch: &parsers::zip::ZipArchive,
+    entries: &[Entry],
+    terms: &BTreeSet<String>,
+) -> Result<bool, ()> {
+    let has = |bytes: &[u8]| {
+        terms.iter().any(|term| {
+            term.len() >= 4
+                && bytes
+                    .windows(term.len())
+                    .any(|window| window.eq_ignore_ascii_case(term.as_bytes()))
+        })
+    };
+    if has(data.get(arch.comment_offset as usize..arch.end as usize).ok_or(())?) {
+        return Ok(true);
+    }
+    for entry in entries {
+        let head = slice(data, entry.rec, CENTRAL_LEN).ok_or(())?;
+        let len = CENTRAL_LEN
+            + usize::from(u16_le(head, 28).ok_or(())?)
+            + usize::from(u16_le(head, 30).ok_or(())?)
+            + usize::from(u16_le(head, 32).ok_or(())?);
+        if has(slice(data, entry.rec + CENTRAL_LEN, len - CENTRAL_LEN).ok_or(())?) {
+            return Ok(true);
+        }
+        let local = slice(data, entry.local, LOCAL_LEN).ok_or(())?;
+        let len = usize::from(u16_le(local, 26).ok_or(())?)
+            + usize::from(u16_le(local, 28).ok_or(())?);
+        if has(slice(data, entry.local + LOCAL_LEN, len).ok_or(())?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether an entry that came back with nothing to blank is itself an archive,
@@ -338,6 +395,8 @@ fn analyze_mode(data: &[u8], mode: Mode) -> Result<Analysis, EditError> {
         arch,
         entries: Vec::new(),
         changes: Vec::new(),
+        metadata: Vec::new(),
+        metadata_entries: BTreeSet::new(),
         brand: 0,
         patch: 0,
         skipped: Vec::new(),
@@ -362,6 +421,7 @@ fn analyze_mode(data: &[u8], mode: Mode) -> Result<Analysis, EditError> {
     }
 
     let registry = parsers::registry();
+    let mut known = BTreeSet::new();
     for (index, (e, span)) in entries.iter().zip(&spans).enumerate() {
         if e.dir {
             continue;
@@ -385,6 +445,9 @@ fn analyze_mode(data: &[u8], mode: Mode) -> Result<Analysis, EditError> {
             out.skipped.push((e.name.clone(), Reason::UnsupportedEntry));
             continue;
         };
+        if mode == Mode::Deep && PeImage::parse(&SliceView::new(e.file_name(), &plain)).is_some() {
+            known.extend(deep::pe_terms(&SliceView::new(e.file_name(), &plain)));
+        }
         let cleaned = deattribute_with_mode(e.file_name(), &plain, &registry, mode);
         if nested(&cleaned, e.file_name(), &plain) {
             out.skipped.push((e.name.clone(), Reason::NestedArchive));
@@ -404,10 +467,159 @@ fn analyze_mode(data: &[u8], mode: Mode) -> Result<Analysis, EditError> {
             None => out.skipped.push((e.name.clone(), Reason::UnsupportedEntry)),
         }
     }
-    out.changes.sort_by_key(|c| c.start);
-    check_overlap(&entries, &spans, &out.changes, cd)?;
     out.entries = entries;
+    if mode == Mode::Deep {
+        scrub_zip_metadata(data, &mut out, &known)?;
+    }
+    out.changes.sort_by_key(|c| c.start);
+    check_overlap(&out.entries, &spans, &out.changes, cd)?;
     Ok(out)
+}
+
+/// Replace learned attribution in archive text without changing field sizes.
+/// Names keep their separators and extensions so the resulting ZIP remains
+/// navigable; duplicate output paths are refused below.
+pub(super) fn scrub_text(bytes: &[u8], terms: &BTreeSet<String>, name: bool) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let lower: Vec<u8> = bytes.iter().map(u8::to_ascii_lowercase).collect();
+    for term in terms {
+        let needle = term.as_bytes();
+        if needle.len() < 4 || !needle.is_ascii() {
+            continue;
+        }
+        for at in 0..=lower.len().saturating_sub(needle.len()) {
+            if lower.get(at..at + needle.len()) == Some(needle) {
+                for byte in &mut out[at..at + needle.len()] {
+                    if byte.is_ascii_alphanumeric() || *byte == b'_' {
+                        *byte = if name { b'_' } else { b' ' };
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn metadata_patch(out: &mut Analysis, offset: usize, before: &[u8], after: Vec<u8>) -> bool {
+    if before == after {
+        return false;
+    }
+    out.metadata.push(MetadataPatch { offset, bytes: after });
+    out.brand += 1;
+    true
+}
+
+/// Unicode path and comment extras have a version byte and CRC of the legacy
+/// field. Update that CRC when the corresponding legacy field changes.
+fn scrub_extras(
+    data: &[u8],
+    offset: usize,
+    len: usize,
+    name: &[u8],
+    comment: &[u8],
+    terms: &BTreeSet<String>,
+    out: &mut Analysis,
+    label: &str,
+) {
+    let Some(raw) = data.get(offset..offset + len) else {
+        out.skipped.push((label.into(), Reason::MalformedMetadata));
+        return;
+    };
+    let mut pos = 0;
+    while pos + 4 <= raw.len() {
+        let id = u16_le(raw, pos).unwrap_or_default();
+        let size = usize::from(u16_le(raw, pos + 2).unwrap_or_default());
+        if pos + 4 + size > raw.len() {
+            out.skipped.push((label.into(), Reason::MalformedMetadata));
+            return;
+        }
+        let field = &raw[pos + 4..pos + 4 + size];
+        if matches!(id, 0x7075 | 0x6375) && size >= 5 && field[0] == 1 {
+            let is_name = id == 0x7075;
+            let cleaned = scrub_text(&field[5..], terms, is_name);
+            if cleaned != field[5..] {
+                let mut replacement = field.to_vec();
+                replacement[1..5]
+                    .copy_from_slice(&crc32(if is_name { name } else { comment }).to_le_bytes());
+                replacement[5..].copy_from_slice(&cleaned);
+                metadata_patch(out, offset + pos + 4, field, replacement);
+            }
+        } else if terms.iter().any(|term| {
+            term.len() >= 4
+                && field
+                    .windows(term.len())
+                    .any(|w| w.eq_ignore_ascii_case(term.as_bytes()))
+        }) {
+            out.skipped.push((label.into(), Reason::MalformedMetadata));
+        }
+        pos += 4 + size;
+    }
+    if pos != raw.len() {
+        out.skipped.push((label.into(), Reason::MalformedMetadata));
+    }
+}
+
+fn scrub_zip_metadata(
+    data: &[u8],
+    out: &mut Analysis,
+    terms: &BTreeSet<String>,
+) -> Result<(), EditError> {
+    if terms.is_empty() {
+        return Ok(());
+    }
+    let mut names: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for index in 0..out.entries.len() {
+        let (rec, local_off, label) = {
+            let e = &out.entries[index];
+            (e.rec, e.local, e.name.clone())
+        };
+        let head = slice(data, rec, CENTRAL_LEN).ok_or_else(|| refuse("bad central record"))?;
+        let name_len = usize::from(u16_le(head, 28).unwrap_or_default());
+        let extra_len = usize::from(u16_le(head, 30).unwrap_or_default());
+        let comment_len = usize::from(u16_le(head, 32).unwrap_or_default());
+        let name_off = rec + CENTRAL_LEN;
+        let name = data[name_off..name_off + name_len].to_vec();
+        let cleaned = scrub_text(&name, terms, true);
+        if let Some(previous) = names.insert(cleaned.clone(), name.clone())
+            && previous != name
+        {
+            return Err(refuse("neutralized ZIP entry names would collide"));
+        }
+        let local = slice(data, local_off, LOCAL_LEN).ok_or_else(|| refuse("bad local record"))?;
+        let local_name_len = usize::from(u16_le(local, 26).unwrap_or_default());
+        let local_extra_len = usize::from(u16_le(local, 28).unwrap_or_default());
+        let local_name_off = local_off + LOCAL_LEN;
+        let local_name = data.get(local_name_off..local_name_off + local_name_len);
+        if local_name != Some(name.as_slice()) {
+            out.skipped.push((label, Reason::MalformedMetadata));
+            continue;
+        }
+        if metadata_patch(out, name_off, &name, cleaned.clone()) {
+            out.metadata_entries.insert(index);
+        }
+        metadata_patch(out, local_name_off, &name, cleaned.clone());
+        let comment_off = name_off + name_len + extra_len;
+        let comment = &data[comment_off..comment_off + comment_len];
+        let cleaned_comment = scrub_text(comment, terms, false);
+        if metadata_patch(out, comment_off, comment, cleaned_comment.clone()) {
+            out.metadata_entries.insert(index);
+        }
+        scrub_extras(data, name_off + name_len, extra_len, &cleaned, &cleaned_comment, terms, out, &label);
+        scrub_extras(
+            data,
+            local_name_off + local_name_len,
+            local_extra_len,
+            &cleaned,
+            &cleaned_comment,
+            terms,
+            out,
+            &label,
+        );
+    }
+    let comment_off = out.arch.comment_offset as usize;
+    let comment = &data[comment_off..out.arch.end as usize];
+    metadata_patch(out, comment_off, comment, scrub_text(comment, terms, false));
+    Ok(())
 }
 
 /// Offset of the classic end record, refusing an archive split over disks.
@@ -750,6 +962,12 @@ fn shift_u64(buf: &mut [u8], at: usize, moved: i64) -> Result<(), EditError> {
 /// Write the copy: the original with each changed entry replaced, the central
 /// directory patched to match, and the end records pointing at it.
 fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), EditError> {
+    let mut patched = data.to_vec();
+    for patch in &found.metadata {
+        let end = patch.offset + patch.bytes.len();
+        patched[patch.offset..end].copy_from_slice(&patch.bytes);
+    }
+    let data = patched.as_slice();
     let arch = &found.arch;
     let cd = arch.cd_offset as usize;
     let cd_end = cd + arch.cd_size as usize;
@@ -794,7 +1012,16 @@ fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), Edit
     let mut cursor = 0usize;
     for c in &found.changes {
         w.write_all(&data[cursor..c.start])?;
-        w.write_all(&c.bytes)?;
+        let mut changed = c.bytes.clone();
+        for patch in &found.metadata {
+            let from = patch.offset.max(c.start);
+            let to = (patch.offset + patch.bytes.len()).min(c.end);
+            if from < to {
+                changed[from - c.start..to - c.start]
+                    .copy_from_slice(&patch.bytes[from - patch.offset..to - patch.offset]);
+            }
+        }
+        w.write_all(&changed)?;
         cursor = c.end;
     }
     w.write_all(&data[cursor..cd])?;
@@ -813,6 +1040,7 @@ fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), Edit
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::mem::tests::fake_pe;
+    use super::super::deep::tests::pe_fixture;
     use super::*;
     use crate::parsers::zip::parse;
     use crate::scan::MemView;
@@ -994,6 +1222,30 @@ pub(crate) mod tests {
         assert_eq!(after[1].plain, text);
         assert_eq!(after[1].packed, before[1].packed, "untouched entry kept");
         assert_eq!(after[1].record[..42], before[1].record[..42]);
+    }
+
+    #[test]
+    fn deep_zip_scrubs_attributed_paths_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pe = pe_fixture(0x1234);
+        pe[0x880..0x8a0].fill(0);
+        pe[0x880..0x88d].copy_from_slice(b"KERNEL32.dll\0");
+        pe[0x8a2..0x8c0].fill(0);
+        pe[0x8a2..0x8ae].copy_from_slice(b"CreateFileA\0");
+        let terms = deep::pe_terms(&SliceView::new("renderer.aex", &pe));
+        assert!(terms.contains("novaflow"), "{terms:?}");
+        let original = build(&[item("NovaFlow/renderer.aex", &pe, true)], b"NovaFlow archive");
+        let path = dir.path().join("bundle.zip");
+        let out = dir.path().join("bundle.deattributed.zip");
+        fs::write(&path, &original).unwrap();
+        let done = deattribute_zip_mode(&path, &out, false, Mode::Deep).unwrap();
+        assert!(done.entries_cleaned > 0);
+        let copy = fs::read(&out).unwrap();
+        let (entries, comment) = read_back(&copy);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].name.contains("NovaFlow"));
+        assert!(!comment.windows(8).any(|w| w == b"NovaFlow"));
+        assert!(verify_copy(&path, &out, Mode::Deep).0);
     }
 
     #[test]

@@ -20,7 +20,9 @@
 ## What it does
 
 meownary scans a file or a folder, names each file's real format, and lists
-what each file carries as findings. Two actions act on them:
+what each file carries as findings. Deep deattribution aims to leave the
+observable binary logic for reverse engineering; its copy may no longer load
+or behave like the original. Two actions act on the findings:
 
 - **Deattribute** is for software. It writes a copy of each file beside the
   original with brand labels, toolchain stamps and `patched by` credits blanked
@@ -128,8 +130,8 @@ Every blank is one of two kinds, `brand` or `patch`.
 ### Deep mode
 
 `--deep`, or `A` in the view, runs a wider sweep on top of the basic one. It
-looks for copyrights, patch credits, build paths, licensing library marks, and
-the vendor and product names the file itself gives away. Deep edits can break
+looks for copyrights, patch credits, build paths, publisher and third-party
+licensing library marks, and the product names the file itself gives away. Deep edits can break
 loading, signing, registration and licensing behavior, and a plug-in whose
 match name changes no longer matches projects saved with the original, so
 inspect and test the copy before using it.
@@ -174,8 +176,9 @@ on a rerun, and a deep copy plans nothing more.
 
 ### Archives
 
-A ZIP, tar or tar.gz carries no attribution of its own, so deattribute cleans
-the files inside it and writes `name.deattributed.zip`, `.tar` or `.tar.gz`
+A ZIP, tar or tar.gz can carry attribution in its metadata as well as its
+contents. Deattribute cleans supported entries and writes
+`name.deattributed.zip`, `.tar` or `.tar.gz`
 beside the original.
 
 - Each file inside is identified and planned like a file on disk. Files with
@@ -192,8 +195,10 @@ beside the original.
 - When an archive stops being readable partway, everything after that point is
   skipped once as `rest of the archive is unreadable`.
 - Each file inside keeps its length, but the archive's may change: a ZIP copy
-  re-deflates the entries it changed, and a tar.gz copy is recompressed as one
-  gzip member without the original's stored file name or comment.
+  re-deflates changed entries and neutralizes learned attribution in entry
+  paths, comments and recognized Unicode extras. Other extra fields that still
+  carry attribution are reported as incomplete. A tar.gz copy is recompressed
+  as one gzip member without the original's stored file name or comment.
 - An archive with nothing to blank inside gets no copy and reports
   `nothing to blank inside the archive`.
 
@@ -273,7 +278,9 @@ encryption info.
 - After writing, each copy is checked: it must be the original byte for byte
   apart from the planned spans, keep its format, and plan nothing more in the
   same mode. A PE deep copy is also checked against readable identities learned
-  from its original, including code and overlay bytes. A name the sweep could not learn from the original is not checked. An archive copy must
+  from its original, including code and overlay bytes. Parsed PE import data
+  must remain byte-exact. A name the sweep could not learn from the original is
+  not checked. An archive copy must
   read as the same kind of archive and clean to nothing more. A copy that fails
   prints `verification incomplete for <copy>` and exits 75.
 - Exit 75 means some file was not fully read, planned, written or verified. It

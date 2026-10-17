@@ -28,7 +28,7 @@ const OPT: usize = 0x98;
 /// executable `.text` (file 0xa00, RVA 0x2000). The export table names the
 /// module `NovaFlow_64.AEX` and exports `NovaFlowRender`; the import table
 /// pulls `NovaFlowActivate` from `NovaFlowCore.dll`. All names invented.
-fn pe_fixture(checksum: u32) -> Vec<u8> {
+pub(crate) fn pe_fixture(checksum: u32) -> Vec<u8> {
     let mut b = vec![0u8; 0xc00];
     put(&mut b, 0, b"MZ");
     put_u32(&mut b, 0x3c, 0x80);
@@ -292,6 +292,30 @@ fn deep_pe_preserves_import_module_names_during_raw_identity_scrub() {
         pe::residual_category(&SliceView::new("x", &out), &terms),
         Some("PE data")
     );
+}
+
+#[test]
+fn deep_pe_learns_repeated_third_party_labels_and_license_symbols() {
+    let mut source = pe_fixture(0x1234);
+    put(&mut source, 0x5c0, b"SilverSix Debug\0");
+    put(&mut source, 0x600, b"SilverSix License Report\0");
+    put(&mut source, 0x650, b"SSLS_CLIENT_OPEN\0");
+    put(&mut source, 0x690, b"SSLS_SERVER_CLOSE\0");
+    let out = deep("x.aex", &source);
+    for term in [b"SilverSix".as_slice(), b"SSLS_CLIENT_OPEN", b"SSLS_SERVER_CLOSE"] {
+        assert!(!has(&out, term), "{}", String::from_utf8_lossy(term));
+    }
+}
+
+#[test]
+fn import_verification_detects_a_damaged_system_dll_name() {
+    let source = pe_fixture(0x1234);
+    let mut copy = source.clone();
+    copy[0x880..0x890].copy_from_slice(b"CRYPT32.dll\0    ");
+    assert!(!pe::imports_unchanged(
+        &SliceView::new("before", &source),
+        &SliceView::new("after", &copy)
+    ));
 }
 
 #[test]

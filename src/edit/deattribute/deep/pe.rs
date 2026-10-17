@@ -83,6 +83,68 @@ fn identity_terms(roots: &BTreeSet<String>) -> BTreeSet<String> {
     terms
 }
 
+/// Learn third-party attribution from repeated diagnostic labels and related
+/// licensing symbols. A single generic "Debug" string is not evidence of a
+/// library name; two distinct labels or identifiers are required.
+fn library_terms(hits: &[Hit]) -> BTreeSet<String> {
+    let mut labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut symbols: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for hit in hits {
+        for line in hit.text.split(['\r', '\n']) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.len() >= 2 {
+                let name = words[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                let marker = words[1].to_ascii_lowercase();
+                if name.len() >= 5
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric())
+                    && matches!(marker.as_str(), "debug" | "license" | "licensing")
+                {
+                    labels
+                        .entry(name.to_ascii_lowercase())
+                        .or_default()
+                        .insert(words[1..].join(" ").to_ascii_lowercase());
+                }
+            }
+        }
+        for token in hit
+            .text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        {
+            let Some((tag, rest)) = token.split_once('_') else {
+                continue;
+            };
+            if tag.len() >= 4
+                && tag.len() <= 8
+                && tag.bytes().all(|b| b.is_ascii_alphabetic())
+                && rest.len() >= 3
+                && rest.bytes().any(|b| b.is_ascii_alphabetic())
+            {
+                symbols
+                    .entry(tag.to_ascii_lowercase())
+                    .or_default()
+                    .insert(token.to_ascii_lowercase());
+            }
+        }
+    }
+    let mut terms: BTreeSet<String> = labels
+        .into_iter()
+        .filter(|(_, contexts)| contexts.len() >= 2)
+        .map(|(name, _)| name)
+        .collect();
+    for (_, family) in symbols {
+        if family.len() >= 2
+            && family.iter().any(|s| {
+                ["lic", "client", "server", "debug", "report"]
+                    .iter()
+                    .any(|word| s.contains(word))
+            })
+        {
+            terms.extend(family);
+        }
+    }
+    terms
+}
+
 /// Expand a corroborated vendor's mixed-case initials only in identifiers that
 /// carry those initials as a prefix. Short initials alone are too ambiguous to
 /// search through executable bytes.
@@ -339,6 +401,53 @@ pub(super) fn residual_category(
     )
 }
 
+/// Compare the loader's import records and every name reached from them. A PE
+/// can still parse after a DLL name is damaged, so format detection alone is
+/// insufficient verification for a deep copy.
+pub(super) fn imports_unchanged(original: &dyn FileView, output: &dyn FileView) -> bool {
+    fn ranges(view: &dyn FileView) -> Option<Protected> {
+        let img = PeImage::parse(view)?;
+        let mut walk = Walk {
+            view,
+            img: &img,
+            protected: Protected::default(),
+            import_protected: Protected::default(),
+            rewrites: Vec::new(),
+            caveats: Vec::new(),
+            resource_hits: Vec::new(),
+            structured_hits: Vec::new(),
+            pipls: Vec::new(),
+            evidence: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for dir in [DIR_IMPORT, DIR_IAT, DIR_DELAY_IMPORT, DIR_BOUND_IMPORT] {
+            if let Some(d) = img.dir(dir)
+                && let Some(off) = img.rva_to_off(d.rva)
+            {
+                walk.import_protected.add(off, u64::from(d.size));
+            }
+        }
+        walk.imports();
+        walk.delay_imports();
+        Some(walk.import_protected)
+    }
+    let (Some(before), Some(after)) = (ranges(original), ranges(output)) else {
+        return PeImage::parse(original).is_none() && PeImage::parse(output).is_none();
+    };
+    if before.0 != after.0 {
+        return false;
+    }
+    before.0.into_iter().all(|(start, end)| {
+        let Ok(len) = usize::try_from(end - start) else {
+            return false;
+        };
+        match (read_full(original, start, len), read_full(output, start, len)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    })
+}
+
 fn merge_rewrites(rewrites: Vec<Rewrite>) -> Vec<Rewrite> {
     let mut bytes = BTreeMap::new();
     for (_, off, value) in rewrites {
@@ -409,14 +518,20 @@ fn aggressive_roots(
         let end = tail[1..]
             .find(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '@')
             .map_or(tail.len(), |n| n + 1);
-        if end >= 5 {
+        if end >= 5 && tail.as_bytes().get(end).is_some_and(u8::is_ascii_digit) {
             class_names.insert(tail[..end].to_ascii_lowercase());
         }
     }
     for name in class_names {
         if hits
             .iter()
-            .any(|h| !h.text.starts_with(".?A") && h.text.to_ascii_lowercase().starts_with(&name))
+            .any(|h| {
+                !h.text.starts_with(".?A")
+                    && h.text.to_ascii_lowercase().starts_with(&name)
+                    && [" gui", " plugin", " effect"]
+                        .iter()
+                        .any(|hint| h.text.to_ascii_lowercase().contains(hint))
+            })
         {
             roots.insert(name);
         }
@@ -1540,6 +1655,7 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     let mut alias_hits = all_hits.clone();
     alias_hits.extend(region_strings(view, &code_regions, &mut w.skipped));
     audit_terms.extend(vendor_alias_terms(&alias_hits, &roots, stem, &w.evidence));
+    audit_terms.extend(library_terms(&alias_hits));
     // Deep PE rewrites the readable identity bytes in these ranges below.
     let mut rewrites = redact_hits(&hits, &roots, &w.protected);
     rewrites.extend(redact_hits(

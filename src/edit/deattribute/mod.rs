@@ -816,8 +816,8 @@ pub fn verify_archive_copy(
 ) -> Verified {
     let (clean, residual) = match kind {
         ArchiveKind::Zip => zip::verify_copy(original, output, mode),
-        ArchiveKind::Tar => (tar::verify_copy(output, false, mode), None),
-        ArchiveKind::TarGz => (tar::verify_copy(output, true, mode), None),
+        ArchiveKind::Tar => (tar::verify_copy(original, output, false, mode), None),
+        ArchiveKind::TarGz => (tar::verify_copy(original, output, true, mode), None),
     };
     Verified {
         clean,

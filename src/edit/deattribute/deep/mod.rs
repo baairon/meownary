@@ -56,13 +56,20 @@ pub(super) fn residual_category(
     output: &dyn FileView,
 ) -> Option<&'static str> {
     let planned = pe::sweep(original);
-    pe::residual_category(output, &planned.audit_terms).or_else(|| {
+    (!pe::imports_unchanged(original, output))
+        .then_some("PE imports")
+        .or_else(|| pe::residual_category(output, &planned.audit_terms))
+        .or_else(|| {
         planned
             .skipped
             .iter()
             .any(|reason| matches!(reason, Reason::MalformedMetadata | Reason::DeepBudget))
             .then_some("unreadable PE metadata")
-    })
+        })
+}
+
+pub(super) fn pe_terms(view: &dyn FileView) -> BTreeSet<String> {
+    pe::sweep(view).audit_terms
 }
 
 /// One same-length rewrite: its kind, offset and new bytes.
@@ -1007,4 +1014,4 @@ fn fallback(view: &dyn FileView) -> Deep {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

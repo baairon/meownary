@@ -15,6 +15,7 @@
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
 
 use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::stream::{InflateState, inflate};
@@ -119,7 +120,7 @@ pub fn plan_tar_mode(
 }
 
 /// Whether cleaning the copy at `output` again in `mode` would change no entry.
-pub fn verify_copy(output: &Path, gz: bool, mode: super::Mode) -> bool {
+pub fn verify_copy(original: &Path, output: &Path, gz: bool, mode: super::Mode) -> bool {
     let found = if gz {
         let Ok(data) = fs::read(output) else {
             return false;
@@ -137,7 +138,54 @@ pub fn verify_copy(output: &Path, gz: bool, mode: super::Mode) -> bool {
         };
         scan_mode(&mut file, meta.len(), LIMITS, mode)
     };
-    matches!(found, Ok(Some(scan)) if scan.patches.is_empty())
+    if !matches!(found, Ok(Some(scan)) if scan.patches.is_empty()) {
+        return false;
+    }
+    if mode != super::Mode::Deep {
+        return true;
+    }
+    let Ok(source) = fs::read(original) else { return false };
+    let original_tar = if gz {
+        let Ok(bytes) = gunzip(&source, LIMITS) else { return false };
+        bytes
+    } else {
+        source
+    };
+    let Some(terms) = original_pe_terms(&original_tar) else { return false };
+    if terms.is_empty() {
+        return true;
+    }
+    let Ok(copy) = fs::read(output) else { return false };
+    let output_tar = if gz {
+        let Ok(bytes) = gunzip(&copy, LIMITS) else { return false };
+        bytes
+    } else {
+        copy
+    };
+    let mut metadata = Scan::default();
+    scan_tar_metadata(&mut Cursor::new(&output_tar), output_tar.len() as u64, &terms, &mut metadata)
+        .is_ok_and(|_| metadata.patches.is_empty() && metadata.skipped.is_empty())
+}
+
+fn original_pe_terms(tar: &[u8]) -> Option<BTreeSet<String>> {
+    let mut cursor = Cursor::new(tar);
+    let mut src = Seekable::new(&mut cursor, tar.len() as u64).ok()?;
+    let mut terms = BTreeSet::new();
+    let ended = walk(&mut src, |entry, src| {
+        if !entry.is_file() || entry.size > LIMITS.entry {
+            return Ok(false);
+        }
+        let mut data = vec![0u8; entry.size as usize];
+        if src.fill(&mut data)? < data.len() {
+            return Err(EditError::Changed);
+        }
+        let view = super::mem::SliceView::new(&entry.name, &data);
+        if crate::parsers::pe::image::PeImage::parse(&view).is_some() {
+            terms.extend(super::deep::pe_terms(&view));
+        }
+        Ok(true)
+    }).ok()?;
+    (ended == Some(Stop::End)).then_some(terms)
 }
 
 /// One changed stretch of an entry and where it goes in the (uncompressed) tar.
@@ -748,8 +796,9 @@ fn scan_mode<R: Read + Seek>(
     mode: super::Mode,
 ) -> Result<Option<Scan>, EditError> {
     let registry = crate::parsers::registry();
-    let mut src = Seekable::new(r, total)?;
+    let mut src = Seekable::new(&mut *r, total)?;
     let mut scan = Scan::default();
+    let mut known = BTreeSet::new();
     let stop = walk(&mut src, |entry, src| {
         if !entry.is_file() || entry.size == 0 {
             return Ok(false);
@@ -769,6 +818,12 @@ fn scan_mode<R: Read + Seek>(
             return Err(EditError::Changed);
         }
         let file_name = name.rsplit('/').next().unwrap_or(name);
+        if mode == super::Mode::Deep {
+            let view = super::mem::SliceView::new(file_name, &data);
+            if crate::parsers::pe::image::PeImage::parse(&view).is_some() {
+                known.extend(super::deep::pe_terms(&view));
+            }
+        }
         let outcome = deattribute_with_mode(file_name, &data, &registry, mode);
         if super::zip::nested(&outcome, file_name, &data) {
             scan.skipped.push((name.clone(), Reason::NestedArchive));
@@ -789,12 +844,70 @@ fn scan_mode<R: Read + Seek>(
         }
         Ok(true)
     })?;
+    drop(src);
+    if mode == super::Mode::Deep && !known.is_empty() {
+        scan_tar_metadata(r, total, &known, &mut scan)?;
+    }
     Ok(stop.map(|stop| {
         if stop == Stop::Tail {
             scan.skipped.push((TAIL.into(), Reason::ArchiveTail));
         }
         scan
     }))
+}
+
+fn scan_tar_metadata<R: Read + Seek>(
+    r: &mut R,
+    total: u64,
+    terms: &BTreeSet<String>,
+    scan: &mut Scan,
+) -> Result<(), EditError> {
+    let mut at = 0u64;
+    while at + BLOCK <= total {
+        r.seek(SeekFrom::Start(at))?;
+        let mut header = [0u8; BLOCK as usize];
+        r.read_exact(&mut header)?;
+        if header.iter().all(|&b| b == 0) || !header_ok(&header) {
+            break;
+        }
+        let Some(size) = number(&header[124..136]) else {
+            break;
+        };
+        let original = header;
+        for range in [0..100, 157..257, 265..297, 297..329, 345..500] {
+            let cleaned = super::zip::scrub_text(&header[range.clone()], terms, true);
+            header[range].copy_from_slice(&cleaned);
+        }
+        if header != original {
+            header[CHKSUM..CHKSUM + 8].fill(b' ');
+            let sum: u64 = header.iter().map(|&b| b as u64).sum();
+            header[CHKSUM..CHKSUM + 8]
+                .copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            scan.patches.push(Patch { offset: at, bytes: header.to_vec() });
+            scan.entries += 1;
+            scan.brand += 1;
+        }
+        let data_at = at + BLOCK;
+        if matches!(original[156], b'L' | b'K' | b'x' | b'g') {
+            if size > META_MAX {
+                scan.skipped.push((format!("<metadata at {at}>"), Reason::MalformedMetadata));
+            } else if data_at + size <= total {
+                r.seek(SeekFrom::Start(data_at))?;
+                let mut data = vec![0u8; size as usize];
+                r.read_exact(&mut data)?;
+                let cleaned = super::zip::scrub_text(&data, terms, true);
+                let runs = changed_runs(data_at, &data, &cleaned);
+                if !runs.is_empty() {
+                    scan.entries += 1;
+                    scan.brand += 1;
+                    scan.patches.extend(runs);
+                }
+            }
+        }
+        at = data_at + padded(size).ok_or(EditError::Changed)?;
+    }
+    scan.patches.sort_by_key(|p| p.offset);
+    Ok(())
 }
 
 /// The stretches where `new` differs from `old` (same length) as patches at
@@ -956,8 +1069,31 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use super::super::deep::tests::pe_fixture;
 
     const CREDIT: &[u8] = b"patched by Invented\0";
+
+    #[test]
+    fn deep_tar_scrubs_attributed_entry_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pe = pe_fixture(0x1234);
+        pe[0x880..0x8a0].fill(0);
+        pe[0x880..0x88d].copy_from_slice(b"KERNEL32.dll\0");
+        pe[0x8a2..0x8c0].fill(0);
+        pe[0x8a2..0x8ae].copy_from_slice(b"CreateFileA\0");
+        let mut tar = Vec::new();
+        entry(&mut tar, "NovaFlow/renderer.aex", b'0', &pe);
+        tar.extend_from_slice(&[0; 1024]);
+        let original = dir.path().join("bundle.tar");
+        let output = copy_name(&original);
+        fs::write(&original, &tar).unwrap();
+        let done = deattribute_tar_mode(&original, false, &output, super::super::Mode::Deep)
+            .unwrap().unwrap();
+        assert!(done.entries_cleaned > 0);
+        let copy = fs::read(&output).unwrap();
+        assert!(!copy.windows(8).any(|w| w == b"NovaFlow"));
+        assert!(verify_copy(&original, &output, false, super::super::Mode::Deep));
+    }
 
     fn octal(v: u64, width: usize) -> Vec<u8> {
         format!("{v:0w$o}\0", w = width - 1).into_bytes()
@@ -1461,8 +1597,8 @@ pub(crate) mod tests {
         for (src, gz) in [(&plain, false), (&packed, true)] {
             let out = copy_name(src);
             deattribute_tar(src, gz, &out).unwrap().unwrap();
-            assert!(verify_copy(&out, gz, super::super::Mode::Basic));
-            assert!(!verify_copy(src, gz, super::super::Mode::Basic));
+            assert!(verify_copy(src, &out, gz, super::super::Mode::Basic));
+            assert!(!verify_copy(src, src, gz, super::super::Mode::Basic));
         }
     }
 
