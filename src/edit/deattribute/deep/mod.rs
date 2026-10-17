@@ -60,11 +60,11 @@ pub(super) fn residual_category(
         .then_some("PE imports")
         .or_else(|| pe::residual_category(output, &planned.audit_terms))
         .or_else(|| {
-        planned
-            .skipped
-            .iter()
-            .any(|reason| matches!(reason, Reason::MalformedMetadata | Reason::DeepBudget))
-            .then_some("unreadable PE metadata")
+            planned
+                .skipped
+                .iter()
+                .any(|reason| matches!(reason, Reason::MalformedMetadata | Reason::DeepBudget))
+                .then_some("unreadable PE metadata")
         })
 }
 

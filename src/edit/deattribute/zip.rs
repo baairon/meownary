@@ -21,10 +21,10 @@
 //! wheel's RECORD, a NuGet signature) is left alone whole, as any change would
 //! break its signature.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::collections::{BTreeMap, BTreeSet};
 
 use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::decompress_to_vec_with_limit;
@@ -340,7 +340,10 @@ fn metadata_contains_terms(
                     .any(|window| window.eq_ignore_ascii_case(term.as_bytes()))
         })
     };
-    if has(data.get(arch.comment_offset as usize..arch.end as usize).ok_or(())?) {
+    if has(data
+        .get(arch.comment_offset as usize..arch.end as usize)
+        .ok_or(())?)
+    {
         return Ok(true);
     }
     for entry in entries {
@@ -353,8 +356,8 @@ fn metadata_contains_terms(
             return Ok(true);
         }
         let local = slice(data, entry.local, LOCAL_LEN).ok_or(())?;
-        let len = usize::from(u16_le(local, 26).ok_or(())?)
-            + usize::from(u16_le(local, 28).ok_or(())?);
+        let len =
+            usize::from(u16_le(local, 26).ok_or(())?) + usize::from(u16_le(local, 28).ok_or(())?);
         if has(slice(data, entry.local + LOCAL_LEN, len).ok_or(())?) {
             return Ok(true);
         }
@@ -504,7 +507,10 @@ fn metadata_patch(out: &mut Analysis, offset: usize, before: &[u8], after: Vec<u
     if before == after {
         return false;
     }
-    out.metadata.push(MetadataPatch { offset, bytes: after });
+    out.metadata.push(MetadataPatch {
+        offset,
+        bytes: after,
+    });
     out.brand += 1;
     true
 }
@@ -515,12 +521,12 @@ fn scrub_extras(
     data: &[u8],
     offset: usize,
     len: usize,
-    name: &[u8],
-    comment: &[u8],
+    fields: (&[u8], &[u8]),
     terms: &BTreeSet<String>,
     out: &mut Analysis,
     label: &str,
 ) {
+    let (name, comment) = fields;
     let Some(raw) = data.get(offset..offset + len) else {
         out.skipped.push((label.into(), Reason::MalformedMetadata));
         return;
@@ -604,13 +610,20 @@ fn scrub_zip_metadata(
         if metadata_patch(out, comment_off, comment, cleaned_comment.clone()) {
             out.metadata_entries.insert(index);
         }
-        scrub_extras(data, name_off + name_len, extra_len, &cleaned, &cleaned_comment, terms, out, &label);
+        scrub_extras(
+            data,
+            name_off + name_len,
+            extra_len,
+            (&cleaned, &cleaned_comment),
+            terms,
+            out,
+            &label,
+        );
         scrub_extras(
             data,
             local_name_off + local_name_len,
             local_extra_len,
-            &cleaned,
-            &cleaned_comment,
+            (&cleaned, &cleaned_comment),
             terms,
             out,
             &label,
@@ -1039,8 +1052,8 @@ fn assemble(data: &[u8], found: &Analysis, w: &mut dyn Write) -> Result<(), Edit
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::super::mem::tests::fake_pe;
     use super::super::deep::tests::pe_fixture;
+    use super::super::mem::tests::fake_pe;
     use super::*;
     use crate::parsers::zip::parse;
     use crate::scan::MemView;
@@ -1234,7 +1247,10 @@ pub(crate) mod tests {
         pe[0x8a2..0x8ae].copy_from_slice(b"CreateFileA\0");
         let terms = deep::pe_terms(&SliceView::new("renderer.aex", &pe));
         assert!(terms.contains("novaflow"), "{terms:?}");
-        let original = build(&[item("NovaFlow/renderer.aex", &pe, true)], b"NovaFlow archive");
+        let original = build(
+            &[item("NovaFlow/renderer.aex", &pe, true)],
+            b"NovaFlow archive",
+        );
         let path = dir.path().join("bundle.zip");
         let out = dir.path().join("bundle.deattributed.zip");
         fs::write(&path, &original).unwrap();

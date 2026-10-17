@@ -302,7 +302,11 @@ fn deep_pe_learns_repeated_third_party_labels_and_license_symbols() {
     put(&mut source, 0x650, b"SSLS_CLIENT_OPEN\0");
     put(&mut source, 0x690, b"SSLS_SERVER_CLOSE\0");
     let out = deep("x.aex", &source);
-    for term in [b"SilverSix".as_slice(), b"SSLS_CLIENT_OPEN", b"SSLS_SERVER_CLOSE"] {
+    for term in [
+        b"SilverSix".as_slice(),
+        b"SSLS_CLIENT_OPEN",
+        b"SSLS_SERVER_CLOSE",
+    ] {
         assert!(!has(&out, term), "{}", String::from_utf8_lossy(term));
     }
 }

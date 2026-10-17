@@ -12,10 +12,10 @@
 //! The original is only ever read. The copy goes through a temp file beside it
 //! and is renamed over the copy path, so a failure leaves nothing behind.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::collections::BTreeSet;
 
 use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::stream::{InflateState, inflate};
@@ -144,27 +144,42 @@ pub fn verify_copy(original: &Path, output: &Path, gz: bool, mode: super::Mode) 
     if mode != super::Mode::Deep {
         return true;
     }
-    let Ok(source) = fs::read(original) else { return false };
+    let Ok(source) = fs::read(original) else {
+        return false;
+    };
     let original_tar = if gz {
-        let Ok(bytes) = gunzip(&source, LIMITS) else { return false };
+        let Ok(bytes) = gunzip(&source, LIMITS) else {
+            return false;
+        };
         bytes
     } else {
         source
     };
-    let Some(terms) = original_pe_terms(&original_tar) else { return false };
+    let Some(terms) = original_pe_terms(&original_tar) else {
+        return false;
+    };
     if terms.is_empty() {
         return true;
     }
-    let Ok(copy) = fs::read(output) else { return false };
+    let Ok(copy) = fs::read(output) else {
+        return false;
+    };
     let output_tar = if gz {
-        let Ok(bytes) = gunzip(&copy, LIMITS) else { return false };
+        let Ok(bytes) = gunzip(&copy, LIMITS) else {
+            return false;
+        };
         bytes
     } else {
         copy
     };
     let mut metadata = Scan::default();
-    scan_tar_metadata(&mut Cursor::new(&output_tar), output_tar.len() as u64, &terms, &mut metadata)
-        .is_ok_and(|_| metadata.patches.is_empty() && metadata.skipped.is_empty())
+    scan_tar_metadata(
+        &mut Cursor::new(&output_tar),
+        output_tar.len() as u64,
+        &terms,
+        &mut metadata,
+    )
+    .is_ok_and(|_| metadata.patches.is_empty() && metadata.skipped.is_empty())
 }
 
 fn original_pe_terms(tar: &[u8]) -> Option<BTreeSet<String>> {
@@ -184,7 +199,8 @@ fn original_pe_terms(tar: &[u8]) -> Option<BTreeSet<String>> {
             terms.extend(super::deep::pe_terms(&view));
         }
         Ok(true)
-    }).ok()?;
+    })
+    .ok()?;
     (ended == Some(Stop::End)).then_some(terms)
 }
 
@@ -844,7 +860,6 @@ fn scan_mode<R: Read + Seek>(
         }
         Ok(true)
     })?;
-    drop(src);
     if mode == super::Mode::Deep && !known.is_empty() {
         scan_tar_metadata(r, total, &known, &mut scan)?;
     }
@@ -881,16 +896,19 @@ fn scan_tar_metadata<R: Read + Seek>(
         if header != original {
             header[CHKSUM..CHKSUM + 8].fill(b' ');
             let sum: u64 = header.iter().map(|&b| b as u64).sum();
-            header[CHKSUM..CHKSUM + 8]
-                .copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-            scan.patches.push(Patch { offset: at, bytes: header.to_vec() });
+            header[CHKSUM..CHKSUM + 8].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            scan.patches.push(Patch {
+                offset: at,
+                bytes: header.to_vec(),
+            });
             scan.entries += 1;
             scan.brand += 1;
         }
         let data_at = at + BLOCK;
         if matches!(original[156], b'L' | b'K' | b'x' | b'g') {
             if size > META_MAX {
-                scan.skipped.push((format!("<metadata at {at}>"), Reason::MalformedMetadata));
+                scan.skipped
+                    .push((format!("<metadata at {at}>"), Reason::MalformedMetadata));
             } else if data_at + size <= total {
                 r.seek(SeekFrom::Start(data_at))?;
                 let mut data = vec![0u8; size as usize];
@@ -1068,8 +1086,8 @@ fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
     use super::super::deep::tests::pe_fixture;
+    use super::*;
 
     const CREDIT: &[u8] = b"patched by Invented\0";
 
@@ -1088,11 +1106,17 @@ pub(crate) mod tests {
         let output = copy_name(&original);
         fs::write(&original, &tar).unwrap();
         let done = deattribute_tar_mode(&original, false, &output, super::super::Mode::Deep)
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert!(done.entries_cleaned > 0);
         let copy = fs::read(&output).unwrap();
         assert!(!copy.windows(8).any(|w| w == b"NovaFlow"));
-        assert!(verify_copy(&original, &output, false, super::super::Mode::Deep));
+        assert!(verify_copy(
+            &original,
+            &output,
+            false,
+            super::super::Mode::Deep
+        ));
     }
 
     fn octal(v: u64, width: usize) -> Vec<u8> {

@@ -441,7 +441,10 @@ pub(super) fn imports_unchanged(original: &dyn FileView, output: &dyn FileView) 
         let Ok(len) = usize::try_from(end - start) else {
             return false;
         };
-        match (read_full(original, start, len), read_full(output, start, len)) {
+        match (
+            read_full(original, start, len),
+            read_full(output, start, len),
+        ) {
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
@@ -523,16 +526,13 @@ fn aggressive_roots(
         }
     }
     for name in class_names {
-        if hits
-            .iter()
-            .any(|h| {
-                !h.text.starts_with(".?A")
-                    && h.text.to_ascii_lowercase().starts_with(&name)
-                    && [" gui", " plugin", " effect"]
-                        .iter()
-                        .any(|hint| h.text.to_ascii_lowercase().contains(hint))
-            })
-        {
+        if hits.iter().any(|h| {
+            !h.text.starts_with(".?A")
+                && h.text.to_ascii_lowercase().starts_with(&name)
+                && [" gui", " plugin", " effect"]
+                    .iter()
+                    .any(|hint| h.text.to_ascii_lowercase().contains(hint))
+        }) {
             roots.insert(name);
         }
     }
