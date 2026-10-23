@@ -19,7 +19,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: version
         name: Tag matches Cargo.toml and CHANGELOG.md
         shell: bash
@@ -62,7 +62,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install musl tools
         if: ${{ contains(matrix.target, 'musl') }}
@@ -104,7 +104,7 @@ jobs:
             shasum -a 256 "$archive" > "$archive.sha256"
           fi
           cat "$archive.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -124,8 +124,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
