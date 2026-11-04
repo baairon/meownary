@@ -179,12 +179,7 @@ pub fn demo_picker() -> App {
     let _ = picker.take_requests();
     let dir = PathBuf::from(r"C:\Users\you\Downloads");
     picker.on_listing(demo_listing(&dir));
-    let counted = [
-        ("Games", 1_030),
-        ("Installers", 612),
-        ("Mods", 2_264),
-        ("Music", 0),
-    ];
+    let counted = [("Games", 1_030), ("Installers", 612), ("Mods", 2_264)];
     let dirs: Vec<(PathBuf, u32)> = counted
         .iter()
         .filter(|(_, n)| *n > 0)
@@ -216,9 +211,7 @@ fn demo_listing(dir: &Path) -> Listing {
         item("Games", true, 0),
         item("Installers", true, 0),
         item("Mods", true, 0),
-        item("Music", true, 0),
         item("Photos", true, 0),
-        item("Work", true, 0),
         item("game-patch.zip", false, 8_388_608),
         item("setup-tool-2.4.1.exe", false, 2_412_544),
         item("beach-day.jpg", false, 3_145_728),
@@ -800,6 +793,8 @@ mod tests {
             "2,264+ files",
             "game-patch.zip",
             "scan here",
+            "jump",
+            "Desktop",
             PICKER_LINE,
         ] {
             assert!(svg.contains(needle), "{needle}");
