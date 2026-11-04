@@ -195,6 +195,198 @@ fn deattribution_rules_preserve_exclusions_and_report_incomplete_scans() {
 }
 
 #[test]
+fn an_exclusion_alone_leaves_a_retained_residual_that_strict_refuses() {
+    let fx = Fixture::empty();
+    let input = fx.dir.path().join("input.exe");
+    let rules = fx.dir.path().join("rules.json");
+    let output = fx.dir.path().join("output.exe");
+    let mut bytes = common::pe_bytes();
+    bytes.extend(b"patched by North Star\0");
+    fs::write(&input, &bytes).unwrap();
+    fs::write(
+        &rules,
+        br#"{"version":1,"exclusions":[{"kind":"text","value":"North Star"}]}"#,
+    )
+    .unwrap();
+    // The credit the catalog would blank is kept by the exclusion. Strict
+    // verification refuses a copy that still carries it.
+    let strict = run(
+        fx.state.path(),
+        &[
+            "deattribute",
+            input.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--verify",
+            "strict",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    strict.assert_code(75);
+    assert!(!output.exists());
+    // Protected verification passes, naming the exclusion as the reason.
+    let protected = run(
+        fx.state.path(),
+        &[
+            "deattribute",
+            input.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--verify",
+            "protected",
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    protected.assert_code(0);
+    let events = protected.events();
+    let report = events
+        .iter()
+        .find(|e| e["event"] == "verification")
+        .unwrap_or_else(|| panic!("{}", protected.stdout));
+    let residuals = report["data"]["audit"]["residuals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", protected.stdout));
+    assert_eq!(residuals.len(), 1, "{}", protected.stdout);
+    assert_eq!(residuals[0]["retained"], "explicit exclusion");
+    assert_eq!(fs::read(&input).unwrap(), bytes, "nothing was written");
+}
+
+#[test]
+fn an_expected_match_count_checks_the_input_not_the_cleaned_output() {
+    let fx = Fixture::empty();
+    let root = fx.dir.path();
+    let input = root.join("input.bin");
+    let rules = root.join("rules.json");
+    let plan = root.join("plan.json");
+    let output = root.join("output.bin");
+    let applied = root.join("applied.bin");
+    fs::write(&input, b"North Star data\0").unwrap();
+    fs::write(&rules, br#"{"version":1,"identities":[{"id":"publisher","scope":"publisher","names":["North Star"],"encodings":["utf8"],"boundary":"word","expected_matches":1}]}"#).unwrap();
+    run(
+        fx.state.path(),
+        &[
+            "deattribute",
+            input.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--plan-out",
+            plan.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .assert_code(0);
+    assert_eq!(fs::read(&output).unwrap(), b"           data\0");
+    run(
+        fx.state.path(),
+        &[
+            "apply",
+            plan.to_str().unwrap(),
+            "--output",
+            applied.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .assert_code(0);
+    run(
+        fx.state.path(),
+        &[
+            "verify",
+            plan.to_str().unwrap(),
+            applied.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .assert_code(0);
+    // Too few matches in the input still stop the plan.
+    fs::write(&input, b"no match here\0").unwrap();
+    run(
+        fx.state.path(),
+        &[
+            "deattribute",
+            input.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ],
+    )
+    .assert_code(2);
+}
+
+#[test]
+fn relative_file_selectors_match_on_apply_from_anywhere() {
+    let fx = Fixture::empty();
+    let root = fx.dir.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::write(root.join("bin").join("sample.dll"), b"North Star data\0").unwrap();
+    fs::write(root.join("rules.json"), br#"{"version":1,"identities":[{"id":"publisher","scope":"publisher","names":["North Star"],"encodings":["utf8"],"boundary":"word","files":["bin/*.dll"]}]}"#).unwrap();
+    let cwd = Some(root);
+    common::run_in(
+        fx.state.path(),
+        cwd,
+        &[
+            "deattribute",
+            "bin/sample.dll",
+            "--rules",
+            "rules.json",
+            "--output",
+            "first.dll",
+            "--plan-out",
+            "plan.json",
+            "--json",
+        ],
+    )
+    .assert_code(0);
+    assert_eq!(
+        fs::read(root.join("first.dll")).unwrap(),
+        b"           data\0"
+    );
+    common::run_in(
+        fx.state.path(),
+        cwd,
+        &["apply", "plan.json", "--output", "second.dll", "--json"],
+    )
+    .assert_code(0);
+    assert_eq!(
+        fs::read(root.join("second.dll")).unwrap(),
+        b"           data\0"
+    );
+    // From another folder the plan still knows the path it was planned as.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let third = root.join("third.dll");
+    common::run_in(
+        fx.state.path(),
+        Some(elsewhere.path()),
+        &[
+            "apply",
+            root.join("plan.json").to_str().unwrap(),
+            "--output",
+            third.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .assert_code(0);
+    assert_eq!(fs::read(&third).unwrap(), b"           data\0");
+    common::run_in(
+        fx.state.path(),
+        Some(elsewhere.path()),
+        &[
+            "verify",
+            root.join("plan.json").to_str().unwrap(),
+            third.to_str().unwrap(),
+            "--json",
+        ],
+    )
+    .assert_code(0);
+}
+
+#[test]
 fn malformed_pe_is_not_edited_and_header_edits_require_raw() {
     let fx = Fixture::empty();
     let input = fx.dir.path().join("input.exe");
