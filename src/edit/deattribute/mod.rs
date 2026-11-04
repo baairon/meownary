@@ -14,12 +14,16 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+pub mod audit;
 mod deep;
+pub mod layout;
 pub mod mem;
+pub mod policy;
 mod route;
 pub mod tar;
 pub mod zip;
 
+pub(crate) use deep::imports_unchanged;
 pub use mem::{ArchiveOutcome, MemOutcome, deattribute_bytes};
 pub use route::{ArchiveKind, archive_file_count, archive_kind};
 
@@ -148,6 +152,9 @@ pub struct FilePlan {
     pub targets: Vec<Target>,
     pub skipped: Vec<Skipped>,
     pub caveats: Vec<Caveat>,
+    pub audit: Option<audit::Audit>,
+    pub errors: Vec<String>,
+    pub configuration: Option<policy::Options>,
 }
 
 impl Target {
@@ -310,7 +317,73 @@ pub fn plan(report: &FileReport, view: &dyn FileView) -> FilePlan {
 }
 
 pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePlan {
-    let mut out = FilePlan::default();
+    plan_with_options(report, view, mode, &policy::Options::default()).unwrap_or_else(|e| {
+        FilePlan {
+            skipped: vec![Skipped {
+                kind: Kind::Brand,
+                reason: Reason::Io,
+            }],
+            errors: vec![e.to_string()],
+            ..FilePlan::default()
+        }
+    })
+}
+
+pub fn plan_with_options(
+    report: &FileReport,
+    view: &dyn FileView,
+    mode: Mode,
+    options: &policy::Options,
+) -> io::Result<FilePlan> {
+    let mut out = FilePlan {
+        configuration: Some(options.clone()),
+        ..FilePlan::default()
+    };
+    let mut deep =
+        (mode == Mode::Deep).then(|| deep::sweep_with_limits(report, view, &options.limits));
+    let mut ranges = deep
+        .as_ref()
+        .and_then(|d| d.audit.as_ref())
+        .map(|a| a.layout.clone())
+        .unwrap_or_else(|| layout::inspect(view));
+    if report.format.as_deref() == Some("pe") && !ranges.valid {
+        push_skip(&mut out, Kind::Brand, Reason::MalformedMetadata);
+        return Ok(out);
+    }
+    // Non-native container parsers authorize individual metadata fields. Their
+    // markers do not make surrounding container bytes available to raw edits.
+    if report
+        .format
+        .as_deref()
+        .is_some_and(|f| !matches!(f, "pe" | "elf" | "macho"))
+    {
+        for finding in &report.findings {
+            if select(&finding.category, &finding.signature_id).is_some()
+                && let Some(marker) = &finding.marker
+                && matches!(marker.removal, RemovalStrategy::RawBlank { .. })
+                && matches!(
+                    assess(report.format.as_deref(), report.size, marker),
+                    Risk::Safe
+                )
+            {
+                ranges.fields.push(crate::edit::precision::pattern::Span {
+                    offset: marker.region.offset,
+                    len: marker.region.len,
+                });
+                ranges.valid = true;
+            }
+        }
+    }
+    let explicit = options
+        .rules
+        .as_ref()
+        .map(|rules| rules.plan(view, ranges.clone(), &options.limits))
+        .transpose()?;
+    let exclusions = explicit
+        .as_ref()
+        .map(|e| e.audit.layout.excluded.clone())
+        .unwrap_or_default();
+    let mut explicit_rewrites = Vec::new();
     let mut raw: Vec<(Kind, Marker)> = Vec::new();
     let pe_values = if report.format.as_deref() == Some("pe") {
         pe::deattribute_version(view)
@@ -358,7 +431,11 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
         f.signature_id.starts_with("catalog.toolchain.go")
             || f.signature_id == "catalog.toolchain.rust"
     });
-    for hit in catalog_probe::deattribute_hits(view, format) {
+    let (credits, coverage) = catalog_probe::deattribute_hits(view, format, &options.limits)?;
+    if !coverage.complete {
+        push_skip(&mut out, Kind::Brand, Reason::DeepBudget);
+    }
+    for hit in credits {
         let sig = &cat.signatures[hit.index];
         let kind = if PATCH_CREDIT_IDS.contains(&sig.id.as_str()) {
             Kind::Patch
@@ -393,16 +470,37 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
             continue;
         }
         if kind == Kind::Patch || standalone_credit(&sig.id) {
+            if ranges
+                .retention(&crate::edit::precision::pattern::Span {
+                    offset: hit.offset,
+                    len: hit.len,
+                })
+                .is_some()
+            {
+                push_skip(&mut out, kind, Reason::LoadBearing);
+                continue;
+            }
             let versioned = VERSIONED_NEEDLES.contains(&sig.id.as_str());
-            match c_string_marker(
+            match encoded_credit_marker(
                 view,
                 hit.offset,
                 hit.len,
                 hit.available,
                 unterminated,
                 versioned,
+                hit.encoding,
             ) {
-                Some(marker) => raw.push((kind, marker)),
+                Some(marker)
+                    if ranges
+                        .retention(&crate::edit::precision::pattern::Span {
+                            offset: marker.region.offset,
+                            len: marker.region.len,
+                        })
+                        .is_none() =>
+                {
+                    raw.push((kind, marker))
+                }
+                Some(_) => push_skip(&mut out, kind, Reason::LoadBearing),
                 None => push_skip(&mut out, kind, Reason::NoMarker),
             }
         } else {
@@ -410,13 +508,42 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
         }
     }
 
-    let deep = (mode == Mode::Deep).then(|| deep::sweep(report, view));
+    if let Some(explicit) = explicit {
+        let d = deep.get_or_insert_with(deep::Deep::default);
+        explicit_rewrites = explicit.rewrites;
+        if let Some(audit) = &mut d.audit {
+            let base = audit.patterns.len();
+            audit.patterns.extend(explicit.audit.patterns);
+            audit.layout.excluded = explicit.audit.layout.excluded;
+            audit
+                .allowed
+                .extend(explicit.audit.allowed.into_iter().map(|mut a| {
+                    a.pattern += base;
+                    a
+                }));
+        } else {
+            d.audit = Some(explicit.audit);
+        }
+    }
     if let Some(d) = &deep {
         raw.extend(d.blanks.iter().cloned());
         for reason in &d.skipped {
             push_skip(&mut out, Kind::Brand, *reason);
         }
     }
+    let mut permitted = Vec::new();
+    for (kind, marker) in raw {
+        let span = crate::edit::precision::pattern::Span {
+            offset: marker.region.offset,
+            len: marker.region.len,
+        };
+        if ranges.linkage.iter().any(|r| r.overlaps(&span)) {
+            push_skip(&mut out, kind, Reason::LoadBearing);
+        } else {
+            permitted.push((kind, marker));
+        }
+    }
+    let mut raw = permitted;
 
     // At one offset the longer span sorts first, and the sort is stable, so a
     // parser's marker stays ahead of a shorter catalog or deep one it covers.
@@ -473,8 +600,50 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
         });
     }
     if let Some(d) = deep {
+        out.audit = d.audit;
+        if let Some(audit) = &mut out.audit {
+            audit.complete &= coverage.complete;
+            audit.unexamined.extend(coverage.unexamined.clone());
+        }
+        // Subtract authoritative marker spans from textual rewrites. A partial
+        // overlap must not discard the uncovered tail of an identity.
+        out.targets.sort_by_key(|t| t.marker.region.offset);
+        let mut rewrites = Vec::new();
         for (kind, off, bytes) in d.rewrites {
             let end = off + bytes.len() as u64;
+            let first = out
+                .targets
+                .partition_point(|t| t.marker.region.end() <= off);
+            let mut pos = off;
+            for target in out.targets[first..]
+                .iter()
+                .take_while(|t| t.marker.region.offset < end)
+            {
+                let stop = target.marker.region.offset.max(pos).min(end);
+                if pos < stop {
+                    rewrites.push((
+                        kind,
+                        pos,
+                        bytes[(pos - off) as usize..(stop - off) as usize].to_vec(),
+                    ));
+                }
+                pos = pos.max(target.marker.region.end()).min(end);
+            }
+            if pos < end {
+                rewrites.push((kind, pos, bytes[(pos - off) as usize..].to_vec()));
+            }
+        }
+        for (kind, off, bytes) in deep::merge_rewrites(rewrites) {
+            let end = off + bytes.len() as u64;
+            if ranges.linkage.iter().any(|r| {
+                r.overlaps(&crate::edit::precision::pattern::Span {
+                    offset: off,
+                    len: bytes.len() as u64,
+                })
+            }) {
+                push_skip(&mut out, kind, Reason::LoadBearing);
+                continue;
+            }
             if out
                 .targets
                 .iter()
@@ -522,9 +691,60 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
             }
         }
     }
+    // Explicit policy wins over inferred text replacements and parser blanks.
+    // An exclusion keeps the complete affected edit intact, including any
+    // structured record that would otherwise be partially erased.
+    if !explicit_rewrites.is_empty() || !exclusions.is_empty() {
+        if let Some(audit) = &mut out.audit {
+            for target in &out.targets {
+                let span = crate::edit::precision::pattern::Span {
+                    offset: target.marker.region.offset,
+                    len: target.marker.region.len,
+                };
+                if exclusions.iter().any(|s| s.overlaps(&span)) {
+                    audit.layout.excluded.push(span);
+                }
+            }
+        }
+        let automatic = out
+            .targets
+            .drain(..)
+            .filter(|t| {
+                !exclusions.iter().any(|s| {
+                    s.overlaps(&crate::edit::precision::pattern::Span {
+                        offset: t.marker.region.offset,
+                        len: t.marker.region.len,
+                    })
+                })
+            })
+            .map(|t| (t.kind, t.marker.region.offset, t.new_bytes()));
+        for (kind, offset, bytes) in
+            deep::merge_rewrites(automatic.chain(explicit_rewrites).collect())
+        {
+            let original = crate::edit::precision::pattern::read_exact(view, offset, bytes.len())?;
+            if original == bytes {
+                continue;
+            }
+            out.targets.push(Target {
+                kind,
+                marker: Marker::blank(Region::new(offset, bytes.len() as u64), ContainerKind::Raw),
+                expected_hash: hash_hex(&original),
+                replacement: Some(bytes),
+            });
+        }
+    }
+    if out.audit.is_none() {
+        out.audit = Some(audit::Audit {
+            layout: ranges,
+            limits: options.limits.clone(),
+            complete: coverage.complete,
+            unexamined: coverage.unexamined.clone(),
+            ..audit::Audit::default()
+        });
+    }
     out.targets.sort_by_key(|t| t.marker.region.offset);
     if out.targets.is_empty() {
-        return out;
+        return Ok(out);
     }
     let signed = match report.format.as_deref() {
         Some("pe") => {
@@ -540,7 +760,53 @@ pub fn plan_mode(report: &FileReport, view: &dyn FileView, mode: Mode) -> FilePl
     if signed && !out.caveats.contains(&Caveat::SignatureInvalidated) {
         out.caveats.push(Caveat::SignatureInvalidated);
     }
-    out
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoded_credit_marker(
+    view: &dyn FileView,
+    offset: u64,
+    needle_len: u64,
+    available: usize,
+    unterminated: bool,
+    versioned: bool,
+    encoding: crate::edit::precision::pattern::Encoding,
+) -> Option<Marker> {
+    use crate::edit::precision::pattern::Encoding;
+    if !matches!(encoding, Encoding::Utf16le | Encoding::Utf16be) {
+        return c_string_marker(view, offset, needle_len, available, unterminated, versioned);
+    }
+    if offset >= 2 {
+        let prev = view.read_at(offset - 2, 2).ok()?;
+        if encoding
+            .decode(&prev)?
+            .chars()
+            .any(|c| c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+    }
+    let bytes = view.read_at(offset, available.min(160)).ok()?;
+    let end = bytes.as_chunks::<2>().0.iter().position(|p| *p == [0, 0])? * 2;
+    if end < needle_len as usize {
+        return None;
+    }
+    let text = encoding.decode(&bytes[..end])?;
+    if text.chars().any(char::is_control) {
+        return None;
+    }
+    if versioned
+        && !encoding
+            .decode(&bytes[needle_len as usize..end])?
+            .starts_with(|c: char| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(Marker::blank(
+        Region::new(offset, if unterminated { needle_len } else { end as u64 }),
+        ContainerKind::Raw,
+    ))
 }
 
 /// The tag inserted before a deattributed copy's last extension.
@@ -752,6 +1018,102 @@ pub struct Verified {
     pub residual: Option<&'static str>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Verification {
+    pub byte_integrity: bool,
+    pub structure_valid: bool,
+    pub coverage_complete: bool,
+    pub strict_clean: bool,
+    pub policy_satisfied: bool,
+    pub residuals: Vec<audit::Residual>,
+    pub unexamined: Vec<crate::edit::precision::pattern::Span>,
+    pub errors: Vec<String>,
+}
+
+impl Verification {
+    pub fn ok(&self, policy: policy::VerificationPolicy) -> bool {
+        self.byte_integrity
+            && self.structure_valid
+            && self.coverage_complete
+            && match policy {
+                policy::VerificationPolicy::Strict => self.strict_clean,
+                policy::VerificationPolicy::Protected => self.policy_satisfied,
+            }
+    }
+}
+
+/// Verify against the identities and coverage retained in the original plan.
+pub fn verify_plan(
+    original: &Path,
+    output: &Path,
+    format: Option<&str>,
+    plan: &FilePlan,
+    mode: Mode,
+) -> Verification {
+    let mut result = Verification {
+        byte_integrity: false,
+        structure_valid: false,
+        coverage_complete: false,
+        strict_clean: false,
+        policy_satisfied: false,
+        residuals: Vec::new(),
+        unexamined: Vec::new(),
+        errors: plan.errors.clone(),
+    };
+    result.byte_integrity = same_with_targets(original, output, &plan.targets).unwrap_or(false);
+    let Ok(view) = crate::scan::WindowedFile::open(output) else {
+        result.errors.push("output could not be read".into());
+        return result;
+    };
+    let again = crate::scan::scan_file_detailed(output, &crate::parsers::registry());
+    result.structure_valid = again.report.format.as_deref() == format;
+    if format == Some("pe") {
+        result.structure_valid &= crate::parsers::pe::image::PeImage::parse(&view)
+            .is_some_and(|p| p.layout_ok())
+            && crate::scan::WindowedFile::open(original)
+                .is_ok_and(|before| deep::imports_unchanged(&before, &view));
+    }
+    result.coverage_complete = !again.report.partial
+        && plan.errors.is_empty()
+        && !plan.skipped.iter().any(|s| {
+            matches!(
+                s.reason,
+                Reason::Io | Reason::Changed | Reason::MalformedMetadata | Reason::DeepBudget
+            )
+        });
+    let replanned = plan_with_options(
+        &again.report,
+        &view,
+        mode,
+        &plan.configuration.clone().unwrap_or_default(),
+    );
+    let Ok(replanned) = replanned else {
+        result
+            .errors
+            .push("output policy could not be evaluated".into());
+        return result;
+    };
+    let no_edits = replanned.targets.is_empty() && replanned.errors.is_empty();
+    result.strict_clean = no_edits;
+    result.policy_satisfied = no_edits;
+    if let Some(audit) = &plan.audit {
+        match audit.verify(&view) {
+            Ok(report) => {
+                result.coverage_complete &= report.complete;
+                result.strict_clean &= report.clean;
+                result.policy_satisfied &= report.policy_satisfied;
+                result.residuals = report.residuals;
+                result.unexamined = report.unexamined;
+            }
+            Err(e) => {
+                result.coverage_complete = false;
+                result.errors.push(e.to_string());
+            }
+        }
+    }
+    result
+}
+
 impl Verified {
     pub fn ok(self) -> bool {
         self.clean && !self.partial
@@ -781,27 +1143,30 @@ pub fn verify_copy(
     targets: &[Target],
     mode: Mode,
 ) -> Verified {
-    if !same_with_targets(original, output, targets).unwrap_or(false) {
-        return Verified::FAILED;
-    }
-    let again = crate::scan::scan_file_detailed(output, &crate::parsers::registry());
-    if again.report.format.as_deref() != format {
-        return Verified::FAILED;
-    }
-    let Ok(view) = crate::scan::WindowedFile::open(output) else {
+    let Ok(source) = crate::scan::WindowedFile::open(original) else {
         return Verified::FAILED;
     };
-    let replanned = crate::scan::guard::guarded(|| plan_mode(&again.report, &view, mode));
-    let residual = if mode == Mode::Deep && format == Some("pe") {
-        crate::scan::WindowedFile::open(original)
-            .ok()
-            .and_then(|source| deep::residual_category(&source, &view))
-    } else {
-        None
+    let before = crate::scan::scan_file_detailed(original, &crate::parsers::registry());
+    let Ok(mut planned) = crate::scan::guard::guarded(|| plan_mode(&before.report, &source, mode))
+    else {
+        return Verified::FAILED;
     };
+    planned.targets = targets.to_vec();
+    let result = verify_plan(original, output, format, &planned, mode);
+    let residual = result.residuals.first().map(|r| match format {
+        Some("pe") => match r.region.as_str() {
+            "PE code" => "PE code",
+            "PE header" => "PE header",
+            "PE overlay" => "PE overlay",
+            _ => "PE data",
+        },
+        Some("elf") => "ELF data",
+        Some("macho") => "Mach-O data",
+        _ => "file data",
+    });
     Verified {
-        clean: replanned.is_ok_and(|p| p.targets.is_empty()) && residual.is_none(),
-        partial: again.report.partial,
+        clean: result.ok(policy::VerificationPolicy::Strict),
+        partial: !result.coverage_complete,
         residual,
     }
 }
@@ -835,10 +1200,12 @@ fn same_with_targets(original: &Path, output: &Path, targets: &[Target]) -> io::
     if b.metadata()?.len() != size {
         return Ok(false);
     }
-    let overlays: Vec<(u64, Vec<u8>)> = targets
+    let mut overlays: Vec<(u64, Vec<u8>)> = targets
         .iter()
         .map(|t| (t.marker.region.offset, t.new_bytes()))
         .collect();
+    overlays.sort_by_key(|(off, _)| *off);
+    let mut cursor = 0;
     let mut want = vec![0u8; fsio::CHUNK];
     let mut got = vec![0u8; fsio::CHUNK];
     let mut pos = 0u64;
@@ -847,7 +1214,11 @@ fn same_with_targets(original: &Path, output: &Path, targets: &[Target]) -> io::
         fill_exact(&a, pos, &mut want[..n])?;
         fill_exact(&b, pos, &mut got[..n])?;
         let end = pos + n as u64;
-        for (off, bytes) in &overlays {
+        while cursor < overlays.len() && overlays[cursor].0 + overlays[cursor].1.len() as u64 <= pos
+        {
+            cursor += 1;
+        }
+        for (off, bytes) in overlays[cursor..].iter().take_while(|(off, _)| *off < end) {
             let o_end = off + bytes.len() as u64;
             if o_end <= pos || *off >= end {
                 continue;

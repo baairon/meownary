@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use aho_corasick::AhoCorasickBuilder;
-
+use crate::edit::deattribute::audit::{Audit, identity_patterns};
+use crate::edit::deattribute::layout::{Layout, Region as LayoutRegion};
+use crate::edit::precision::pattern::{Limits, Span};
 use crate::model::{ContainerKind, Marker, Region};
 use crate::parsers::pe::image::{
     DIR_CLR, DIR_DEBUG, DIR_EXPORT, DIR_RESOURCE, DIR_SECURITY, PeImage,
@@ -21,7 +22,7 @@ use super::dotnet;
 use super::pipl::Pipl;
 use super::{
     Deep, Encoding, Evidence, Hit, Protected, Rewrite, Source, candidate, fill_marker, read_full,
-    redact_hits, region_strings, registry_candidates, roots, single_byte, strings,
+    redact_hits, registry_candidates, roots, single_byte, strings,
 };
 
 const DIR_IMPORT: usize = 1;
@@ -251,124 +252,91 @@ fn vendor_alias_terms(
     terms
 }
 
-fn matcher(terms: &BTreeSet<String>) -> Option<(aho_corasick::AhoCorasick, Vec<bool>)> {
-    let mut patterns = Vec::new();
-    let mut wide = Vec::new();
-    for term in terms {
-        if !term.is_ascii() || term.len() < 4 {
-            continue;
-        }
-        patterns.push(term.as_bytes().to_vec());
-        wide.push(false);
-        patterns.push(term.bytes().flat_map(|b| [b, 0]).collect());
-        wide.push(true);
-    }
-    AhoCorasickBuilder::new()
-        .ascii_case_insensitive(true)
-        .build(patterns)
-        .ok()
-        .map(|ac| (ac, wide))
-}
-
-/// Search every raw section and the overlay past the loaded image, including
-/// executable sections. A hit is a fixed-width textual byte sequence, so the PE
-/// directory layout remains readable even if the plug-in's runtime behavior
-/// does not.
-fn identity_bytes(
-    view: &dyn FileView,
-    img: &PeImage,
-    terms: &BTreeSet<String>,
-    protected: &Protected,
-    detached: Option<(u64, u64)>,
-    edit: bool,
-) -> (Vec<Rewrite>, Option<&'static str>, bool) {
-    let Some((ac, wide)) = matcher(terms) else {
-        return (Vec::new(), None, false);
-    };
-    let mut spans: Vec<(u64, u64, &'static str)> = img
+fn layout(w: &Walk<'_>, fields: impl IntoIterator<Item = Span>) -> Layout {
+    let img = w.img;
+    let mut regions: Vec<LayoutRegion> = img
         .sections
         .iter()
-        .map(|section| {
-            let category =
-                if section.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
-                    "PE code"
-                } else if section.name.starts_with(b".rsrc") {
-                    "PE resource"
-                } else {
-                    "PE data"
-                };
+        .map(|s| LayoutRegion {
+            span: Span {
+                offset: u64::from(s.raw_ptr),
+                len: u64::from(s.raw_size),
+            },
+            category: if s.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE) != 0 {
+                "PE code"
+            } else if s.name.starts_with(b".rsrc") {
+                "PE resource"
+            } else {
+                "PE data"
+            }
+            .into(),
+        })
+        .collect();
+    regions.push(LayoutRegion {
+        span: Span {
+            offset: 0,
+            len: u64::from(img.size_of_headers).max(img.table_end),
+        },
+        category: "PE header".into(),
+    });
+    regions.push(LayoutRegion {
+        span: Span {
+            offset: img.image_end().min(w.view.size()),
+            len: w.view.size().saturating_sub(img.image_end()),
+        },
+        category: "PE overlay".into(),
+    });
+    regions.push(LayoutRegion {
+        span: Span {
+            offset: 0,
+            len: w.view.size(),
+        },
+        category: "PE padding".into(),
+    });
+    let spans = |p: &Protected| {
+        p.0.iter()
+            .map(|&(a, b)| Span {
+                offset: a,
+                len: b - a,
+            })
+            .collect()
+    };
+    Layout {
+        size: w.view.size(),
+        format: Some("pe".into()),
+        regions,
+        protected: spans(&w.protected),
+        linkage: spans(&w.import_protected),
+        excluded: Vec::new(),
+        fields: fields.into_iter().collect(),
+        valid: valid_layout(img),
+    }
+}
+
+fn identity_bytes(view: &dyn FileView, audit: &mut Audit) -> (Vec<Rewrite>, bool) {
+    let Ok(found) = audit.search(view) else {
+        audit.complete = false;
+        audit.unexamined = vec![Span {
+            offset: 0,
+            len: view.size(),
+        }];
+        return (Vec::new(), true);
+    };
+    audit.complete &= found.complete;
+    audit.unexamined.extend(found.unexamined);
+    let rewrites = found
+        .matches
+        .iter()
+        .filter(|hit| audit.classify(hit).retained.is_none())
+        .map(|hit| {
             (
-                u64::from(section.raw_ptr),
-                u64::from(section.raw_size),
-                category,
+                Kind::Brand,
+                hit.offset,
+                hit.encoding.unwrap_or_default().spaces(hit.len as usize),
             )
         })
         .collect();
-    spans.extend(overlay_spans(view.size(), img.image_end(), detached));
-    let mut edits = BTreeMap::new();
-    let mut budget = super::MAX_TOTAL;
-    for (start, size, category) in spans {
-        if size == 0 {
-            continue;
-        }
-        if size > budget {
-            return (Vec::new(), None, true);
-        }
-        budget -= size;
-        let Some(bytes) = read_full(view, start, size as usize) else {
-            return (Vec::new(), None, true);
-        };
-        for hit in ac.find_overlapping_iter(&bytes) {
-            let start = start + hit.start() as u64;
-            let end = start + hit.len() as u64;
-            if protected.overlaps(start, end) {
-                continue;
-            }
-            if !edit {
-                return (Vec::new(), Some(category), false);
-            }
-            let base = start;
-            let is_wide = wide[hit.pattern().as_usize()];
-            for index in 0..hit.len() {
-                if !is_wide || index % 2 == 0 {
-                    edits.insert(base + index as u64, b' ');
-                }
-            }
-        }
-    }
-    let mut rewrites: Vec<Rewrite> = Vec::new();
-    for (off, byte) in edits {
-        if let Some((_, start, bytes)) = rewrites.last_mut()
-            && *start + bytes.len() as u64 == off
-        {
-            bytes.push(byte);
-        } else {
-            rewrites.push((Kind::Brand, off, vec![byte]));
-        }
-    }
-    (rewrites, None, false)
-}
-
-/// The file past the loaded image, less a detached certificate that the sweep
-/// clears. Each span is `(start, len, category)`.
-fn overlay_spans(
-    size: u64,
-    image_end: u64,
-    detached: Option<(u64, u64)>,
-) -> Vec<(u64, u64, &'static str)> {
-    if image_end >= size {
-        return Vec::new();
-    }
-    match detached.filter(|&(off, _)| off >= image_end && off < size) {
-        Some((off, len)) => {
-            let end = off.saturating_add(len).min(size);
-            vec![
-                (image_end, off - image_end, "PE overlay"),
-                (end, size - end, "PE overlay"),
-            ]
-        }
-        None => vec![(image_end, size - image_end, "PE overlay")],
-    }
+    (rewrites, !audit.complete)
 }
 
 pub(super) fn residual_category(
@@ -376,13 +344,18 @@ pub(super) fn residual_category(
     terms: &BTreeSet<String>,
 ) -> Option<&'static str> {
     let img = PeImage::parse(view)?;
-    let (ac, _) = matcher(terms)?;
-    let size = usize::try_from(view.size()).ok()?;
-    let Some(bytes) = read_full(view, 0, size) else {
+    let audit = Audit {
+        patterns: identity_patterns(terms),
+        complete: true,
+        ..Audit::default()
+    };
+    let Ok(found) = audit.search(view) else {
         return Some("PE scan budget");
     };
-    let hit = ac.find(&bytes)?;
-    let at = hit.start() as u64;
+    let Some(hit) = found.matches.first() else {
+        return (!found.complete).then_some("PE scan budget");
+    };
+    let at = hit.offset;
     Some(
         match img.sections.iter().find(|section| {
             at >= u64::from(section.raw_ptr)
@@ -404,7 +377,7 @@ pub(super) fn residual_category(
 /// Compare the loader's import records and every name reached from them. A PE
 /// can still parse after a DLL name is damaged, so format detection alone is
 /// insufficient verification for a deep copy.
-pub(super) fn imports_unchanged(original: &dyn FileView, output: &dyn FileView) -> bool {
+pub(crate) fn imports_unchanged(original: &dyn FileView, output: &dyn FileView) -> bool {
     fn ranges(view: &dyn FileView) -> Option<Protected> {
         let img = PeImage::parse(view)?;
         let mut walk = Walk {
@@ -451,21 +424,43 @@ pub(super) fn imports_unchanged(original: &dyn FileView, output: &dyn FileView) 
     })
 }
 
-fn merge_rewrites(rewrites: Vec<Rewrite>) -> Vec<Rewrite> {
-    let mut bytes = BTreeMap::new();
-    for (_, off, value) in rewrites {
-        for (i, b) in value.into_iter().enumerate() {
-            bytes.insert(off + i as u64, b);
+pub(in super::super) fn merge_rewrites(rewrites: Vec<Rewrite>) -> Vec<Rewrite> {
+    // Overlay intervals in input order. Memory is proportional to rewritten bytes,
+    // rather than one tree allocation per byte. Later structural edits win.
+    let mut ranges: BTreeMap<u64, (Kind, Vec<u8>)> = BTreeMap::new();
+    for (kind, off, value) in rewrites {
+        if value.is_empty() {
+            continue;
         }
+        let end = off + value.len() as u64;
+        let first = ranges
+            .range(..=off)
+            .next_back()
+            .filter(|(at, (_, bytes))| **at + bytes.len() as u64 > off)
+            .map_or(off, |(&at, _)| at);
+        let overlaps: Vec<_> = ranges.range(first..end).map(|(&at, _)| at).collect();
+        for at in overlaps {
+            let (old_kind, old) = ranges.remove(&at).expect("collected range");
+            let old_end = at + old.len() as u64;
+            if at < off {
+                ranges.insert(at, (old_kind, old[..(off - at) as usize].to_vec()));
+            }
+            if old_end > end {
+                ranges.insert(end, (old_kind, old[(end - at) as usize..].to_vec()));
+            }
+        }
+        ranges.insert(off, (kind, value));
     }
     let mut merged: Vec<Rewrite> = Vec::new();
-    for (off, byte) in bytes {
-        if let Some((_, start, value)) = merged.last_mut()
+    for (off, (kind, bytes)) in ranges {
+        if let Some((old_kind, start, value)) = merged.last_mut()
+            && *old_kind == kind
             && *start + value.len() as u64 == off
+            && value.len() + bytes.len() <= 1024 * 1024
         {
-            value.push(byte);
+            value.extend(bytes);
         } else {
-            merged.push((Kind::Brand, off, vec![byte]));
+            merged.push((kind, off, bytes));
         }
     }
     merged
@@ -765,7 +760,7 @@ fn message_table(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
 }
 
 /// Only assembly identities are used as evidence. The XML bytes stay intact.
-fn manifest_names(view: &dyn FileView, off: u64, size: usize) -> Vec<String> {
+fn manifest_fields(view: &dyn FileView, off: u64, size: usize) -> Vec<Hit> {
     if size > MAX_RESOURCE_STRING {
         return Vec::new();
     }
@@ -834,13 +829,24 @@ fn manifest_names(view: &dyn FileView, off: u64, size: usize) -> Vec<String> {
                 if let Some(&quote @ (b'"' | b'\'')) = tag.as_bytes().get(value) {
                     value += 1;
                     if let Some(close) = tag[value..].find(char::from(quote)) {
-                        names.push(
-                            tag[value..value + close]
-                                .split('.')
-                                .next()
-                                .unwrap_or("")
-                                .to_string(),
-                        );
+                        let start = begin + value;
+                        let value = &tag[value..value + close];
+                        let (offset, len, encoding) = if utf16 {
+                            (
+                                usize::from(bytes.starts_with(&[0xff, 0xfe])) * 2
+                                    + text[..start].encode_utf16().count() * 2,
+                                value.encode_utf16().count() * 2,
+                                Encoding::Utf16,
+                            )
+                        } else {
+                            (start, value.len(), Encoding::Utf8)
+                        };
+                        names.push(Hit {
+                            off: off + offset as u64,
+                            len,
+                            text: value.to_string(),
+                            encoding,
+                        });
                     }
                 }
             }
@@ -1075,6 +1081,25 @@ impl Walk<'_> {
         };
         if let Some(off) = self.img.rva_to_off(funcs_rva) {
             self.protected.add(off, functions as u64 * 4);
+            if let Some(table) = read_full(self.view, off, functions * 4) {
+                for i in 0..functions {
+                    if let Some(rva) = u32_at(&table, i * 4)
+                        && rva >= d.rva
+                        && u64::from(rva) < u64::from(d.rva) + u64::from(d.size)
+                        && let Some((off, bytes)) = self.name_at(rva)
+                        && u64::from(rva) + (bytes.len() as u64)
+                            < u64::from(d.rva) + u64::from(d.size)
+                        && let Ok(text) = String::from_utf8(bytes.clone())
+                    {
+                        self.structured_hits.push(Hit {
+                            off,
+                            len: bytes.len(),
+                            text,
+                            encoding: Encoding::Utf8,
+                        });
+                    }
+                }
+            }
         }
         if let Some(off) = self.img.rva_to_off(ords_rva) {
             self.protected.add(off, names as u64 * 2);
@@ -1083,8 +1108,16 @@ impl Walk<'_> {
             self.protected.add(off, names as u64 * 4);
             if let Some(table) = read_full(self.view, off, names * 4) {
                 for i in 0..names {
-                    if let Some(rva) = u32_at(&table, i * 4) {
-                        self.name_at(rva);
+                    if let Some(rva) = u32_at(&table, i * 4)
+                        && let Some((off, bytes)) = self.name_at(rva)
+                        && let Ok(text) = String::from_utf8(bytes.clone())
+                    {
+                        self.structured_hits.push(Hit {
+                            off,
+                            len: bytes.len(),
+                            text,
+                            encoding: Encoding::Utf8,
+                        });
                     }
                 }
             }
@@ -1193,11 +1226,14 @@ impl Walk<'_> {
                     Some(RT_VERSION) => self.protected.add(off, u64::from(size)),
                     Some(RT_MANIFEST) => {
                         self.protected.add(off, u64::from(size));
-                        self.evidence.extend(
-                            manifest_names(self.view, off, size as usize)
-                                .into_iter()
-                                .map(|name| (name, Source::Manifest)),
-                        );
+                        let names = manifest_fields(self.view, off, size as usize);
+                        self.evidence.extend(names.iter().map(|h| {
+                            (
+                                h.text.split('.').next().unwrap_or("").to_string(),
+                                Source::Manifest,
+                            )
+                        }));
+                        self.structured_hits.extend(names);
                     }
                     Some(RT_STRING) => {
                         self.protected.add(off, u64::from(size));
@@ -1221,6 +1257,7 @@ impl Walk<'_> {
                         {
                             Some(pipl) => {
                                 self.evidence.extend(pipl.evidence());
+                                self.structured_hits.extend(pipl.text_fields());
                                 self.pipls.push(pipl);
                             }
                             None => self.skipped.push(Reason::MalformedMetadata),
@@ -1556,9 +1593,22 @@ fn user_strings(view: &dyn FileView, md: u64, md_size: u64) -> Option<Vec<Hit>> 
 }
 
 pub(super) fn sweep(view: &dyn FileView) -> Deep {
+    sweep_with_limits(view, &Limits::default())
+}
+
+pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
     let Some(img) = PeImage::parse(view) else {
-        return Deep::default();
+        return Deep {
+            skipped: vec![Reason::MalformedMetadata],
+            ..Deep::default()
+        };
     };
+    if !valid_layout(&img) {
+        return Deep {
+            skipped: vec![Reason::MalformedMetadata],
+            ..Deep::default()
+        };
+    }
     let mut w = Walk {
         view,
         img: &img,
@@ -1572,8 +1622,9 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         evidence: Vec::new(),
         skipped: Vec::new(),
     };
+    w.protected.add(0, 64);
     w.protected
-        .add(0, u64::from(img.size_of_headers).max(img.table_end));
+        .add(img.e_lfanew, img.table_end.saturating_sub(img.e_lfanew));
     for dir in [
         DIR_EXPORT,
         DIR_IMPORT,
@@ -1603,8 +1654,13 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     let user = w.dotnet();
     w.debug();
     let certificate = w.certificate();
+    let mut fields = Vec::new();
     if let Some(info) = version::find(&img, view) {
         for item in info.strings {
+            fields.push(Span {
+                offset: item.value_off,
+                len: item.value_len,
+            });
             let source = match item.key.as_str() {
                 "CompanyName" => Some(Source::Company),
                 "ProductName" | "InternalName" | "OriginalFilename" => Some(Source::Product),
@@ -1631,7 +1687,8 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     }
 
     let regions = w.data_regions();
-    let mut hits = region_strings(view, &regions, &mut w.skipped);
+    let mut hits =
+        super::region_strings_limited(view, &regions, &mut w.skipped, limits.max_scan_bytes);
     hits.extend(w.resource_hits.iter().cloned());
     hits.extend(w.structured_hits.iter().cloned());
     hits.sort();
@@ -1653,7 +1710,12 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         .map(|section| (u64::from(section.raw_ptr), u64::from(section.raw_size)))
         .collect();
     let mut alias_hits = all_hits.clone();
-    alias_hits.extend(region_strings(view, &code_regions, &mut w.skipped));
+    alias_hits.extend(super::region_strings_limited(
+        view,
+        &code_regions,
+        &mut w.skipped,
+        limits.max_scan_bytes,
+    ));
     audit_terms.extend(vendor_alias_terms(&alias_hits, &roots, stem, &w.evidence));
     audit_terms.extend(library_terms(&alias_hits));
     // Deep PE rewrites the readable identity bytes in these ranges below.
@@ -1664,17 +1726,24 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         &Protected::default(),
     ));
     rewrites.extend(redact_hits(&user, &roots, &Protected::default()));
-    let detached = certificate
-        .as_ref()
-        .map(|marker| (marker.region.offset, marker.region.len));
-    let (identity_rewrites, _, budget_hit) = identity_bytes(
-        view,
-        &img,
-        &audit_terms,
-        &w.import_protected,
-        detached,
-        true,
-    );
+    fields.extend(w.structured_hits.iter().chain(&user).map(|h| Span {
+        offset: h.off,
+        len: h.len as u64,
+    }));
+    let mut audit = Audit {
+        patterns: identity_patterns(&audit_terms),
+        layout: layout(&w, fields),
+        limits: limits.clone(),
+        complete: !w.skipped.iter().any(|r| {
+            matches!(
+                r,
+                Reason::DeepBudget | Reason::MalformedMetadata | Reason::Io
+            )
+        }),
+        unexamined: Vec::new(),
+        allowed: Vec::new(),
+    };
+    let (identity_rewrites, budget_hit) = identity_bytes(view, &mut audit);
     if budget_hit {
         w.skipped.push(Reason::DeepBudget);
     }
@@ -1713,7 +1782,36 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
         caveats: w.caveats,
         skipped: w.skipped,
         audit_terms,
+        audit: Some(audit),
     }
+}
+
+fn valid_layout(img: &PeImage) -> bool {
+    if !img.layout_ok() || u64::from(img.size_of_headers) > img.file_size {
+        return false;
+    }
+    if img
+        .sections
+        .first()
+        .is_some_and(|s| s.header_off + img.sections.len() as u64 * 40 != img.table_end)
+    {
+        return false;
+    }
+    let mut spans: Vec<_> = img
+        .sections
+        .iter()
+        .filter(|s| s.raw_size != 0)
+        .map(|s| (u64::from(s.raw_ptr), u64::from(s.raw_size)))
+        .collect();
+    spans.sort_unstable();
+    let mut end = u64::from(img.size_of_headers);
+    for (start, len) in spans {
+        if start < end || start.checked_add(len).is_none_or(|n| n > img.file_size) {
+            return false;
+        }
+        end = start + len;
+    }
+    true
 }
 
 /// Whether the PE carries an Authenticode signature.

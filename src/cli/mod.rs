@@ -3,6 +3,7 @@
 
 pub mod args;
 pub mod headless;
+pub mod precision;
 pub mod style;
 
 pub use args::{Command, HELP_TEXT, exit, parse};

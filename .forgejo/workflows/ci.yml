@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ forgejo.ref }}
+  cancel-in-progress: ${{ forgejo.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Rust ${{ matrix.toolchain }} on Linux
+    runs-on: docker
+    container:
+      image: docker.io/library/node:24-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, 1.88.0]
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain '${{ matrix.toolchain }}'
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Check minimum supported Rust
+        if: matrix.toolchain == '1.88.0'
+        run: cargo check --all-targets --locked
+      - name: Format, lint, test and package
+        if: matrix.toolchain == 'stable'
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --all --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --all-targets --locked --no-default-features -- -D warnings
+          cargo test --locked
+          cargo test --locked --no-default-features
+          cargo package --locked --allow-dirty --no-verify

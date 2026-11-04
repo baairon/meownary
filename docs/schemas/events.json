@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "meownary events v1",
+  "$ref": "#/$defs/events",
+  "$defs": {
+    "events": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "event": {
+              "const": "done"
+            },
+            "exit": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "complete": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "version",
+            "event",
+            "exit",
+            "complete"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "event": {
+              "const": "error"
+            },
+            "error": {
+              "type": "string"
+            },
+            "exit": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "version",
+            "event",
+            "error",
+            "exit"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "event": {
+              "type": "string",
+              "not": {
+                "enum": [
+                  "done",
+                  "error"
+                ]
+              }
+            },
+            "data": {}
+          },
+          "required": [
+            "version",
+            "event",
+            "data"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

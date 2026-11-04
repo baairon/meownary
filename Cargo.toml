@@ -11,7 +11,7 @@ homepage = "https://github.com/baairon/meownary"
 readme = "README.md"
 keywords = ["forensics", "binary", "authenticity", "tui", "audit"]
 categories = ["command-line-utilities", "filesystem"]
-exclude = ["/.github", "/target"]
+exclude = ["/.github", "/.forgejo", "/target"]
 
 [dependencies]
 aho-corasick = "1.1.5"
@@ -21,6 +21,13 @@ rayon = "1.12.0"
 ron = "0.12.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.10.9"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+tar = "0.4.46"
+zip = { version = "9.3.0", default-features = false, features = ["deflate-flate2"] }
+msi = "0.11.1"
+tempfile = "3.27.0"
+time = { version = "0.3.55", default-features = false, features = ["std"] }
 walkdir = "2.5.0"
 # Every ratatui default feature except the non-crossterm backends.
 ratatui = { version = "0.30.2", optional = true, default-features = false, features = [
@@ -38,9 +45,6 @@ miniz_oxide = { version = "0.8", features = ["with-alloc"] }
 [features]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width"]
-
-[dev-dependencies]
-tempfile = "3.27.0"
 
 [lints.rust]
 unsafe_code = "forbid"

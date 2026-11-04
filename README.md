@@ -7,10 +7,12 @@
 <p align="center">
   <a href="#what-it-does">What it does</a> ·
   <a href="#deattribute">Deattribute</a> ·
+  <a href="#precision-cli">Precision CLI</a> ·
   <a href="#scrub">Scrub</a> ·
   <a href="#undo">Undo</a> ·
   <a href="#interactive-view">Interactive view</a> ·
   <a href="#json-output">JSON output</a> ·
+  <a href="docs/agents.md">Agent guide</a> ·
   <a href="#install">Install</a> ·
   <a href="#exit-codes">Exit codes</a>
 </p>
@@ -37,8 +39,8 @@ meownary makes no network requests.
 
 ## Deattribute or scrub
 
-Deattribute is a fixed, quiet pass that writes clean copies; scrub edits the
-findings you select in place.
+Deattribute writes copies using inferred identities and optional explicit rules;
+scrub edits the findings you select in place.
 
 | | Deattribute | Scrub |
 |---|---|---|
@@ -64,10 +66,14 @@ folder they walk once, recursively.
 meownary [<path>]
 meownary scan <path> [--json] [--no-color] [--fail-on <severity>]
 meownary clean <path> --deattribute [--deep] [--dry-run] [--json]
+meownary deattribute <file> [--deep] [--rules FILE] [--verify strict|protected]
 meownary clean <path> --category <slug> [--marker | --file] [--dry-run] [--force] [--json]
 meownary clean <path> --signature <id> [--marker | --file] [--dry-run] [--force] [--json]
 meownary undo [--last | --all] [--json]
 ```
+
+The [precision CLI](#precision-cli) also provides byte inspection, search, edit
+plans, verification and archive helpers. `meownary bytes --help` lists its options.
 
 - **Paths**: `scan` and `clean` need a path; `meownary` without one opens a
   file and folder picker. Hidden files are included, symbolic links are never
@@ -120,9 +126,10 @@ Every blank is one of two kinds, `brand` or `patch`.
 | WAV, AVI | `INFO/ISFT` software string | `0x20` |
 | Audio, video | `Lavf`, `Lavc`, `x264 - core`, `x265 (build`, `HandBrake` | `0x00` |
 
-- Catalog text credits are matched only in the first and last 64 KiB of a file,
-  in the formats their catalog entry lists, weak matches included. Every match
-  is blanked, though the scan lists a catalog entry once per file.
+- Catalog text credits are searched throughout the file with bounded streaming
+  reads, in the formats their catalog entry lists. Encoded matches retain their
+  original offsets. Every eligible match is planned, though the scan lists a
+  catalog entry once per file. Protected linkage and unverified layouts are kept.
 - `patched by` and the executable and media credits are blanked from the match
   to the end of its printable ASCII run, when that run ends within 80 bytes.
 - Other version keys, the numeric file version and every key name stay.
@@ -170,9 +177,89 @@ between NUL bytes as UTF-8, Windows ANSI or UTF-16 text of up to 65,536
 characters, or as a short string led by its own length byte. Text embedded in
 a larger blob is left as it is.
 Matches are whole words: `dispatched by` is not a `patched by` credit. A deep
-sweep reads at most 256 MiB of a file. It reads only the file's bytes, never
+sweep uses a 1 GiB byte budget per streaming pass, with additional bounds on
+individual metadata records. It reads only the file's bytes, never
 its name, so the same file gives the same copy on disk, inside an archive and
-on a rerun, and a deep copy plans nothing more.
+on a rerun. Verification reports identities it must retain and any incomplete
+coverage; a successful cleanup does not establish that every possible identity
+has been discovered.
+
+### Explicit identities and verification
+
+The scriptable `deattribute` command operates on one regular file and exposes
+the engine's rules, saved plans, coverage and residual matches:
+
+```sh
+meownary deattribute sample.dll --deep --dry-run --details --json
+meownary deattribute sample.dll --deep --verify protected --plan-out cleanup.json
+meownary apply cleanup.json --output sample.clean.dll
+meownary verify cleanup.json sample.clean.dll --json
+```
+
+`--verify strict` is the default. It requires complete coverage, the expected
+output bytes, applicable structural checks, and no remaining matched identity.
+`--verify protected` permits residual matches only when the original plan
+explains why they were retained, such as a parsed import name, a structural
+record, an explicit exclusion, or a region outside a rule's selection. Its
+success means the selected policy was satisfied. Retained names remain in the
+output. Failed verification prevents publication of the staged copy.
+
+Both policies audit identities learned from the original. Removing the source
+of an identity cannot make the verifier forget it. PE checks also compare parsed
+imports and thunk records against the original. Malformed PE layouts are refused.
+The existing `clean <path> --deattribute` command and the interactive view retain
+their folder and archive workflows and report incomplete verification as exit 75.
+
+Supply `--rules identities.json` to add identities without changing source code:
+
+```json
+{
+  "version": 1,
+  "identities": [
+    {
+      "id": "publisher",
+      "scope": "publisher",
+      "names": ["North Star Labs", "NorthStar"],
+      "encodings": ["utf8", "utf16le", "utf16be", "windows1252"],
+      "boundary": "identifier",
+      "ignore_ascii_case": true
+    }
+  ],
+  "exclusions": [
+    {"kind": "text", "value": "NorthStarRequiredABI"}
+  ]
+}
+```
+
+Scopes label identities as `publisher`, `product`, `toolchain`, `third_party`,
+`credits`, or `build_paths`. Names are matched as encoded bytes. Boundaries are
+`word`, `identifier`, or explicit `substring`; case folding is ASCII only.
+Identifier matching recognizes separators, case transitions and parsed RTTI
+framing. Short aliases need corroborating evidence before inference promotes
+them. Compound names stay intact instead of turning each short word into a rule.
+Raw UTF-16 discovery requires endian evidence; declared encodings and exact rules
+can match Unicode directly, including surrogate pairs.
+
+Optional `files` globs match the normalized logical input path, using `/` even
+on Windows. Optional `regions` globs match labels from `inspect`, such as
+`PE data` or `PE resource`. Globs support case-sensitive `*` and `?`.
+`expected_matches` checks distinct selected byte ranges before editing.
+A `replacement` must fit the original encoded field; shorter replacements need
+an explicit one-character `pad`. Omitting it blanks with encoded spaces.
+Conflicting explicit replacements are refused. Exclusions retain an entire
+planned edit when it overlaps the selected bytes, so structural rewrites are
+not partially applied. Explicit rules retain the engine's structural protections.
+
+`--max-scan` defaults to 1,073,741,824 bytes per streaming pass and `--max-matches`
+to 100,000. An incomplete rules or exclusion scan refuses editing. Reports
+distinguish unexplored ranges from explained residuals. `--details` can expose
+identity text and audit patterns; ordinary reports omit those values.
+`--plan-out` alone saves a plan without applying it; `--dry-run` performs no
+binary write and can still save a requested plan. `--output` applies to a copy.
+Without either, the copy lands beside the input as `name.deattributed.ext`.
+Existing plans and copies need `--overwrite`. `clean <file> --deattribute` with
+any of `--rules`, `--verify`, `--max-scan`, `--max-matches`, `--plan-out` or
+`--output` runs this command, so it takes one file rather than a folder.
 
 ### Archives
 
@@ -246,7 +333,7 @@ reports `nothing to blank inside the archive`.
 | `functional name kept` | a name in a resource fork or other protected linkage could not be edited |
 | `functional value kept` | a URL or registry key outside PE deep mode was kept |
 | `malformed metadata` | a structure that can name the vendor (a PiPL list, .NET metadata, an embedded PDB, a code signature, a resource map) could not be read safely, so it is left as it is |
-| `deep scan budget reached` | the deep sweep stopped at its 256 MiB read limit, or a record was too large to read |
+| `deep scan budget reached` | a streaming pass exhausted its byte or match budget, or a record was too large to read |
 | `unsupported entry` | an archive entry that is encrypted, ZIP64, corrupt or uses an unknown method |
 | `entry too large` | an archive entry over 256 MiB uncompressed |
 | `nested archive` | an archive inside the archive, which is never opened |
@@ -297,6 +384,158 @@ encryption info.
 - Re-sign an executable. The copy of a signed file carries a broken
   signature, or none for a PE or Mach-O in deep mode, and the run reports the
   caveat.
+
+## Precision CLI
+
+Read and edit bytes without a separate script for each file:
+
+```sh
+meownary inspect sample.bin --json
+meownary inventory ./samples --json
+meownary hash sample.bin --json
+meownary bytes read sample.bin --offset 0x100 --length 64 --details
+meownary find sample.bin --hex "4e 6f ?? 74 68" --json
+meownary strings sample.bin --encoding utf16le --details --json
+meownary diff original.bin changed.bin --details --json
+```
+
+`inspect` reports hashes, detected layout, protected spans and findings.
+`inventory` walks files without following symbolic links and marks incomplete
+inventories. Hashes include BLAKE3, SHA-256 and file size. Reads default to 256
+bytes and are capped at 1 MiB. String and diff output default to 1,000 results;
+use `--limit` to change that cap. String offsets and lengths always refer to
+encoded bytes. Invalid text ends a run, and discovery resumes at later valid
+text. Oversized string records report truncation. Diff details show at most 64
+sample bytes per changed range.
+
+Search accepts exactly one `--text` or `--hex` pattern. Hex search supports `?`
+nibbles, with at least one exact byte required. `--encoding` accepts `ascii`,
+`utf8`, `utf16le`, `utf16be`, or `windows1252`; `--ignore-case` folds ASCII only.
+`--boundary` selects `substring`, `word`, or `identifier`. `--offset` and
+`--length` bound a read or search. Search coverage reports examined and
+unexamined ranges when byte or match limits stop it. Use `--details` to include
+decoded text or matched bytes. `--` ends options for filenames that start with
+a dash; a text option's following argument is its literal value.
+
+### Byte edits and saved plans
+
+```sh
+meownary bytes replace sample.bin --offset 0x100 --hex "00 01 02 03" --dry-run
+meownary bytes replace sample.bin --find-text "North Star" --text "South Star" --expect 2 --plan-out edits.json
+meownary apply edits.json --output edited.bin
+meownary verify edits.json edited.bin --json
+meownary bytes fill sample.bin --offset 0x200 --length 16 --fill 0
+meownary bytes insert sample.bin --offset 0x100 --data-file payload.bin
+meownary bytes delete sample.bin --offset 0x100 --length 16
+meownary bytes truncate sample.bin --offset 0x800
+```
+
+Every edit uses original-input coordinates, including multi-operation plans.
+Numbers accept decimal and `0x` hexadecimal. Search selection supports
+`--expect N` for the total match count and `--occurrence N` for one match,
+numbered from 1. Overlapping edits and ambiguous insertions at the same offset
+are refused. Replacement keeps its length unless `--resize` is explicit.
+`--length` fixes the replacement field size; `--pad BYTE` explicitly pads a
+shorter inline replacement. Fill requires a byte value from 0 to 255.
+
+Copies default to `<input>.edited`; `--output` selects another path. Existing
+outputs require `--overwrite`. Input, replacement payload, plan and output paths
+must not collide. `--plan-out` alone writes only the plan. To apply immediately
+as well, supply `--output` or `--in-place`.
+
+Recognized formats require `--raw` for resizing or editing protected or
+unverified regions. A raw plan must also be applied with `--raw`. Raw verification
+checks the planned bytes and hashes, and makes no structural-validity claim.
+Deattribution plans cannot be raw. Same-length byte plans outside protected
+regions also verify byte integrity; only deattribution adds identity and
+structural policy checks.
+
+For several exact edits, use `plan sample.bin --spec edits.spec.json --output edits.json`:
+
+```json
+{
+  "version": 1,
+  "operations": [
+    {
+      "kind": "replace",
+      "offset": 256,
+      "remove": 4,
+      "data": {"kind": "hex", "value": "00 01 02 03"}
+    },
+    {
+      "kind": "fill",
+      "offset": 512,
+      "remove": 16,
+      "data": {"kind": "fill", "byte": 0, "len": 16}
+    }
+  ]
+}
+```
+
+Plans pin the input and expected output by size, BLAKE3 and SHA-256, record
+affected-range hashes, and pin replacement files too. Apply refuses changed
+inputs, changed payloads, inconsistent plans and invalid operations. It writes
+and verifies a temporary sibling before publication. Failed verification leaves
+the existing destination intact.
+
+`--in-place` records a complete original snapshot in the existing undo journal
+before replacement. `meownary undo` restores it. A later `verify` of that edit
+uses the matching original snapshot, and refuses if it is unavailable or
+inconsistent. Keep the plan and undo state while you need this verification.
+
+### Archive helpers
+
+```sh
+meownary archive list bundle.zip --manifest contents.json
+meownary archive extract bundle.zip --output extracted
+meownary archive pack extracted --format zip --output rebuilt.zip --manifest rebuilt.json
+meownary archive verify rebuilt.zip --manifest rebuilt.json
+meownary archive msi installer.msi --json
+```
+
+These helpers read and write ZIP/ZIP64, TAR and TAR.GZ. They preserve file bytes,
+relative paths and empty directories. Extraction stages the directory before
+publishing it and requires a new destination. Packaging requires its archive
+and manifest outside the input tree. Verification checks entry paths, kinds,
+sizes and content hashes against the manifest. Nested archives remain ordinary
+files and are not processed recursively.
+
+Default limits are 100,000 entries, 256 MiB per entry and 1 GiB total payload.
+`--limit`, `--max-entry` and `--max-total` override them. ZIP expansion ratios
+above 1,000 and TAR framing beyond the payload budget plus 16 MiB are refused.
+Absolute paths, traversal, duplicate or case-colliding names, links, encrypted
+entries and special files are refused.
+
+Packing preserves supported modification times and Unix permission bits;
+extraction restores those fields where supported. ZIP timestamps use UTC and
+two-second precision and must fit 1980 through 2107. TAR stores whole Unix
+seconds. `archive pack --normalize-metadata` chooses fixed timestamps and modes
+for reproducible output. Ownership, ACLs, extended attributes and archive-specific
+extra fields are not carried through generic repacking. The existing
+deattribution archive rewriters retain their own preservation rules described
+above. MSI inspection reads File, Component, Directory, Media and Property
+tables; it neither extracts payloads nor runs installation actions.
+
+### Machine interfaces
+
+`capabilities --json` describes the implemented surface. `schema plan`,
+`schema rules`, `schema spec`, and `schema events` print self-contained JSON
+schemas that also ship in [docs/schemas](docs/schemas). Plans, specs and rules
+accept `-` for stdin. JSON inputs are capped at 32 MiB; large replacement bytes
+belong in a pinned payload file rather than inline hex.
+
+Precision commands emit version 1 JSON Lines with `--json`: result events carry
+`data`, errors carry `error` and `exit`, and the final `done` event carries `exit`
+and `complete`. Without `--json` they print each result as indented JSON and
+errors on stderr. A completed read or search with no matches still exits 0.
+Usage, rule validation and stale-plan errors exit 2. Incomplete coverage,
+verification failures and operational errors exit 75, including a missing input
+and an existing output without `--overwrite`. The legacy scan, clean and undo
+JSON event shapes stay as documented below.
+
+The [agent guide](docs/agents.md) is the full reference for scripts and agents:
+every option each command accepts, the events it prints, exit codes, rules and
+spec fields, limits, common errors and end-to-end workflows.
 
 ## Scrub
 
@@ -629,9 +868,12 @@ Every command exits with one of seven codes.
 |------|---------|
 | 0    | success |
 | 1    | `scan --fail-on` was met; `clean` matched but changed nothing; `undo` failed; the view failed |
-| 2    | bad command, flag or value, a missing path, or a path that does not exist |
+| 2    | bad command, flag or value, a missing path, or a path that does not exist; for precision commands, also invalid rules or specs, stale plans and failed search selections |
 | 73   | the state store could not be opened, or another meownary holds it; nothing was edited |
-| 75   | some files could not be fully read, or a deattributed copy could not be written or verified; for deattribute it wins over 1 |
+| 75   | some files could not be fully read, or a deattributed copy could not be written or verified; for deattribute it wins over 1; for precision commands, any incomplete result, failed verification or I/O error, a missing input included |
+
+Precision commands use only 0, 2, 75, 101 and 130. The
+[agent guide](docs/agents.md#exit-codes) maps each code to a next step.
 | 101  | internal error; meownary prints where to report it |
 | 130  | interrupted with Ctrl-C (Windows reports 0xC000013A instead) |
 

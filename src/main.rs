@@ -15,6 +15,7 @@ fn main() -> ExitCode {
     install_panic_hook();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let code = match cli::args::parse_os(&argv) {
+        Command::Precision { args } => cli::precision::run(&args),
         Command::Version => {
             print_out(&format!("meownary {}\n", env!("CARGO_PKG_VERSION")));
             exit::OK

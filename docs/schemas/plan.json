@@ -1,0 +1,606 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "meownary plan v1",
+  "$ref": "#/$defs/plan",
+  "$defs": {
+    "span": {
+      "type": "object",
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "len": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "offset",
+        "len"
+      ],
+      "additionalProperties": false
+    },
+    "encoding": {
+      "enum": [
+        "ascii",
+        "utf8",
+        "utf16le",
+        "utf16be",
+        "windows1252"
+      ]
+    },
+    "boundary": {
+      "enum": [
+        "substring",
+        "word",
+        "identifier"
+      ]
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "max_scan_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_matches": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "max_scan_bytes",
+        "max_matches"
+      ],
+      "additionalProperties": false
+    },
+    "hashes": {
+      "type": "object",
+      "properties": {
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blake3": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "size",
+        "blake3",
+        "sha256"
+      ],
+      "additionalProperties": false
+    },
+    "pattern": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "hex"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "text"
+            },
+            "value": {
+              "type": "string"
+            },
+            "encoding": {
+              "$ref": "#/$defs/encoding"
+            },
+            "ignore_ascii_case": {
+              "type": "boolean"
+            },
+            "boundary": {
+              "$ref": "#/$defs/boundary"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "payload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "hex"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "fill"
+            },
+            "byte": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "len": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "byte",
+            "len"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "file"
+            },
+            "path": {
+              "type": "string"
+            },
+            "hashes": {
+              "$ref": "#/$defs/hashes"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "hashes"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "empty"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "replace",
+            "fill",
+            "insert",
+            "delete",
+            "truncate"
+          ]
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "remove": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "data": {
+          "$ref": "#/$defs/payload"
+        },
+        "resize": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "offset",
+        "remove",
+        "data"
+      ],
+      "additionalProperties": false
+    },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "enum": [
+            "publisher",
+            "product",
+            "toolchain",
+            "third_party",
+            "credits",
+            "build_paths"
+          ]
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "encodings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/encoding"
+          }
+        },
+        "boundary": {
+          "$ref": "#/$defs/boundary"
+        },
+        "ignore_ascii_case": {
+          "type": "boolean"
+        },
+        "replacement": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pad": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expected_matches": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "names"
+      ],
+      "additionalProperties": false
+    },
+    "rules": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "identities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identity"
+          }
+        },
+        "exclusions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "layout": {
+      "type": "object",
+      "properties": {
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/span"
+              },
+              "category": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "span",
+              "category"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "protected": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/span"
+          }
+        },
+        "linkage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/span"
+          }
+        },
+        "excluded": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/span"
+          }
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/span"
+          }
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "size",
+        "format",
+        "regions",
+        "protected",
+        "linkage",
+        "fields",
+        "valid"
+      ],
+      "additionalProperties": false
+    },
+    "audit": {
+      "type": "object",
+      "properties": {
+        "patterns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pattern"
+          }
+        },
+        "layout": {
+          "$ref": "#/$defs/layout"
+        },
+        "limits": {
+          "$ref": "#/$defs/limits"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "unexamined": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/span"
+          }
+        },
+        "allowed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "span": {
+                "$ref": "#/$defs/span"
+              }
+            },
+            "required": [
+              "pattern",
+              "span"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "patterns",
+        "layout",
+        "limits",
+        "complete",
+        "unexamined"
+      ],
+      "additionalProperties": false
+    },
+    "policy": {
+      "enum": [
+        "strict",
+        "protected"
+      ]
+    },
+    "options": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/limits"
+        },
+        "rules": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/rules"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verification": {
+          "$ref": "#/$defs/policy"
+        }
+      },
+      "required": [
+        "limits",
+        "rules",
+        "verification"
+      ],
+      "additionalProperties": false
+    },
+    "check": {
+      "type": "object",
+      "properties": {
+        "deep": {
+          "type": "boolean"
+        },
+        "options": {
+          "$ref": "#/$defs/options"
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "audit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/audit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage_complete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "deep",
+        "options",
+        "policy",
+        "audit",
+        "coverage_complete"
+      ],
+      "additionalProperties": false
+    },
+    "plan": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "input": {
+          "type": "string"
+        },
+        "before": {
+          "$ref": "#/$defs/hashes"
+        },
+        "after": {
+          "$ref": "#/$defs/hashes"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "edit": {
+                "$ref": "#/$defs/request"
+              },
+              "expected_blake3": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "edit",
+              "expected_blake3"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "raw": {
+          "type": "boolean"
+        },
+        "deattribute": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "input",
+        "before",
+        "after",
+        "operations",
+        "raw",
+        "deattribute"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -23,7 +23,22 @@ mod pe;
 mod pipl;
 mod rsrc;
 
+pub(crate) use pe::imports_unchanged;
+pub(super) use pe::merge_rewrites;
 pub(super) use pe::{checksum_target, signed as pe_signed};
+
+pub(super) fn pe_layout(view: &dyn FileView) -> super::layout::Layout {
+    pe::sweep_with_limits(
+        view,
+        &crate::edit::precision::pattern::Limits {
+            max_scan_bytes: 0,
+            max_matches: 1,
+        },
+    )
+    .audit
+    .map(|a| a.layout)
+    .unwrap_or_default()
+}
 
 /// Longest string the sweep considers, in characters.
 const MAX_STRING: usize = 64 * 1024;
@@ -49,6 +64,7 @@ pub(super) struct Deep {
     pub skipped: Vec<Reason>,
     /// Readable identities learned from the original PE for copy verification.
     pub audit_terms: BTreeSet<String>,
+    pub audit: Option<super::audit::Audit>,
 }
 
 pub(super) fn residual_category(
@@ -76,15 +92,28 @@ pub(super) fn pe_terms(view: &dyn FileView) -> BTreeSet<String> {
 pub(super) type Rewrite = (Kind, u64, Vec<u8>);
 
 /// Plan the deep pass for one file.
+#[cfg(test)]
 pub(super) fn sweep(report: &FileReport, view: &dyn FileView) -> Deep {
+    sweep_with_limits(
+        report,
+        view,
+        &crate::edit::precision::pattern::Limits::default(),
+    )
+}
+
+pub(super) fn sweep_with_limits(
+    report: &FileReport,
+    view: &dyn FileView,
+    limits: &crate::edit::precision::pattern::Limits,
+) -> Deep {
     match report.format.as_deref() {
-        Some("pe") => pe::sweep(view),
+        Some("pe") => pe::sweep_with_limits(view, limits),
         Some("rsrc" | "appledouble") => rsrc::sweep(view),
         Some("elf") => {
             let mut regions = elf::data_regions(view);
             regions.extend(elf::debug_string_regions(view));
             regions.sort_unstable();
-            binary(view, &regions, &Protected::default(), &Vec::new())
+            binary(view, &regions, &Protected::default(), &Vec::new(), limits)
         }
         Some("macho") => {
             let found = macho::deep_regions(view);
@@ -106,7 +135,13 @@ pub(super) fn sweep(report: &FileReport, view: &dyn FileView) -> Deep {
                     names
                 })
                 .collect();
-            let mut deep = binary(view, &found.regions, &Protected::default(), &evidence);
+            let mut deep = binary(
+                view,
+                &found.regions,
+                &Protected::default(),
+                &evidence,
+                limits,
+            );
             for sig in &found.signatures {
                 if sig.len > MAX_TOTAL {
                     deep.skipped.push(Reason::DeepBudget);
@@ -136,8 +171,17 @@ pub(super) fn sweep(report: &FileReport, view: &dyn FileView) -> Deep {
             }
             deep
         }
-        None | Some("script") if looks_text(view) => text(view),
-        None => fallback(view),
+        None | Some("script") if looks_text(view) => {
+            if view.size() > limits.max_scan_bytes {
+                Deep {
+                    skipped: vec![Reason::DeepBudget],
+                    ..Deep::default()
+                }
+            } else {
+                text(view)
+            }
+        }
+        None => fallback_limited(view, limits.max_scan_bytes),
         _ => Deep::default(),
     }
 }
@@ -159,6 +203,7 @@ pub(super) struct Hit {
 pub(super) enum Encoding {
     Utf8,
     Utf16,
+    Utf16be,
     SingleByte,
 }
 
@@ -177,7 +222,7 @@ pub(super) enum Source {
 pub(super) type Evidence = Vec<(String, Source)>;
 
 /// Byte ranges a sweep must never touch, as sorted `(start, end)` pairs.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct Protected(Vec<(u64, u64)>);
 
 impl Protected {
@@ -273,32 +318,87 @@ fn strings(bytes: &[u8], base: u64, bounded_start: bool, out: &mut Vec<Hit>) {
             });
         }
     }
-    for parity in 0..2 {
-        let mut i = parity;
-        while i + 1 < bytes.len() {
-            if bytes[i + 1] != 0 || !(0x20..=0x7e).contains(&bytes[i]) {
-                i += 2;
-                continue;
-            }
-            let start = i;
-            while i + 1 < bytes.len() && bytes[i + 1] == 0 && (0x20..=0x7e).contains(&bytes[i]) {
-                i += 2;
-            }
-            let chars = (i - start) / 2;
-            if (4..=MAX_STRING).contains(&chars)
-                && bytes.get(i..i + 2) == Some(&[0, 0][..])
-                && starts_ok(start, 2)
-            {
-                out.push(Hit {
-                    off: base + start as u64,
-                    len: i - start,
-                    text: bytes[start..i]
-                        .iter()
-                        .step_by(2)
-                        .map(|&b| char::from(b))
-                        .collect(),
-                    encoding: Encoding::Utf16,
-                });
+    for big_endian in [false, true] {
+        for parity in 0..2 {
+            let mut i = parity;
+            while i + 1 < bytes.len() {
+                let unit = |at: usize| {
+                    let p = [bytes[at], bytes[at + 1]];
+                    if big_endian {
+                        u16::from_be_bytes(p)
+                    } else {
+                        u16::from_le_bytes(p)
+                    }
+                };
+                let printable = |u: u16| {
+                    (0xd800..=0xdfff).contains(&u)
+                        || char::from_u32(u as u32).is_some_and(|c| {
+                            !c.is_control()
+                                && !matches!(c, '\u{feff}' | '\u{fffd}' | '\u{fffe}' | '\u{ffff}')
+                        })
+                };
+                if !printable(unit(i)) {
+                    i += 2;
+                    continue;
+                }
+                let start = i;
+                while i + 1 < bytes.len() && printable(unit(i)) {
+                    i += 2;
+                }
+                let chars = (i - start) / 2;
+                if (4..=MAX_STRING).contains(&chars)
+                    && bytes.get(i..i + 2) == Some(&[0, 0][..])
+                    && (starts_ok(start, 2)
+                        || (start >= 2
+                            && bytes[start - 2..start]
+                                == if big_endian {
+                                    [0xfe, 0xff]
+                                } else {
+                                    [0xff, 0xfe]
+                                }))
+                {
+                    let Some(text) = (if big_endian {
+                        crate::edit::precision::pattern::Encoding::Utf16be
+                    } else {
+                        crate::edit::precision::pattern::Encoding::Utf16le
+                    })
+                    .decode(&bytes[start..i]) else {
+                        continue;
+                    };
+                    // Untyped bytes need positive endian evidence. Opposite-endian
+                    // readings of ASCII pairs otherwise look like unrelated CJK text.
+                    let bom = start >= 2
+                        && bytes[start - 2..start]
+                            == if big_endian {
+                                [0xfe, 0xff]
+                            } else {
+                                [0xff, 0xfe]
+                            };
+                    let ascii = text.chars().filter(char::is_ascii).count();
+                    if !bom && ascii < 2 {
+                        continue;
+                    }
+                    if big_endian
+                        && !bom
+                        && out.iter().any(|h| {
+                            h.encoding == Encoding::Utf16
+                                && h.text == text
+                                && h.off.abs_diff(base + start as u64) <= 1
+                        })
+                    {
+                        continue;
+                    }
+                    out.push(Hit {
+                        off: base + start as u64,
+                        len: i - start,
+                        text,
+                        encoding: if big_endian {
+                            Encoding::Utf16be
+                        } else {
+                            Encoding::Utf16
+                        },
+                    });
+                }
             }
         }
     }
@@ -324,16 +424,27 @@ pub(super) fn read_full(view: &dyn FileView, off: u64, len: usize) -> Option<Vec
 /// Every string in each region, read in overlapping windows so a string that
 /// straddles a window edge is still seen whole. Regions past `MAX_TOTAL` are
 /// not read and report [`Reason::DeepBudget`]. Sorted and deduplicated.
+#[cfg(test)]
 fn region_strings(
     view: &dyn FileView,
     regions: &[(u64, u64)],
     skipped: &mut Vec<Reason>,
 ) -> Vec<Hit> {
+    region_strings_limited(view, regions, skipped, MAX_TOTAL)
+}
+
+fn region_strings_limited(
+    view: &dyn FileView,
+    regions: &[(u64, u64)],
+    skipped: &mut Vec<Reason>,
+    max_bytes: u64,
+) -> Vec<Hit> {
     let overlap = (MAX_STRING as u64 + 1) * 2;
-    let mut budget = MAX_TOTAL;
+    let mut budget = max_bytes;
     let mut hits = Vec::new();
     for &(off, len) in regions {
         let Some(end) = off.checked_add(len).filter(|&e| e <= view.size()) else {
+            skipped.push(Reason::MalformedMetadata);
             continue;
         };
         let mut pos = off;
@@ -349,6 +460,7 @@ fn region_strings(
                 break;
             }
             let Some(bytes) = read_full(view, from, (to - from) as usize) else {
+                skipped.push(Reason::Io);
                 break;
             };
             budget -= to - from;
@@ -514,9 +626,41 @@ fn candidate(value: &str) -> Option<String> {
         .trim_end_matches(|c: char| !c.is_alphanumeric())
         .to_ascii_lowercase();
     (first.len() >= 5
-        && first.bytes().any(|b| b.is_ascii_alphabetic())
+        && first.chars().any(char::is_alphabetic)
         && !ROOT_STOPLIST.contains(&first.as_str()))
     .then_some(first)
+}
+
+/// Keep a compound identity intact, dropping legal suffixes and trailing versions.
+/// Individual short words are not promoted into global matching rules.
+fn compound_identity(value: &str) -> Option<String> {
+    let mut words = Vec::new();
+    for word in value.split_whitespace().take(12) {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let lower = word.to_ascii_lowercase();
+        if word.is_empty()
+            || word.chars().next().is_some_and(|c| c.is_ascii_digit())
+            || matches!(
+                lower.as_str(),
+                "inc"
+                    | "incorporated"
+                    | "ltd"
+                    | "llc"
+                    | "corp"
+                    | "corporation"
+                    | "all"
+                    | "rights"
+                    | "reserved"
+            )
+        {
+            break;
+        }
+        words.push(word);
+    }
+    let name = words.join(" ").to_ascii_lowercase();
+    (name.chars().filter(|c| c.is_alphabetic()).count() >= 4
+        && !ROOT_STOPLIST.contains(&name.as_str()))
+    .then_some(name)
 }
 
 /// Mine a host label, without treating the transport or service subdomain as
@@ -627,6 +771,11 @@ pub(super) fn roots(hits: &[Hit], module: Option<&str>, extra: &Evidence) -> BTr
     }
     let mut corroborated: BTreeMap<String, BTreeSet<Source>> = BTreeMap::new();
     for (value, source) in extra {
+        if matches!(source, Source::Company | Source::Product)
+            && let Some(name) = compound_identity(value)
+        {
+            roots.insert(name);
+        }
         if let Some(root) = candidate(value) {
             if *source == Source::Company {
                 roots.insert(root.clone());
@@ -637,6 +786,11 @@ pub(super) fn roots(hits: &[Hit], module: Option<&str>, extra: &Evidence) -> BTr
     let mut acronyms: BTreeMap<String, (usize, bool)> = BTreeMap::new();
     for hit in hits {
         if let Some(vendor) = copyright_vendor(&hit.text) {
+            if let Some(start) = hit.text.to_ascii_lowercase().find(&vendor)
+                && let Some(name) = compound_identity(&hit.text[start..])
+            {
+                roots.insert(name);
+            }
             roots.insert(vendor);
         }
         for name in url_candidates(&hit.text) {
@@ -817,10 +971,15 @@ fn redact_hits(hits: &[Hit], roots: &BTreeSet<String>, protected: &Protected) ->
                             let to = h.text[..end].chars().count();
                             (from, to, vec![b' '; to - from])
                         }
-                        Encoding::Utf16 => {
+                        Encoding::Utf16 | Encoding::Utf16be => {
                             let from = h.text[..start].encode_utf16().count() * 2;
                             let to = h.text[..end].encode_utf16().count() * 2;
-                            (from, to, [0x20, 0].repeat((to - from) / 2))
+                            let space = if h.encoding == Encoding::Utf16 {
+                                [0x20, 0]
+                            } else {
+                                [0, 0x20]
+                            };
+                            (from, to, space.repeat((to - from) / 2))
                         }
                     };
                     (start < end && end <= h.len).then_some((kind, h.off + start as u64, bytes))
@@ -893,14 +1052,44 @@ fn binary(
     regions: &[(u64, u64)],
     protected: &Protected,
     evidence: &Evidence,
+    limits: &crate::edit::precision::pattern::Limits,
 ) -> Deep {
     let mut skipped = Vec::new();
-    let hits = region_strings(view, regions, &mut skipped);
+    let hits = region_strings_limited(view, regions, &mut skipped, limits.max_scan_bytes);
     let roots = roots(&hits, None, evidence);
     skipped.extend(residuals(&hits, &[], &[], &roots));
+    let mut layout = super::layout::inspect(view);
+    for hit in &hits {
+        for (start, end) in functional_spans(&hit.text) {
+            let byte_offset = |at| match hit.encoding {
+                Encoding::Utf8 => at,
+                Encoding::SingleByte => hit.text[..at].chars().count(),
+                Encoding::Utf16 | Encoding::Utf16be => hit.text[..at].encode_utf16().count() * 2,
+            };
+            let from = byte_offset(start);
+            let to = byte_offset(end);
+            layout.linkage.push(crate::edit::precision::pattern::Span {
+                offset: hit.off + from as u64,
+                len: (to - from) as u64,
+            });
+        }
+    }
+    let complete = !skipped.iter().any(|reason| {
+        matches!(
+            reason,
+            Reason::DeepBudget | Reason::MalformedMetadata | Reason::Io
+        )
+    });
     Deep {
         rewrites: redact_hits(&hits, &roots, protected),
         skipped,
+        audit: Some(super::audit::Audit {
+            patterns: super::audit::identity_patterns(&roots),
+            layout,
+            limits: limits.clone(),
+            complete,
+            ..super::audit::Audit::default()
+        }),
         ..Deep::default()
     }
 }
@@ -983,13 +1172,13 @@ fn entropy(bytes: &[u8]) -> f64 {
 /// A file no parser describes: only patch credits, copyright marks and build
 /// paths in NUL-bounded strings, and only where the bytes around the string
 /// are not compressed or encrypted.
-fn fallback(view: &dyn FileView) -> Deep {
+fn fallback_limited(view: &dyn FileView, max_bytes: u64) -> Deep {
     let size = view.size();
     let mut skipped = Vec::new();
-    if size > MAX_TOTAL {
+    if size > max_bytes {
         skipped.push(Reason::DeepBudget);
     }
-    let hits = region_strings(view, &[(0, size.min(MAX_TOTAL))], &mut skipped);
+    let hits = region_strings_limited(view, &[(0, size.min(max_bytes))], &mut skipped, max_bytes);
     let mut rewrites = Vec::new();
     for hit in hits {
         let lower = hit.text.to_ascii_lowercase();

@@ -1,7 +1,6 @@
-//! A small hand-rolled argument parser. meownary's surface is a handful of
-//! verbs, so a discriminated `Command` plus a strict reader beats pulling in a
-//! macro-heavy parser. Anything malformed becomes `Command::Invalid`, which
-//! `main` prints with a pointer to `--help` and the usage exit code.
+//! Strict argument parsing for the interactive view and legacy commands.
+//! Precision commands retain their OS arguments for their own parser. Other
+//! malformed input becomes `Command::Invalid` with the usage exit code.
 //!
 //! Rules: option values may not start with `-`; boolean flags reject
 //! `=value`; `--` ends options so later arguments are always paths.
@@ -63,6 +62,10 @@ pub enum CleanUnit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Precision and policy commands preserve raw OS path arguments.
+    Precision {
+        args: Vec<OsString>,
+    },
     /// Open the interactive TUI on a file or directory, or on a folder picker
     /// when no path was given. Nothing defaults to the current directory.
     Tui {
@@ -245,6 +248,26 @@ fn parse_severity(s: &str) -> Option<Severity> {
 
 /// Parse `argv` (already without the program name).
 pub fn parse(argv: &[String]) -> Command {
+    if argv
+        .first()
+        .is_some_and(|arg| super::precision::is_command(arg))
+        || (argv.first().is_some_and(|a| a == "clean")
+            && argv.iter().take_while(|a| a.as_str() != "--").any(|a| {
+                matches!(
+                    split_eq(a).0,
+                    "--rules"
+                        | "--verify"
+                        | "--max-scan"
+                        | "--max-matches"
+                        | "--plan-out"
+                        | "--output"
+                )
+            }))
+    {
+        return Command::Precision {
+            args: argv.iter().map(OsString::from).collect(),
+        };
+    }
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     match args.first().copied() {
         None => Command::Tui { path: None },
@@ -264,6 +287,10 @@ pub fn parse_os(argv: &[OsString]) -> Command {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let mut cmd = parse(&lossy);
+    if let Command::Precision { args } = &mut cmd {
+        *args = argv.to_vec();
+        return cmd;
+    }
     let path = match &mut cmd {
         Command::Tui { path: Some(path) }
         | Command::Scan { path, .. }
@@ -568,6 +595,14 @@ usage
                                     write a copy with brand labels and patch
                                     credits blanked, beside each file
   meownary undo [flags]             undo the last clean (or everything)
+  meownary deattribute <file>       deattribute with explicit rules and policies
+  meownary inspect|inventory|hash   inspect layout, list files, or hash bytes
+  meownary bytes <operation>        read|replace|fill|insert|delete|truncate
+  meownary find|strings|diff        bounded byte and text inspection
+  meownary plan|apply|verify        save, apply and verify original-offset edits
+  meownary archive <operation>      list, extract, pack, verify, inspect MSI
+  meownary capabilities|schema      discover versioned machine interfaces
+                                    use bytes --help for precision options
   meownary -v, --version            print the version
   meownary -h, --help               print this
 

@@ -10,7 +10,7 @@ use common::{Fixture, mz_bytes, of_kind};
 
 /// A small PE stand-in carrying one `patched by` credit.
 fn credited_exe() -> Vec<u8> {
-    let mut bytes = mz_bytes();
+    let mut bytes = common::pe_bytes();
     bytes.extend_from_slice(b"patched by Invented\0");
     bytes
 }

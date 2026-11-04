@@ -1568,8 +1568,7 @@ mod tests {
     fn deattribute_writes_a_copy_and_leaves_the_original() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invented.exe");
-        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-        bytes.resize(256, 0);
+        let mut bytes = crate::test_pe::pe_bytes();
         bytes.extend_from_slice(b"patched by Invented\0");
         std::fs::write(&path, &bytes).unwrap();
         let report = scan::scan_file(&path, &crate::parsers::registry());
@@ -1598,8 +1597,7 @@ mod tests {
 
     fn patched_exe(dir: &Path) -> (PathBuf, Vec<u8>) {
         let path = dir.join("invented.exe");
-        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-        bytes.resize(256, 0);
+        let mut bytes = crate::test_pe::pe_bytes();
         bytes.extend_from_slice(b"patched by Invented\0");
         std::fs::write(&path, &bytes).unwrap();
         (path, bytes)
@@ -2279,8 +2277,7 @@ mod tests {
         let mut reports = Vec::new();
         for name in names {
             let path = dir.join(name);
-            let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-            bytes.resize(256, 0);
+            let mut bytes = crate::test_pe::pe_bytes();
             bytes.extend_from_slice(b"patched by Invented\0");
             std::fs::write(&path, &bytes).unwrap();
             reports.push(scan::scan_file(&path, &registry));

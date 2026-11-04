@@ -103,98 +103,98 @@ impl Span<'_> {
     }
 }
 
-/// Every selected catalog occurrence in the existing scan windows. Audit scans
-/// still report only the first occurrence of each signature.
+/// Every selected catalog occurrence through bounded streaming reads. Entries
+/// that require a header or tail still honor that constraint. The ordinary
+/// finding scan reports only the first occurrence of each signature.
 pub(crate) struct CreditHit {
+    pub encoding: crate::edit::precision::pattern::Encoding,
     pub index: usize,
     pub offset: u64,
     pub len: u64,
     pub available: usize,
 }
 
-pub(crate) fn deattribute_hits(view: &dyn FileView, format: Option<&str>) -> Vec<CreditHit> {
-    let Some(matcher) = embedded_matcher() else {
-        return Vec::new();
+pub(crate) fn deattribute_hits(
+    view: &dyn FileView,
+    format: Option<&str>,
+    limits: &crate::edit::precision::pattern::Limits,
+) -> std::io::Result<(
+    Vec<CreditHit>,
+    crate::edit::precision::pattern::SearchReport,
+)> {
+    use crate::edit::precision::pattern::{
+        Boundary, Encoding, Matcher as StreamMatcher, Pattern, Span,
     };
     let cat = catalog();
-    let header = view.header();
-    let tail = view.tail();
-    let header_end = header.len() as u64;
-    let tail_start = view.tail_start();
-    let joined;
-    let spans: Vec<Span> = if tail_start <= header_end {
-        let skip = usize::try_from(header_end - tail_start).unwrap_or(usize::MAX);
-        let rest = tail.get(skip..).unwrap_or_default();
-        let data: &[u8] = if rest.is_empty() {
-            header
-        } else {
-            joined = [header, rest].concat();
-            &joined
+    let mut patterns = Vec::new();
+    let mut indices = Vec::new();
+    for (index, sig) in cat.signatures.iter().enumerate() {
+        let category = sig.kind.to_category();
+        if !matches!(category, Category::Brand(_))
+            && !(matches!(
+                category,
+                Category::Tamper(TamperKind::Patched | TamperKind::Cracked)
+            ) && matches!(sig.id.as_str(), "tamper.patched_by" | "tamper.cracked_by"))
+        {
+            continue;
+        }
+        if !format_ok(sig, format) {
+            continue;
+        }
+        let Some(bytes) = sig.detect.pattern() else {
+            continue;
         };
-        vec![Span {
-            data,
-            start: 0,
-            header_end,
-            tail_start,
-        }]
-    } else {
-        vec![
-            Span {
-                data: header,
-                start: 0,
-                header_end,
-                tail_start,
-            },
-            Span {
-                data: tail,
-                start: tail_start,
-                header_end,
-                tail_start,
-            },
-        ]
-    };
-    let mut out = Vec::new();
-    for span in &spans {
-        for mat in matcher.ac.find_overlapping_iter(span.data) {
-            let Some(&index) = matcher.entry_of.get(mat.pattern().as_usize()) else {
-                continue;
-            };
-            let Some(sig) = cat.signatures.get(index) else {
-                continue;
-            };
-            let category = sig.kind.to_category();
-            if !matches!(category, Category::Brand(_))
-                && !(matches!(
-                    category,
-                    Category::Tamper(TamperKind::Patched | TamperKind::Cracked)
-                ) && matches!(sig.id.as_str(), "tamper.patched_by" | "tamper.cracked_by"))
-            {
-                continue;
+        patterns.push(Pattern::Hex {
+            value: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        });
+        indices.push((index, Encoding::Utf8));
+        if let Ok(text) = std::str::from_utf8(&bytes)
+            && text.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        {
+            for encoding in [Encoding::Utf16le, Encoding::Utf16be] {
+                patterns.push(Pattern::Text {
+                    value: text.into(),
+                    encoding,
+                    ignore_ascii_case: false,
+                    boundary: Boundary::Word,
+                });
+                indices.push((index, encoding));
             }
-            if !format_ok(sig, format) {
-                continue;
-            }
-            let offset = span.start + mat.start() as u64;
-            let len = mat.len() as u64;
-            let (in_header, in_tail) = span.windows(offset, len);
-            if !match sig.detect.window() {
-                Window::Header => in_header,
-                Window::Tail => in_tail,
-                Window::Whole => true,
-            } {
-                continue;
-            }
-            out.push(CreditHit {
-                index,
-                offset,
-                len,
-                available: span.data.len() - mat.start(),
-            });
         }
     }
-    out
+    let report = StreamMatcher::new(&patterns)?.search(
+        view,
+        Span {
+            offset: 0,
+            len: view.size(),
+        },
+        limits,
+    )?;
+    let hits = report
+        .matches
+        .iter()
+        .filter_map(|hit| {
+            let (index, encoding) = indices[hit.pattern];
+            let sig = &cat.signatures[index];
+            let end = hit.offset + hit.len;
+            if !match sig.detect.window() {
+                Window::Header => end <= view.header().len() as u64,
+                Window::Tail => hit.offset >= view.tail_start(),
+                Window::Whole => true,
+            } {
+                return None;
+            }
+            Some(CreditHit {
+                index,
+                offset: hit.offset,
+                len: hit.len,
+                available: (view.size() - hit.offset).min(1024) as usize,
+                encoding,
+            })
+        })
+        .collect();
+    Ok((hits, report))
 }
-
 fn scan(cat: &Catalog, m: &Matcher, view: &dyn FileView, format: Option<&str>) -> Vec<Finding> {
     let header = view.header();
     let tail = view.tail();

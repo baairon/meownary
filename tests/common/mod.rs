@@ -10,6 +10,10 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[path = "../fixtures/pe.rs"]
+mod pe;
+pub use pe::pe_bytes;
+
 /// The bytes of a tiny executable stand-in: enough for identity to call it PE.
 pub fn mz_bytes() -> Vec<u8> {
     let mut v = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();

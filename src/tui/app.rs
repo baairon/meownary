@@ -2753,8 +2753,7 @@ mod tests {
     fn deattribute_key_offers_quiet_shared_plan() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invented.exe");
-        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-        bytes.resize(256, 0);
+        let mut bytes = crate::test_pe::pe_bytes();
         bytes.extend_from_slice(b"patched by Invented\0");
         std::fs::write(&path, bytes).unwrap();
         let report = crate::scan::scan_file(&path, &crate::parsers::registry());
@@ -2781,8 +2780,7 @@ mod tests {
     /// A small PE with an invented patch credit, scanned into a fresh view.
     fn patched_view(dir: &Path, name: &str) -> App {
         let path = dir.join(name);
-        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-        bytes.resize(256, 0);
+        let mut bytes = crate::test_pe::pe_bytes();
         bytes.extend_from_slice(b"patched by Invented\0");
         std::fs::write(&path, bytes).unwrap();
         let report = crate::scan::scan_file(&path, &crate::parsers::registry());
@@ -2918,8 +2916,7 @@ mod tests {
     #[test]
     fn deattribute_offers_the_files_inside_a_zip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut exe = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-        exe.resize(256, 0);
+        let mut exe = crate::test_pe::pe_bytes();
         exe.extend_from_slice(b"patched by Invented\0");
         let path = dir.path().join("bundle.zip");
         std::fs::write(&path, {

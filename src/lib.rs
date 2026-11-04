@@ -9,5 +9,9 @@ pub mod parsers;
 pub mod scan;
 pub mod util;
 
+#[cfg(test)]
+#[path = "../tests/fixtures/pe.rs"]
+pub(crate) mod test_pe;
+
 #[cfg(feature = "tui")]
 pub mod tui;

@@ -1161,8 +1161,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn fake_pe() -> Vec<u8> {
-        let mut v = vec![0u8; 256];
-        v[..16].copy_from_slice(b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00");
+        let mut v = crate::test_pe::pe_bytes();
         v.extend_from_slice(CREDIT);
         v
     }
@@ -1296,10 +1295,11 @@ pub(crate) mod tests {
         assert!(find(&tar, CREDIT));
         let before = headers(&tar);
         assert_eq!(headers(&copy), before, "same headers and sizes");
+        let pe_len = fake_pe().len();
         let pes: Vec<_> = before
             .iter()
-            .filter(|e| e.1 == 276 && e.0 == b'0')
-            .map(|e| e.2..e.2 + 276)
+            .filter(|e| e.1 == pe_len as u64 && e.0 == b'0')
+            .map(|e| e.2..e.2 + pe_len)
             .collect();
         assert_eq!(pes.len(), 3);
         for (i, (a, b)) in tar.iter().zip(&copy).enumerate() {
@@ -1693,7 +1693,9 @@ pub(crate) mod tests {
         assert_eq!(stop, Some(Stop::End));
         assert_eq!(names.len(), 4);
         assert_eq!(names[3], "pax/dir/paxed.dll");
-        let cut = &tar[..tar.len() - 1024 - 300];
+        // Cut inside the last entry's data, not just its block padding.
+        let last = fake_pe().len().next_multiple_of(512);
+        let cut = &tar[..tar.len() - 1024 - last + 100];
         let stop = walk(&mut Stream::new(cut), |_, _| Ok(false)).unwrap();
         assert_eq!(stop, Some(Stop::Tail));
     }

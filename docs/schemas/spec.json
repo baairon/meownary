@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "meownary spec v1",
+  "$ref": "#/$defs/spec",
+  "$defs": {
+    "hashes": {
+      "type": "object",
+      "properties": {
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blake3": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "size",
+        "blake3",
+        "sha256"
+      ],
+      "additionalProperties": false
+    },
+    "payload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "hex"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "fill"
+            },
+            "byte": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "len": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind",
+            "byte",
+            "len"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "file"
+            },
+            "path": {
+              "type": "string"
+            },
+            "hashes": {
+              "$ref": "#/$defs/hashes"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "hashes"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "empty"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "replace",
+            "fill",
+            "insert",
+            "delete",
+            "truncate"
+          ]
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "remove": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "data": {
+          "$ref": "#/$defs/payload"
+        },
+        "resize": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "offset",
+        "remove",
+        "data"
+      ],
+      "additionalProperties": false
+    },
+    "spec": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/request"
+          }
+        }
+      },
+      "required": [
+        "version",
+        "operations"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

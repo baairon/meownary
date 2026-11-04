@@ -664,6 +664,35 @@ fn strings_need_nul_bounds() {
 }
 
 #[test]
+fn endian_evidence_and_unicode_scalars_keep_exact_offsets() {
+    for (bom, encoding, expected) in [
+        (
+            [0xff, 0xfe],
+            crate::edit::precision::pattern::Encoding::Utf16le,
+            Encoding::Utf16,
+        ),
+        (
+            [0xfe, 0xff],
+            crate::edit::precision::pattern::Encoding::Utf16be,
+            Encoding::Utf16be,
+        ),
+    ] {
+        let text = "North \u{1f680} Star";
+        let mut bytes = bom.to_vec();
+        bytes.extend(encoding.encode(text).unwrap());
+        bytes.extend([0; 2]);
+        let mut found = Vec::new();
+        strings(&bytes, 100, true, &mut found);
+        assert_eq!(found.iter().filter(|h| h.text == text).count(), 1);
+        let hit = found.iter().find(|h| h.text == text).unwrap();
+        assert_eq!(
+            (hit.off, hit.len, hit.encoding),
+            (102, bytes.len() - 4, expected)
+        );
+    }
+}
+
+#[test]
 fn copyright_vendor_and_word_bounds() {
     assert_eq!(
         copyright_vendor("Copyright (c) 2001-2026 Glimmer Labs, Inc.").as_deref(),
@@ -741,16 +770,19 @@ fn identity_boundary_takes_whole_words_and_case_joins() {
         let start = text.to_ascii_lowercase().find("glimmer").unwrap();
         needle::identity_boundary(text, start, start + "glimmer".len())
     };
-    for text in ["Glimmer Labs", "(Glimmer)", "GlimmerRender", "useGlimmer"] {
-        assert!(at(text), "{text}");
-    }
+    // Underscores separate identifier words, and a trailing digit starts a
+    // version suffix, as in the shared `identifier` boundary.
     for text in [
-        "glimmerrender",
-        "Glimmered",
-        "GLIMMERX",
+        "Glimmer Labs",
+        "(Glimmer)",
+        "GlimmerRender",
+        "useGlimmer",
         "lib_glimmer",
         "glimmer2",
     ] {
+        assert!(at(text), "{text}");
+    }
+    for text in ["glimmerrender", "Glimmered", "GLIMMERX"] {
         assert!(!at(text), "{text}");
     }
 }
@@ -786,7 +818,7 @@ fn pascal_and_windows_ansi_strings_are_read_and_blanked_in_place() {
     assert_eq!(
         redact_hits(&found, &roots, &Protected::default()),
         [
-            (Kind::Brand, 2, vec![b' '; 7]),
+            (Kind::Brand, 2, vec![b' '; 12]),
             (Kind::Brand, 16, vec![b' '; 19]),
         ],
         "one byte per character"
@@ -1247,6 +1279,19 @@ fn copy_verification_reports_identity_left_in_a_protected_import_name() {
     );
     assert!(!verified.ok(), "{verified:?}");
     assert_eq!(verified.residual, Some("PE data"));
+    let policy_check = crate::edit::deattribute::verify_plan(
+        &path,
+        &output,
+        report.format.as_deref(),
+        &plan,
+        Mode::Deep,
+    );
+    assert!(
+        policy_check.ok(crate::edit::deattribute::policy::VerificationPolicy::Protected),
+        "{policy_check:?}"
+    );
+    assert!(!policy_check.ok(crate::edit::deattribute::policy::VerificationPolicy::Strict));
+    assert!(policy_check.residuals.iter().all(|r| r.retained.is_some()));
     let bytes = std::fs::read(&output).unwrap();
     assert!(!has(&bytes[0xc00..], b"NovaFlow"));
     assert!(has(&bytes[0x880..0x8c0], b"NovaFlowCore.dll"));

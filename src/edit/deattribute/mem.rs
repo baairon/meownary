@@ -215,10 +215,9 @@ fn note(reasons: &mut Vec<Reason>, reason: Reason) {
 pub(crate) mod tests {
     use super::*;
 
-    /// A fake PE: a DOS header padded to 256 bytes, then an invented credit.
+    /// A validated PE with an invented credit in its overlay.
     pub(crate) fn fake_pe(credit: &[u8]) -> Vec<u8> {
-        let mut bytes = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
-        bytes.resize(256, 0);
+        let mut bytes = crate::test_pe::pe_bytes();
         bytes.extend_from_slice(credit);
         bytes.push(0);
         bytes
@@ -240,6 +239,17 @@ pub(crate) mod tests {
         let out = deattribute_bytes("notes.txt", b"hello there");
         assert!(out.bytes.is_none());
         assert_eq!((out.brand, out.patch), (0, 0));
+    }
+
+    #[test]
+    fn malformed_pe_credit_is_preserved() {
+        // A plausible DOS header identifies as PE, but has no valid PE layout.
+        let mut data = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00".to_vec();
+        data.resize(256, 0);
+        data.extend_from_slice(b"patched by Invented\0");
+        let result = deattribute_bytes("sample.exe", &data);
+        assert!(result.bytes.is_none());
+        assert!(result.skipped.contains(&Reason::MalformedMetadata));
     }
 
     #[test]

@@ -38,6 +38,33 @@ fn fourcc(bytes: &[u8], at: usize) -> Option<[u8; 4]> {
 }
 
 impl Pipl {
+    /// Text bodies only, excluding their lengths, terminators and property headers.
+    pub(super) fn text_fields(&self) -> Vec<super::Hit> {
+        self.fields
+            .iter()
+            .filter_map(|field| {
+                let (skip, raw) = if matches!(&field.key, b"name" | b"catg" | b"eMNA") {
+                    (1, Self::pascal(field)?)
+                } else if functional_key(&field.key) {
+                    let skip = usize::from(field.value.first().is_some_and(|&n| n < 0x20));
+                    let body = field.value.get(skip..)?;
+                    (
+                        skip,
+                        &body[..body.iter().position(|&b| b == 0).unwrap_or(body.len())],
+                    )
+                } else {
+                    return None;
+                };
+                Some(super::Hit {
+                    off: self.base + field.off as u64 + skip as u64,
+                    len: raw.len(),
+                    text: single_byte(raw),
+                    encoding: super::Encoding::SingleByte,
+                })
+            })
+            .collect()
+    }
+
     /// Parse either resource header and either recorded integer byte order.
     pub(super) fn parse(bytes: &[u8], base: u64) -> Option<Self> {
         if bytes.len() > MAX_PIPL {

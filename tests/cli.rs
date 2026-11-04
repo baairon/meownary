@@ -83,7 +83,7 @@ fn root_names(fx: &Fixture) -> Vec<String> {
 fn deattribute_saves_a_blanked_copy_and_leaves_the_original() {
     let fx = Fixture::empty();
     let path = fx.path("app.exe");
-    let mut bytes = mz_bytes();
+    let mut bytes = common::pe_bytes();
     bytes.extend_from_slice(b"patched by Invented\0patched by Second\0");
     fs::write(&path, &bytes).unwrap();
     let mtime = fs::metadata(&path).unwrap().modified().unwrap();
@@ -163,7 +163,7 @@ fn deattribute_saves_a_blanked_copy_and_leaves_the_original() {
 #[test]
 fn deattribute_reruns_replace_the_copy_instead_of_stacking() {
     let fx = Fixture::empty();
-    let mut bytes = mz_bytes();
+    let mut bytes = common::pe_bytes();
     bytes.extend_from_slice(b"patched by Invented\0");
     fs::write(fx.path("app.exe"), &bytes).unwrap();
     // A stale copy from some earlier run, still carrying the credit.
@@ -223,7 +223,7 @@ fn deattribute_reruns_replace_the_copy_instead_of_stacking() {
 fn deattribute_leaves_load_bearing_magic_and_reports_only_kind() {
     let fx = Fixture::empty();
     let path = fx.path("packed.exe");
-    let mut bytes = mz_bytes();
+    let mut bytes = common::pe_bytes();
     bytes.extend_from_slice(b"UPX!\0");
     fs::write(&path, &bytes).unwrap();
     let shown = fx.shown("packed.exe");
@@ -1029,7 +1029,7 @@ fn zip_of(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
 #[test]
 fn deattribute_cleans_the_files_inside_a_zip() {
     let fx = Fixture::empty();
-    let mut exe = mz_bytes();
+    let mut exe = common::pe_bytes();
     exe.extend_from_slice(b"patched by Invented\0");
     let text = b"plain words, nothing to blank here".to_vec();
     let original = zip_of(&[

@@ -598,6 +598,61 @@ impl EditEngine {
         Ok(())
     }
 
+    /// Commit an already verified sibling with a complete undo snapshot. The
+    /// expected post-edit hash is journaled before the atomic replacement.
+    pub fn replace_staged(
+        &mut self,
+        path: &Path,
+        staged: &Path,
+        before_hash: &str,
+        after_hash: &str,
+    ) -> Result<Applied, EditError> {
+        let (target, _) = resolve_target(path)?;
+        self.acquire_lock()?;
+        let (size, before) = fsio::hash_file(&target)?;
+        let (new_size, after) = fsio::hash_file(staged)?;
+        if before != before_hash || after != after_hash {
+            return Err(EditError::Changed);
+        }
+        let snap = self.trash.stash_copy(&target, "byte-edit-snapshot")?;
+        if fsio::hash_file(&snap)?.1 != before {
+            self.trash.discard(&snap);
+            return Err(EditError::Changed);
+        }
+        if self.cur_group == 0 {
+            self.begin_group();
+        }
+        let id = self.alloc_id();
+        let label = "byte edit";
+        let record = self.record(
+            id,
+            &target,
+            label,
+            UndoAction::RestoreSnapshot { trash_path: snap },
+            Some(Fingerprint::span(size, 0, size, before)),
+            Some(Fingerprint::span(new_size, 0, new_size, after)),
+        );
+        self.journal_first(&record)?;
+        if fsio::hash_file(&target)?.1 != before_hash || fsio::hash_file(staged)?.1 != after_hash {
+            self.void(&record);
+            return Err(EditError::Changed);
+        }
+        if let Err(error) = fs::rename(staged, &target) {
+            self.void(&record);
+            return Err(EditError::Io(error));
+        }
+        if let Some(parent) = target.parent() {
+            fsio::sync_dir(parent);
+        }
+        self.group_used = true;
+        Ok(Applied {
+            undo_id: id,
+            group: self.cur_group,
+            path: target,
+            label: label.into(),
+        })
+    }
+
     /// Open `path` in the user's external editor, blocking until it exits. The
     /// file is snapshotted to trash and journaled first; if the bytes changed
     /// on return the change is recorded as an undoable snapshot restore,

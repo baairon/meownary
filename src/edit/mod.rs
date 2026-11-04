@@ -9,9 +9,10 @@
 pub mod deattribute;
 pub mod engine;
 pub mod external;
-mod fsio;
+pub(crate) mod fsio;
 pub mod journal;
 pub mod lock;
+pub mod precision;
 pub mod safety;
 pub mod structural;
 pub mod trash;
