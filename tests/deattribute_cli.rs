@@ -121,13 +121,15 @@ fn deep_mode_cleans_resource_forks_and_appledouble_files() {
         basic.stdout
     );
 
+    // The resource name keeps the vendor's name, so the copies are written
+    // but do not verify clean under the strict policy the folder pass uses.
     let run = fx.run(&["clean", fx.root(), "--deattribute", "--deep", "--json"]);
-    run.assert_code(0);
+    run.assert_code(75);
     let events = run.events();
     let saved = of_kind(&events, "saved");
     assert_eq!(saved.len(), 2, "{}", run.stdout);
     assert!(
-        saved.iter().all(|e| e["verified"] == true),
+        saved.iter().all(|e| e["verified"] == false),
         "{}",
         run.stdout
     );
@@ -148,10 +150,63 @@ fn deep_mode_cleans_resource_forks_and_appledouble_files() {
     }
     assert!(!run.stdout.contains("Glimmer") && !run.stdout.contains("Nobody"));
     assert!(
-        !run.stderr.contains("verification incomplete"),
+        run.stderr.contains("verification incomplete"),
         "{}",
         run.stderr
     );
+}
+
+/// A ustar entry: a header block, the data, and padding to a whole block.
+fn tar_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let mut h = [0u8; 512];
+    h[..name.len()].copy_from_slice(name.as_bytes());
+    for (at, value, width) in [(100, 0o644u64, 8), (108, 0, 8), (116, 0, 8)] {
+        h[at..at + width].copy_from_slice(format!("{value:0w$o}\0", w = width - 1).as_bytes());
+    }
+    h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    h[136..148].copy_from_slice(b"14545055000\0");
+    h[148..156].fill(b' ');
+    h[156] = b'0';
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    out.extend_from_slice(&h);
+    out.extend_from_slice(data);
+    out.resize(out.len().next_multiple_of(512), 0);
+}
+
+#[test]
+fn a_tar_copy_is_judged_entry_by_entry_like_a_zip() {
+    // A credit the basic pass blanks inside a PE entry: both archive kinds
+    // clean it, and both verify the copy by reading the entry back. The
+    // deep case, where an identity the entry keeps fails both the same way,
+    // is covered beside the archive code.
+    let fx = Fixture::empty();
+    let exe = credited_exe();
+    let mut tar = Vec::new();
+    tar_entry(&mut tar, "tools/setup.exe", &exe);
+    tar.extend_from_slice(&[0; 1024]);
+    fs::write(fx.path("bundle.tar"), &tar).unwrap();
+    fs::write(
+        fx.path("bundle.zip"),
+        stored_zip(&[("tools/setup.exe", &exe)]),
+    )
+    .unwrap();
+    let run = fx.run(&["clean", fx.root(), "--deattribute", "--json"]);
+    run.assert_code(0);
+    let events = run.events();
+    let saved = of_kind(&events, "saved");
+    assert_eq!(saved.len(), 2, "{}", run.stdout);
+    assert!(
+        saved.iter().all(|e| e["verified"] == true),
+        "{}",
+        run.stdout
+    );
+    for name in ["bundle.deattributed.tar", "bundle.deattributed.zip"] {
+        let copy = fs::read(fx.path(name)).unwrap();
+        assert!(!copy.windows(8).any(|w| w == b"Invented"), "{name}");
+    }
 }
 
 #[test]

@@ -1,9 +1,12 @@
 //! Structured deep edits in Macintosh resource forks.
 
+use crate::edit::precision::pattern::{Limits, Span};
 use crate::parsers::rsrc;
 use crate::scan::FileView;
 
 use super::super::Reason;
+use super::super::audit::{self, identity_patterns};
+use super::super::layout::{Layout, Region};
 use super::pipl::Pipl;
 use super::{
     Deep, Encoding, Hit, Protected, read_full, redact_hits, residuals, roots, single_byte,
@@ -41,7 +44,12 @@ fn pascal(view: &dyn FileView, off: u64, len: u64, count: usize) -> Vec<Hit> {
     hits
 }
 
-pub(super) fn sweep(view: &dyn FileView) -> Deep {
+/// Deep edits in a resource fork, with an audit of what it learned: the
+/// identities the strings and PiPL lists name become the audit's patterns,
+/// the resource names are linkage (the host looks them up, so they stay and
+/// count as retained), and the string records are the fields an edit may
+/// change.
+pub(super) fn sweep(view: &dyn FileView, limits: &Limits) -> Deep {
     let Some(fork) = rsrc::parse(view) else {
         return Deep {
             skipped: vec![Reason::MalformedMetadata],
@@ -52,12 +60,17 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     let mut hits = Vec::new();
     let mut evidence = Vec::new();
     let mut names = Vec::new();
+    let mut name_spans = Vec::new();
     let mut skipped = Vec::new();
     for res in &fork.resources {
         if let Some((off, len)) = res.name
             && let Some(raw) = read_full(view, off, len)
         {
             names.push(single_byte(&raw));
+            name_spans.push(Span {
+                offset: off,
+                len: len as u64,
+            });
         }
         match &res.kind {
             b"PiPL" | b"PIPL" => {
@@ -92,9 +105,50 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
     }
     // Resource names are looked up by the host, so they count as linkage.
     skipped.extend(residuals(&hits, &[], &names, &roots));
+    let complete = !skipped.iter().any(|reason| {
+        matches!(
+            reason,
+            Reason::DeepBudget | Reason::MalformedMetadata | Reason::Io
+        )
+    });
+    let mut fields: Vec<Span> = hits
+        .iter()
+        .map(|h| Span {
+            offset: h.off,
+            len: h.len as u64,
+        })
+        .collect();
+    fields.extend(pipls.iter().flat_map(Pipl::text_fields).map(|h| Span {
+        offset: h.off,
+        len: h.len as u64,
+    }));
+    let layout = Layout {
+        size: view.size(),
+        format: Some("rsrc".to_string()),
+        regions: vec![Region {
+            span: Span {
+                offset: 0,
+                len: view.size(),
+            },
+            category: "resource fork".to_string(),
+        }],
+        protected: Vec::new(),
+        linkage: name_spans,
+        excluded: Vec::new(),
+        fields,
+        valid: true,
+    };
     Deep {
         rewrites,
         skipped,
+        audit: Some(audit::Audit {
+            patterns: identity_patterns(&roots),
+            layout,
+            limits: limits.clone(),
+            complete,
+            unexamined: Vec::new(),
+            allowed: Vec::new(),
+        }),
         ..Deep::default()
     }
 }

@@ -93,6 +93,21 @@ pub struct Options {
     pub verification: VerificationPolicy,
 }
 
+impl Options {
+    /// The same options for planning against a cleaned output: a rule's
+    /// `expected_matches` counts the input's matches, so on the output it
+    /// is dropped and the audit judges what remains.
+    pub fn for_output(&self) -> Self {
+        let mut out = self.clone();
+        if let Some(rules) = &mut out.rules {
+            for identity in &mut rules.identities {
+                identity.expected_matches = None;
+            }
+        }
+        out
+    }
+}
+
 /// Simple case-sensitive `*`/`?` globs over the normalized logical path.
 /// No regex, shell expansion, or platform-dependent path interpretation.
 pub fn glob(pattern: &str, value: &str) -> bool {
@@ -376,6 +391,25 @@ mod tests {
             rules
                 .plan(&view, raw_layout(view.size()), &Limits::default())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn output_options_drop_the_match_count_and_nothing_else() {
+        let rules: Rules = serde_json::from_str(r#"{"version":1,"identities":[{"id":"publisher","scope":"publisher","names":["North"],"encodings":["ascii"],"expected_matches":1}],"exclusions":[{"kind":"text","value":"keep"}]}"#).unwrap();
+        let options = Options {
+            rules: Some(rules),
+            ..Options::default()
+        };
+        let output = options.for_output();
+        let rules = output.rules.as_ref().unwrap();
+        assert_eq!(rules.identities[0].expected_matches, None);
+        assert_eq!(rules.identities[0].names, ["North"]);
+        assert_eq!(rules.exclusions.len(), 1);
+        assert_eq!(
+            options.rules.as_ref().unwrap().identities[0].expected_matches,
+            Some(1),
+            "the input's options are untouched"
         );
     }
 

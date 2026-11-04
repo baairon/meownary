@@ -975,7 +975,10 @@ impl Walk<'_> {
     }
 
     /// Protect a thunk array at `rva` and every hint/name entry it points to.
-    fn thunks(&mut self, rva: u32) {
+    /// `base` is what the entries carry on top of their RVAs: zero, or the
+    /// image base for an old-form delay-import table, whose entries hold
+    /// virtual addresses.
+    fn thunks(&mut self, rva: u32, base: u64) {
         let Some(mut at) = self.img.rva_to_off(rva) else {
             return;
         };
@@ -995,7 +998,10 @@ impl Walk<'_> {
             self.protected.add(at, width as u64);
             self.import_protected.add(at, width as u64);
             let ordinal = value >> (width * 8 - 1) != 0;
-            if !ordinal && let Ok(name_rva) = u32::try_from(value & 0x7fff_ffff) {
+            if !ordinal
+                && let Some(rva) = value.checked_sub(base)
+                && let Ok(name_rva) = u32::try_from(rva & 0x7fff_ffff)
+            {
                 // A hint/name entry: a two-byte hint, then the name.
                 self.import_name_at(name_rva.wrapping_add(2));
                 if let Some(off) = self.img.rva_to_off(name_rva) {
@@ -1030,7 +1036,7 @@ impl Walk<'_> {
                 return;
             };
             self.import_name_at(name);
-            self.thunks(if lookup != 0 { lookup } else { iat });
+            self.thunks(if lookup != 0 { lookup } else { iat }, 0);
             at += 20;
         }
     }
@@ -1057,10 +1063,28 @@ impl Walk<'_> {
             else {
                 return;
             };
-            // Version 1 descriptors hold RVAs; the older form holds VAs.
+            // Version 1 descriptors hold RVAs; the older form holds virtual
+            // addresses, which come back to RVAs by taking off the image base.
+            // Either form names a DLL the loader resolves, so both are
+            // protected, and a pointer that cannot be an address inside this
+            // image leaves the copy unverified rather than quietly unchecked.
             if attrs & 1 != 0 {
                 self.import_name_at(name);
-                self.thunks(names);
+                self.thunks(names, 0);
+            } else {
+                let base = self.img.image_base;
+                let rva = |va: u32| {
+                    u64::from(va)
+                        .checked_sub(base)
+                        .and_then(|rva| u32::try_from(rva).ok())
+                };
+                match (rva(name), rva(names)) {
+                    (Some(name), Some(names)) => {
+                        self.import_name_at(name);
+                        self.thunks(names, base);
+                    }
+                    _ => self.skipped.push(Reason::MalformedMetadata),
+                }
             }
             at += 32;
         }
@@ -1687,19 +1711,27 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
     }
 
     let regions = w.data_regions();
-    let mut hits =
-        super::region_strings_limited(view, &regions, &mut w.skipped, limits.max_scan_bytes);
-    hits.extend(w.resource_hits.iter().cloned());
+    let mut hits = super::region_strings_limited(
+        view,
+        &regions,
+        &mut w.skipped,
+        limits.max_scan_bytes,
+        super::MAX_DEEP_STRINGS,
+    );
+    hits.extend(std::mem::take(&mut w.resource_hits));
     hits.extend(w.structured_hits.iter().cloned());
     hits.sort();
     hits.dedup();
-    let mut all_hits = hits.clone();
-    all_hits.extend(user.iter().cloned());
+    // The data strings are what deep PE rewrites; the user strings and the
+    // code strings only inform the roots and the audit terms, so they ride
+    // along at the end of the one vector and are cut off again after.
+    let data_hits = hits.len();
+    hits.extend(user.iter().cloned());
     let stem = module.as_ref().and_then(|(_, name)| {
         let name = std::str::from_utf8(name).ok()?;
         name.split(['.', '_']).next()
     });
-    let roots = aggressive_roots(&all_hits, &w.evidence, roots(&all_hits, stem, &w.evidence));
+    let roots = aggressive_roots(&hits, &w.evidence, roots(&hits, stem, &w.evidence));
     let mut audit_terms = identity_terms(&roots);
     let code_regions: Vec<(u64, u64)> = img
         .sections
@@ -1709,15 +1741,16 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
         })
         .map(|section| (u64::from(section.raw_ptr), u64::from(section.raw_size)))
         .collect();
-    let mut alias_hits = all_hits.clone();
-    alias_hits.extend(super::region_strings_limited(
+    hits.extend(super::region_strings_limited(
         view,
         &code_regions,
         &mut w.skipped,
         limits.max_scan_bytes,
+        super::MAX_DEEP_STRINGS.saturating_sub(hits.len()),
     ));
-    audit_terms.extend(vendor_alias_terms(&alias_hits, &roots, stem, &w.evidence));
-    audit_terms.extend(library_terms(&alias_hits));
+    audit_terms.extend(vendor_alias_terms(&hits, &roots, stem, &w.evidence));
+    audit_terms.extend(library_terms(&hits));
+    hits.truncate(data_hits);
     // Deep PE rewrites the readable identity bytes in these ranges below.
     let mut rewrites = redact_hits(&hits, &roots, &w.protected);
     rewrites.extend(redact_hits(

@@ -205,10 +205,16 @@ success means the selected policy was satisfied. Retained names remain in the
 output. Failed verification prevents publication of the staged copy.
 
 Both policies audit identities learned from the original. Removing the source
-of an identity cannot make the verifier forget it. PE checks also compare parsed
-imports and thunk records against the original. Malformed PE layouts are refused.
-The existing `clean <path> --deattribute` command and the interactive view retain
-their folder and archive workflows and report incomplete verification as exit 75.
+of an identity cannot make the verifier forget it: every credit the plan blanks,
+and every one an exclusion keeps, joins the audit as its exact bytes, in normal
+mode as well as deep. A learned name kept on purpose, in an import name, a
+resource name or an excluded span, is a retained residual: `protected` passes
+and names the reason, `strict` fails. PE checks also compare parsed imports and
+thunk records against the original, delay imports in either descriptor form
+included. Malformed PE layouts are refused. A ZIP or tar copy is audited entry by
+entry against the original. The existing `clean <path> --deattribute` command
+and the interactive view retain their folder and archive workflows, judge with
+`strict`, and report incomplete verification as exit 75.
 
 Supply `--rules identities.json` to add identities without changing source code:
 
@@ -240,10 +246,12 @@ them. Compound names stay intact instead of turning each short word into a rule.
 Raw UTF-16 discovery requires endian evidence; declared encodings and exact rules
 can match Unicode directly, including surrogate pairs.
 
-Optional `files` globs match the normalized logical input path, using `/` even
-on Windows. Optional `regions` globs match labels from `inspect`, such as
-`PE data` or `PE resource`. Globs support case-sensitive `*` and `?`.
-`expected_matches` checks distinct selected byte ranges before editing.
+Optional `files` globs match the input path as it was given, with `/` even on
+Windows; a saved plan keeps that path, so `apply` matches the same way from any
+folder. Optional `regions` globs match labels from `inspect`, such as `PE data`
+or `PE resource`. Globs support case-sensitive `*` and `?`. `expected_matches`
+checks distinct selected byte ranges in the input before editing; the cleaned
+output is judged by the audit, not by the count.
 A `replacement` must fit the original encoded field; shorter replacements need
 an explicit one-character `pad`. Omitting it blanks with encoded spaces.
 Conflicting explicit replacements are refused. Exclusions retain an entire
@@ -251,8 +259,9 @@ planned edit when it overlaps the selected bytes, so structural rewrites are
 not partially applied. Explicit rules retain the engine's structural protections.
 
 `--max-scan` defaults to 1,073,741,824 bytes per streaming pass and `--max-matches`
-to 100,000. An incomplete rules or exclusion scan refuses editing. Reports
-distinguish unexplored ranges from explained residuals. `--details` can expose
+to 100,000. Deep string discovery keeps at most 500,000 candidates per sweep and
+reports incomplete coverage past that. An incomplete rules or exclusion scan
+refuses editing. Reports distinguish unexplored ranges from explained residuals. `--details` can expose
 identity text and audit patterns; ordinary reports omit those values.
 `--plan-out` alone saves a plan without applying it; `--dry-run` performs no
 binary write and can still save a requested plan. `--output` applies to a copy.

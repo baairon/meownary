@@ -205,6 +205,19 @@ pub struct DeattributeCheck {
     pub policy: deattribute::policy::VerificationPolicy,
     pub audit: Option<deattribute::audit::Audit>,
     pub coverage_complete: bool,
+    /// The input path as it was given when planning, with `/` separators:
+    /// what the rules' `files` globs were matched against, so applying the
+    /// plan matches them the same way wherever it runs. Plans saved before
+    /// this field fall back to the canonical path.
+    #[serde(default)]
+    pub logical: Option<String>,
+}
+
+/// A path the way `files` globs see it: as typed, with `/` separators and
+/// no leading `./`.
+pub fn logical_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.strip_prefix("./").unwrap_or(&text).to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,12 +405,23 @@ impl EditPlan {
                 options: planned.configuration.clone().unwrap_or_default(),
                 audit: planned.audit.clone(),
                 coverage_complete,
+                logical: Some(logical_path(path)),
             }),
         )
     }
 
     pub fn check_input(&self) -> io::Result<()> {
         self.check_input_at(&self.input)
+    }
+
+    /// The path the rules' `files` globs are matched against: the one saved
+    /// at planning, else the canonical input.
+    fn logical_input(&self) -> PathBuf {
+        self.deattribute
+            .as_ref()
+            .and_then(|c| c.logical.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.input.clone())
     }
 
     fn check_fresh(&self) -> io::Result<()> {
@@ -442,9 +466,10 @@ impl EditPlan {
                 return Err(invalid("a deattribution plan cannot also be raw"));
             }
             let source_view = WindowedFile::open(source)?;
+            let logical = self.logical_input();
             let view = LogicalView {
                 view: &source_view,
-                path: &self.input,
+                path: &logical,
             };
             let scan = crate::scan::scan_file_detailed(source, &crate::parsers::registry());
             let mode = if check.deep {
@@ -555,14 +580,26 @@ impl EditPlan {
                 };
                 report.audit = Some(result);
             }
-            // Re-probe structural/catalog metadata as well as the saved identities.
+            // Re-probe structural/catalog metadata as well as the saved
+            // identities, with the output standing in for the input: the
+            // rules' file selectors see the planned path, not a temp name.
             let scan = crate::scan::scan_file_detailed(output, &crate::parsers::registry());
             let mode = if check.deep {
                 deattribute::Mode::Deep
             } else {
                 deattribute::Mode::Basic
             };
-            let next = deattribute::plan_with_options(&scan.report, &view, mode, &check.options)?;
+            let logical = self.logical_input();
+            let as_input = LogicalView {
+                view: &view,
+                path: &logical,
+            };
+            let next = deattribute::plan_with_options(
+                &scan.report,
+                &as_input,
+                mode,
+                &check.options.for_output(),
+            )?;
             report.coverage_complete &= !scan.report.partial
                 && next.errors.is_empty()
                 && !next.skipped.iter().any(|s| {
@@ -766,6 +803,20 @@ pub struct ApplyReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_check_saved_without_a_logical_path_still_loads() {
+        let check: DeattributeCheck = serde_json::from_str(
+            r#"{"deep":false,"options":{"limits":{"max_scan_bytes":1,"max_matches":1},"rules":null,"verification":"strict"},"policy":"strict","audit":null,"coverage_complete":true}"#,
+        )
+        .unwrap();
+        assert_eq!(check.logical, None);
+        assert_eq!(
+            logical_path(Path::new("./bin/sample.dll")),
+            "bin/sample.dll"
+        );
+        assert_eq!(logical_path(Path::new("bin\\sample.dll")), "bin/sample.dll");
+    }
 
     #[test]
     fn resolved_spells_new_and_existing_paths_once() {

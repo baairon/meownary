@@ -119,11 +119,19 @@ pub fn plan_tar_mode(
     run_mode(original, gz, None, LIMITS, mode)
 }
 
-/// Whether cleaning the copy at `output` again in `mode` would change no entry.
-pub fn verify_copy(original: &Path, output: &Path, gz: bool, mode: super::Mode) -> bool {
+/// Whether cleaning the copy at `output` again in `mode` would change no
+/// entry, and in deep mode whether any PE entry still carries an identity
+/// the original's did (the first such category), checked entry by entry the
+/// way a ZIP copy is.
+pub fn verify_copy(
+    original: &Path,
+    output: &Path,
+    gz: bool,
+    mode: super::Mode,
+) -> (bool, Option<&'static str>) {
     let found = if gz {
         let Ok(data) = fs::read(output) else {
-            return false;
+            return (false, None);
         };
         gunzip(&data, LIMITS).and_then(|tar| {
             let len = tar.len() as u64;
@@ -131,55 +139,100 @@ pub fn verify_copy(original: &Path, output: &Path, gz: bool, mode: super::Mode) 
         })
     } else {
         let Ok(mut file) = File::open(output) else {
-            return false;
+            return (false, None);
         };
         let Ok(meta) = file.metadata() else {
-            return false;
+            return (false, None);
         };
         scan_mode(&mut file, meta.len(), LIMITS, mode)
     };
     if !matches!(found, Ok(Some(scan)) if scan.patches.is_empty()) {
-        return false;
+        return (false, None);
     }
     if mode != super::Mode::Deep {
-        return true;
+        return (true, None);
     }
-    let Ok(source) = fs::read(original) else {
-        return false;
+    let unpack = |path: &Path| -> Option<Vec<u8>> {
+        let bytes = fs::read(path).ok()?;
+        if gz {
+            gunzip(&bytes, LIMITS).ok()
+        } else {
+            Some(bytes)
+        }
     };
-    let original_tar = if gz {
-        let Ok(bytes) = gunzip(&source, LIMITS) else {
-            return false;
-        };
-        bytes
-    } else {
-        source
+    let (Some(original_tar), Some(output_tar)) = (unpack(original), unpack(output)) else {
+        return (false, None);
     };
+    match pe_residual_in_entries(&original_tar, &output_tar) {
+        Ok(Some(category)) => return (false, Some(category)),
+        Ok(None) => {}
+        Err(()) => return (false, None),
+    }
     let Some(terms) = original_pe_terms(&original_tar) else {
-        return false;
+        return (false, None);
     };
     if terms.is_empty() {
-        return true;
+        return (true, None);
     }
-    let Ok(copy) = fs::read(output) else {
-        return false;
-    };
-    let output_tar = if gz {
-        let Ok(bytes) = gunzip(&copy, LIMITS) else {
-            return false;
-        };
-        bytes
-    } else {
-        copy
-    };
     let mut metadata = Scan::default();
-    scan_tar_metadata(
+    let clean = scan_tar_metadata(
         &mut Cursor::new(&output_tar),
         output_tar.len() as u64,
         &terms,
         &mut metadata,
     )
-    .is_ok_and(|_| metadata.patches.is_empty() && metadata.skipped.is_empty())
+    .is_ok_and(|_| metadata.patches.is_empty() && metadata.skipped.is_empty());
+    (clean, (!clean).then_some("tar metadata"))
+}
+
+/// Audit every PE entry of the output tar against the same entry of the
+/// original: a tar copy changes bytes in place, so the two line up, and an
+/// output that differs in length or holds an entry that no longer parses
+/// cannot be judged. The first category still carrying an original identity
+/// is returned.
+fn pe_residual_in_entries(original: &[u8], output: &[u8]) -> Result<Option<&'static str>, ()> {
+    if original.len() != output.len() {
+        return Err(());
+    }
+    let mut cursor = Cursor::new(output);
+    let mut src = Seekable::new(&mut cursor, output.len() as u64).map_err(|_| ())?;
+    let mut residual = None;
+    let ended = walk(&mut src, |entry, src| {
+        if residual.is_some()
+            || !entry.is_file()
+            || entry.size == 0
+            || entry.sparse
+            || entry.size > LIMITS.entry
+        {
+            return Ok(false);
+        }
+        let at = src.pos();
+        let mut copy = vec![0u8; entry.size as usize];
+        if src.fill(&mut copy)? < copy.len() {
+            return Err(EditError::Changed);
+        }
+        let Some(before) = usize::try_from(at)
+            .ok()
+            .and_then(|at| original.get(at..at + copy.len()))
+        else {
+            return Err(EditError::Changed);
+        };
+        let original_view = super::mem::SliceView::new(&entry.name, before);
+        if crate::parsers::pe::image::PeImage::parse(&original_view).is_none() {
+            return Ok(true);
+        }
+        let copy_view = super::mem::SliceView::new(&entry.name, &copy);
+        if crate::parsers::pe::image::PeImage::parse(&copy_view).is_none() {
+            return Err(EditError::Changed);
+        }
+        residual = super::deep::residual_category(&original_view, &copy_view);
+        Ok(true)
+    })
+    .map_err(|_| ())?;
+    if ended != Some(Stop::End) {
+        return Err(());
+    }
+    Ok(residual)
 }
 
 fn original_pe_terms(tar: &[u8]) -> Option<BTreeSet<String>> {
@@ -1111,12 +1164,47 @@ pub(crate) mod tests {
         assert!(done.entries_cleaned > 0);
         let copy = fs::read(&output).unwrap();
         assert!(!copy.windows(8).any(|w| w == b"NovaFlow"));
-        assert!(verify_copy(
-            &original,
-            &output,
-            false,
-            super::super::Mode::Deep
-        ));
+        assert!(verify_copy(&original, &output, false, super::super::Mode::Deep).0);
+    }
+
+    #[test]
+    fn deep_tar_verification_reads_every_pe_entry_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pe = pe_fixture(0x1234);
+        pe.extend_from_slice(b"NovaFlow private build\0");
+        let mut tar = Vec::new();
+        entry(&mut tar, "tools/renderer.aex", b'0', &pe);
+        entry(&mut tar, "notes.txt", b'0', b"plain notes\n");
+        tar.extend_from_slice(&[0; 1024]);
+        for (name, gz) in [("bundle.tar", false), ("bundle.tar.gz", true)] {
+            let original = dir.path().join(name);
+            let output = copy_name(&original);
+            let bytes = if gz {
+                gz_member(&tar, false)
+            } else {
+                tar.clone()
+            };
+            fs::write(&original, &bytes).unwrap();
+            let done = deattribute_tar_mode(&original, gz, &output, super::super::Mode::Deep)
+                .unwrap()
+                .unwrap();
+            assert!(done.entries_cleaned > 0, "{name}");
+            let (clean, residual) = verify_copy(&original, &output, gz, super::super::Mode::Deep);
+            assert!(!clean, "{name}: the import name keeps the identity");
+            assert!(residual.is_some(), "{name}");
+            // A copy that no longer holds a PE where the original did cannot
+            // be judged either.
+            let mut broken = fs::read(&output).unwrap();
+            if !gz {
+                broken[512..516].copy_from_slice(b"XXXX");
+                fs::write(&output, &broken).unwrap();
+                assert_eq!(
+                    verify_copy(&original, &output, gz, super::super::Mode::Deep),
+                    (false, None),
+                    "{name}"
+                );
+            }
+        }
     }
 
     fn octal(v: u64, width: usize) -> Vec<u8> {
@@ -1621,8 +1709,8 @@ pub(crate) mod tests {
         for (src, gz) in [(&plain, false), (&packed, true)] {
             let out = copy_name(src);
             deattribute_tar(src, gz, &out).unwrap().unwrap();
-            assert!(verify_copy(src, &out, gz, super::super::Mode::Basic));
-            assert!(!verify_copy(src, src, gz, super::super::Mode::Basic));
+            assert!(verify_copy(src, &out, gz, super::super::Mode::Basic).0);
+            assert!(!verify_copy(src, src, gz, super::super::Mode::Basic).0);
         }
     }
 

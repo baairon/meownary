@@ -311,6 +311,96 @@ fn deep_pe_learns_repeated_third_party_labels_and_license_symbols() {
     }
 }
 
+/// [`pe_fixture`] with a delay-import directory (index 13) naming
+/// `NovaFlowDelay.dll` and importing `NovaFlowDelayed`, in the RVA form
+/// (attributes bit 0 set) or the old form whose pointers are virtual
+/// addresses at image base 0x40_0000. The descriptor sits at RVA 0x1700
+/// (file 0x900), the name at 0x1740 (0x940), the name table at 0x1760
+/// (0x960) and the hint/name record at 0x1780 (0x980).
+fn delay_import_fixture(va_form: bool) -> Vec<u8> {
+    const BASE: u64 = 0x40_0000;
+    let mut b = pe_fixture(0x1234);
+    put_u64(&mut b, OPT + 24, BASE);
+    put_u32(&mut b, OPT + 112 + 13 * 8, 0x1700);
+    put_u32(&mut b, OPT + 112 + 13 * 8 + 4, 64);
+    let at = |rva: u32| if va_form { rva + BASE as u32 } else { rva };
+    put_u32(&mut b, 0x900, u32::from(!va_form));
+    put_u32(&mut b, 0x904, at(0x1740));
+    put_u32(&mut b, 0x90c, at(0x1770));
+    put_u32(&mut b, 0x910, at(0x1760));
+    put(&mut b, 0x940, b"NovaFlowDelay.dll\0");
+    put_u64(&mut b, 0x960, u64::from(at(0x1780)));
+    put_u64(&mut b, 0x970, u64::from(at(0x1780)));
+    put(&mut b, 0x982, b"NovaFlowDelayed\0");
+    b
+}
+
+#[test]
+fn delay_import_names_survive_a_deep_sweep_in_either_form() {
+    for va_form in [false, true] {
+        let source = delay_import_fixture(va_form);
+        let out = deattribute_bytes_mode("x.dll", &source, Mode::Deep);
+        let bytes = out.bytes.expect("deep copy");
+        assert!(
+            has(&bytes[0x940..0x960], b"NovaFlowDelay.dll"),
+            "va_form={va_form}: the loader resolves this name"
+        );
+        assert!(
+            has(&bytes[0x980..0x9a0], b"NovaFlowDelayed"),
+            "va_form={va_form}: and this one"
+        );
+        assert!(
+            !out.skipped.contains(&Reason::MalformedMetadata),
+            "va_form={va_form}: {:?}",
+            out.skipped
+        );
+        assert!(
+            !has(&bytes[0x300..0x800], b"NovaFlow"),
+            "the rest is cleaned"
+        );
+    }
+}
+
+#[test]
+fn import_verification_detects_a_damaged_va_form_delay_import_name() {
+    let source = delay_import_fixture(true);
+    let mut copy = source.clone();
+    copy[0x940..0x952].copy_from_slice(b"Core.dll\0         ");
+    assert!(!pe::imports_unchanged(
+        &SliceView::new("before", &source),
+        &SliceView::new("after", &copy)
+    ));
+    let mut copy = source.clone();
+    copy[0x982..0x992].copy_from_slice(b"Delayed\0        ");
+    assert!(!pe::imports_unchanged(
+        &SliceView::new("before", &source),
+        &SliceView::new("after", &copy)
+    ));
+    assert!(pe::imports_unchanged(
+        &SliceView::new("before", &source),
+        &SliceView::new("after", &source)
+    ));
+}
+
+#[test]
+fn a_va_form_delay_import_outside_the_image_leaves_the_copy_unverified() {
+    let mut source = delay_import_fixture(true);
+    // A name pointer below the image base cannot be an address inside it.
+    put_u32(&mut source, 0x904, 0x10);
+    let out = deattribute_bytes_mode("x.dll", &source, Mode::Deep);
+    assert!(
+        out.skipped.contains(&Reason::MalformedMetadata),
+        "{:?}",
+        out.skipped
+    );
+    let bytes = out.bytes.expect("the rest is still cleaned");
+    assert_eq!(
+        &bytes[..2],
+        b"MZ",
+        "offset 0 was neither protected nor touched"
+    );
+}
+
 #[test]
 fn import_verification_detects_a_damaged_system_dll_name() {
     let source = pe_fixture(0x1234);
@@ -847,6 +937,29 @@ fn the_longest_string_across_a_window_edge_is_read_once_and_whole() {
             encoding: Encoding::Utf16,
         }]
     );
+    assert!(skipped.is_empty());
+}
+
+#[test]
+fn string_discovery_stops_at_the_candidate_cap() {
+    let mut data = Vec::new();
+    for i in 0..64 {
+        data.extend_from_slice(format!("string number {i:03}\0").as_bytes());
+    }
+    let view = SliceView::new("blob.bin", &data);
+    let mut skipped = Vec::new();
+    let hits = region_strings_limited(&view, &[(0, data.len() as u64)], &mut skipped, MAX_TOTAL, 5);
+    assert_eq!(hits.len(), 5);
+    assert_eq!(skipped, [Reason::DeepBudget]);
+    let mut skipped = Vec::new();
+    let all = region_strings_limited(
+        &view,
+        &[(0, data.len() as u64)],
+        &mut skipped,
+        MAX_TOTAL,
+        64,
+    );
+    assert_eq!(all.len(), 64);
     assert!(skipped.is_empty());
 }
 
@@ -1842,6 +1955,72 @@ fn apple_double(fork: &[u8]) -> Vec<u8> {
     b.resize(82, 0);
     b.extend_from_slice(fork);
     b
+}
+
+#[test]
+fn a_resource_fork_audits_the_names_it_learned_and_keeps() {
+    let mut list = 2u16.to_be_bytes().to_vec();
+    list.extend(pstr(b"\xa9 2024 North Star Labs"));
+    list.extend(pstr(b"Render ready"));
+    let fork = resource_fork(&[(b"STR#", Some(b"North Star Resource"), list)]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Glow.rsrc");
+    std::fs::write(&path, &fork).unwrap();
+    let report = crate::scan::scan_file_detailed(&path, &crate::parsers::registry()).report;
+    assert_eq!(report.format.as_deref(), Some("rsrc"));
+    let view = crate::scan::WindowedFile::open(&path).unwrap();
+    let plan = crate::edit::deattribute::plan_mode(&report, &view, Mode::Deep);
+    drop(view);
+    let audit = plan.audit.as_ref().expect("a resource fork is audited");
+    assert!(
+        !audit.patterns.is_empty(),
+        "the learned vendor becomes a pattern"
+    );
+    assert!(audit.layout.valid && !audit.layout.linkage.is_empty());
+    let output = crate::edit::deattribute::write_deattributed(
+        &path,
+        report.format.as_deref(),
+        report.size,
+        &plan.targets,
+    )
+    .unwrap();
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(!has(&bytes, b"2024 North Star Labs"));
+    assert!(
+        has(&bytes, b"North Star Resource"),
+        "the resource name stays"
+    );
+    let check = crate::edit::deattribute::verify_plan(
+        &path,
+        &output,
+        report.format.as_deref(),
+        &plan,
+        Mode::Deep,
+    );
+    assert!(
+        !check.ok(crate::edit::deattribute::policy::VerificationPolicy::Strict),
+        "{check:?}"
+    );
+    assert!(
+        check.ok(crate::edit::deattribute::policy::VerificationPolicy::Protected),
+        "{check:?}"
+    );
+    assert!(
+        check
+            .residuals
+            .iter()
+            .any(|r| r.retained.as_deref() == Some("protected linkage")),
+        "{:?}",
+        check.residuals
+    );
+    let verified = crate::edit::deattribute::verify_copy(
+        &path,
+        &output,
+        report.format.as_deref(),
+        &plan.targets,
+        Mode::Deep,
+    );
+    assert!(!verified.ok(), "{verified:?}");
 }
 
 #[test]
