@@ -633,11 +633,13 @@ A rules file adds identities for `deattribute --rules`. Schema:
 | `identities[].ignore_ascii_case` | no | `true` | ASCII-only case folding |
 | `identities[].replacement` | no | spaces | must fit the encoded field |
 | `identities[].pad` | no | none | one character; required when `replacement` is shorter |
-| `identities[].files` | no | all files | `*`/`?` globs on the logical path, `/` separators |
+| `identities[].files` | no | all files | `*`/`?` globs on the input path as given, `/` separators; a plan saves that path and matches it again on `apply` |
 | `identities[].regions` | no | all regions | globs on `inspect` region labels |
-| `identities[].expected_matches` | no | unchecked | distinct selected ranges required before editing |
+| `identities[].expected_matches` | no | unchecked | distinct selected ranges required in the input before editing; the output is judged by the audit |
 | `exclusions[]` | no | none | text or hex patterns whose every occurrence is retained |
 
+The `files` glob above selects an input given as `bin/<name>.dll`, so run
+`deattribute bin/app.dll --rules identities.json` from the folder above `bin`.
 Exclusion text patterns default to `utf8`, `substring` and case-sensitive,
 unlike identities. At most 1,000 identities and 1,000 exclusions; globs are at
 most 4,096 characters.
@@ -679,8 +681,9 @@ file when the plan is created and when it is applied.
 A plan (`meownary schema plan`) is what `plan`, `bytes --plan-out` and
 `deattribute --plan-out` write. It pins `input`, `before` and `after` hashes,
 each operation with the BLAKE3 of the bytes it removes, the `raw` flag, and,
-for deattribution, the mode, policy, options and learned audit. Treat plans as
-read-only: any edit makes `apply` refuse it.
+for deattribution, the mode, policy, options, learned audit and `logical`, the
+input path as it was given, which `apply` and `verify` match the rules' `files`
+globs against. Treat plans as read-only: any edit makes `apply` refuse it.
 
 ## Verification reports
 
@@ -694,7 +697,7 @@ read-only: any edit makes `apply` refuse it.
 | `policy_satisfied` | the verification policy holds on the output |
 | `raw` | the plan was raw: bytes were checked, structure was not |
 | `hashes` | the output's size, BLAKE3 and SHA-256 |
-| `audit` | deattribution only: `complete`, `clean`, `policy_satisfied`, `residuals` and `unexamined` |
+| `audit` | deattribution only: `complete`, `clean`, `policy_satisfied`, `residuals` and `unexamined`; the patterns cover every identity the original carried, learned or planned, so a credit an exclusion kept is a residual retained as `explicit exclusion` |
 
 A report passes when `byte_integrity`, `coverage_complete` and
 `policy_satisfied` are true and `structure_valid` is not false.
@@ -711,6 +714,7 @@ record or an exclusion.
 |---|---|---|
 | Streaming scan budget per pass | 1,073,741,824 bytes | `--max-scan` |
 | Matches per search | 100,000 | `--max-matches` |
+| Deep string candidates per sweep | 500,000 | none; past it coverage is incomplete |
 | `bytes read` length | 256 bytes, at most 1 MiB | `--length` |
 | `strings` results | 1,000 | `--limit` |
 | `strings` minimum length | 4 characters | `--min-length` |

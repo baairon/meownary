@@ -57,6 +57,28 @@ All notable changes to meownary are recorded here. The format follows
 
 ### Fixed
 
+- **Delay imports in the old form**: a PE delay-import descriptor whose
+  pointers are virtual addresses (attributes bit 0 clear) is now protected and
+  verified like the RVA form, so deep mode no longer rewrites its DLL name and
+  the import check no longer passes a copy that did. A pointer outside the
+  image leaves the copy unverified.
+- **Tar copies**: a deep tar or tar.gz copy is audited entry by entry against
+  the original, the way a ZIP copy is, so a PE entry that keeps an original
+  identity reports `verified: false` and exit 75 in either archive.
+- **Audit patterns**: a resource fork's sweep now carries an audit, with the
+  learned names as patterns and the resource names as protected linkage, and
+  every plan adds the exact bytes of each credit it blanks or an exclusion
+  keeps, in normal mode as well as deep. `strict` fails on a retained name and
+  `protected` names the reason; a resource fork whose vendor name stays in a
+  resource name reports unverified from `clean --deattribute --deep`.
+- **`expected_matches`** counts the input only; verification of the cleaned
+  output no longer fails a valid one-match rule with `found 0`.
+- **Relative `files` selectors**: a plan saves the input path as given, so
+  `apply` and `verify` match `bin/*.dll` the way planning did, from any folder.
+  Plans saved before this field fall back to the canonical path.
+- **Deep string discovery** keeps at most 500,000 candidates per sweep and
+  reports incomplete coverage past that, and the PE sweep no longer clones its
+  candidate lists.
 - The highlight no longer moves when a file appears or disappears above it,
   such as a `.deattributed` copy sorting before its original.
 - Columns line up for file names with wide characters.
