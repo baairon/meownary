@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 
 use crate::scan::FileView;
-use crate::util::bytes::{slice, u16_le, u32_le};
+use crate::util::bytes::{slice, u16_le, u32_le, u64_le};
 
 /// Hard cap on the section table walk.
 pub const MAX_SECTIONS: usize = 96;
@@ -82,6 +82,9 @@ pub struct PeImage {
     pub checksum: u32,
     /// Absolute file offset of the optional header CheckSum field.
     pub checksum_off: u64,
+    /// The preferred load address, which old-form delay-import descriptors
+    /// bake into their pointers.
+    pub image_base: u64,
     pub sym_ptr: u32,
     pub sym_count: u32,
     pub sections: Vec<Section>,
@@ -128,6 +131,11 @@ impl PeImage {
         let entry_rva = u32_le(&opt, 16)?;
         let size_of_headers = u32_le(&opt, 60)?;
         let checksum = u32_le(&opt, 64)?;
+        let image_base = if is64 {
+            u64_le(&opt, 24)?
+        } else {
+            u64::from(u32_le(&opt, 28)?)
+        };
         let nrva = (u32_le(&opt, nrva_off)? as usize)
             .min(16)
             .min((opt_size - dir_base) / 8);
@@ -172,6 +180,7 @@ impl PeImage {
             size_of_headers,
             checksum,
             checksum_off: opt_off + 64,
+            image_base,
             sym_ptr,
             sym_count,
             sections,

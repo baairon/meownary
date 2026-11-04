@@ -46,6 +46,10 @@ const MAX_STRING: usize = 64 * 1024;
 const WINDOW: u64 = 8 * 1024 * 1024;
 /// Most bytes one file's sweep reads in total.
 const MAX_TOTAL: u64 = 256 * 1024 * 1024;
+/// The most candidate strings one sweep keeps. Past this the sweep stops and
+/// reports [`Reason::DeepBudget`], so the copy counts as incompletely
+/// covered rather than clean.
+pub(super) const MAX_DEEP_STRINGS: usize = 500_000;
 /// Largest plain-text file the text sweep reads.
 const MAX_TEXT: u64 = 16 * 1024 * 1024;
 /// Window for the entropy guard of the fallback sweep.
@@ -108,7 +112,7 @@ pub(super) fn sweep_with_limits(
 ) -> Deep {
     match report.format.as_deref() {
         Some("pe") => pe::sweep_with_limits(view, limits),
-        Some("rsrc" | "appledouble") => rsrc::sweep(view),
+        Some("rsrc" | "appledouble") => rsrc::sweep(view, limits),
         Some("elf") => {
             let mut regions = elf::data_regions(view);
             regions.extend(elf::debug_string_regions(view));
@@ -430,19 +434,22 @@ fn region_strings(
     regions: &[(u64, u64)],
     skipped: &mut Vec<Reason>,
 ) -> Vec<Hit> {
-    region_strings_limited(view, regions, skipped, MAX_TOTAL)
+    region_strings_limited(view, regions, skipped, MAX_TOTAL, MAX_DEEP_STRINGS)
 }
 
+/// Strings in `regions`, reading at most `max_bytes` and keeping at most
+/// `max_hits`; either limit reached reports [`Reason::DeepBudget`].
 fn region_strings_limited(
     view: &dyn FileView,
     regions: &[(u64, u64)],
     skipped: &mut Vec<Reason>,
     max_bytes: u64,
+    max_hits: usize,
 ) -> Vec<Hit> {
     let overlap = (MAX_STRING as u64 + 1) * 2;
     let mut budget = max_bytes;
     let mut hits = Vec::new();
-    for &(off, len) in regions {
+    'regions: for &(off, len) in regions {
         let Some(end) = off.checked_add(len).filter(|&e| e <= view.size()) else {
             skipped.push(Reason::MalformedMetadata);
             continue;
@@ -467,6 +474,13 @@ fn region_strings_limited(
             let mut found = Vec::new();
             strings(&bytes, from, pos == off, &mut found);
             hits.extend(found.into_iter().filter(|h| h.off >= pos && h.off < stop));
+            if hits.len() > max_hits {
+                hits.truncate(max_hits);
+                if !skipped.contains(&Reason::DeepBudget) {
+                    skipped.push(Reason::DeepBudget);
+                }
+                break 'regions;
+            }
             pos = stop.min(to);
         }
     }
@@ -1055,7 +1069,13 @@ fn binary(
     limits: &crate::edit::precision::pattern::Limits,
 ) -> Deep {
     let mut skipped = Vec::new();
-    let hits = region_strings_limited(view, regions, &mut skipped, limits.max_scan_bytes);
+    let hits = region_strings_limited(
+        view,
+        regions,
+        &mut skipped,
+        limits.max_scan_bytes,
+        MAX_DEEP_STRINGS,
+    );
     let roots = roots(&hits, None, evidence);
     skipped.extend(residuals(&hits, &[], &[], &roots));
     let mut layout = super::layout::inspect(view);
@@ -1178,7 +1198,13 @@ fn fallback_limited(view: &dyn FileView, max_bytes: u64) -> Deep {
     if size > max_bytes {
         skipped.push(Reason::DeepBudget);
     }
-    let hits = region_strings_limited(view, &[(0, size.min(max_bytes))], &mut skipped, max_bytes);
+    let hits = region_strings_limited(
+        view,
+        &[(0, size.min(max_bytes))],
+        &mut skipped,
+        max_bytes,
+        MAX_DEEP_STRINGS,
+    );
     let mut rewrites = Vec::new();
     for hit in hits {
         let lower = hit.text.to_ascii_lowercase();

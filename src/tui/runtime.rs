@@ -1808,13 +1808,17 @@ mod tests {
 
         let out = write_copies(&plan, dir.path());
         assert!(out.failed.is_empty(), "{:?}", out.failed);
-        assert!(out.unverified.is_empty(), "{:?}", out.unverified);
         assert_eq!(out.saved.len(), 2);
+        // The resource name keeps the vendor's name, so the copies carry a
+        // retained residual and do not verify clean.
+        assert_eq!(out.unverified.len(), 2, "{:?}", out.unverified);
         for item in &out.saved {
             let copy = std::fs::read(&item.output).unwrap();
             let has = |needle: &[u8]| copy.windows(needle.len()).any(|w| w == needle);
             assert!(!has(b"2024 Glimmer Labs"), "{}", item.output.display());
             assert!(has(b"Glimmer Glow"), "the resource name is kept");
+            let verified = item.verified.expect("checked");
+            assert!(!verified.clean && !verified.partial, "{verified:?}");
         }
     }
 

@@ -531,6 +531,16 @@
         },
         "coverage_complete": {
           "type": "boolean"
+        },
+        "logical": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

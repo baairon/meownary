@@ -694,14 +694,16 @@ pub fn plan_with_options(
     // Explicit policy wins over inferred text replacements and parser blanks.
     // An exclusion keeps the complete affected edit intact, including any
     // structured record that would otherwise be partially erased.
+    let mut excluded_targets: Vec<(u64, u64)> = Vec::new();
     if !explicit_rewrites.is_empty() || !exclusions.is_empty() {
-        if let Some(audit) = &mut out.audit {
-            for target in &out.targets {
-                let span = crate::edit::precision::pattern::Span {
-                    offset: target.marker.region.offset,
-                    len: target.marker.region.len,
-                };
-                if exclusions.iter().any(|s| s.overlaps(&span)) {
+        for target in &out.targets {
+            let span = crate::edit::precision::pattern::Span {
+                offset: target.marker.region.offset,
+                len: target.marker.region.len,
+            };
+            if exclusions.iter().any(|s| s.overlaps(&span)) {
+                excluded_targets.push((span.offset, span.len));
+                if let Some(audit) = &mut out.audit {
                     audit.layout.excluded.push(span);
                 }
             }
@@ -742,6 +744,7 @@ pub fn plan_with_options(
             ..audit::Audit::default()
         });
     }
+    audit_credit_patterns(view, &mut out, &excluded_targets)?;
     out.targets.sort_by_key(|t| t.marker.region.offset);
     if out.targets.is_empty() {
         return Ok(out);
@@ -1085,7 +1088,7 @@ pub fn verify_plan(
         &again.report,
         &view,
         mode,
-        &plan.configuration.clone().unwrap_or_default(),
+        &plan.configuration.clone().unwrap_or_default().for_output(),
     );
     let Ok(replanned) = replanned else {
         result
@@ -1181,14 +1184,85 @@ pub fn verify_archive_copy(
 ) -> Verified {
     let (clean, residual) = match kind {
         ArchiveKind::Zip => zip::verify_copy(original, output, mode),
-        ArchiveKind::Tar => (tar::verify_copy(original, output, false, mode), None),
-        ArchiveKind::TarGz => (tar::verify_copy(original, output, true, mode), None),
+        ArchiveKind::Tar => tar::verify_copy(original, output, false, mode),
+        ArchiveKind::TarGz => tar::verify_copy(original, output, true, mode),
     };
     Verified {
         clean,
         partial: false,
         residual,
     }
+}
+
+/// The longest credit whose bytes become an audit pattern.
+const MAX_CREDIT_PATTERN: usize = 4096;
+
+/// Every credit the plan blanks, and every one an exclusion kept, is an
+/// identity the original carried, whatever the mode learned it in. Their
+/// exact bytes join the audit's patterns, so a copy that still holds them
+/// anywhere shows a residual: one the exclusion explains, or one nothing
+/// does. Only readable text of four characters or more qualifies, so a
+/// zeroed timestamp or checksum never matches unrelated bytes.
+fn audit_credit_patterns(
+    view: &dyn FileView,
+    out: &mut FilePlan,
+    excluded: &[(u64, u64)],
+) -> io::Result<()> {
+    let Some(audit) = &mut out.audit else {
+        return Ok(());
+    };
+    let mut spans: Vec<(u64, u64)> = excluded.to_vec();
+    spans.extend(
+        out.targets
+            .iter()
+            .filter(|t| t.replacement.is_none())
+            .map(|t| (t.marker.region.offset, t.marker.region.len)),
+    );
+    spans.sort_unstable();
+    spans.dedup();
+    for (offset, len) in spans {
+        let Ok(len) = usize::try_from(len) else {
+            continue;
+        };
+        if len == 0 || len > MAX_CREDIT_PATTERN {
+            continue;
+        }
+        let bytes = crate::edit::precision::pattern::read_exact(view, offset, len)?;
+        if !readable_credit(&bytes) {
+            continue;
+        }
+        let value = fsio::to_hex(&bytes);
+        let known = audit.patterns.iter().any(|p| {
+            matches!(p, crate::edit::precision::pattern::Pattern::Hex { value: v } if *v == value)
+        });
+        if !known {
+            audit
+                .patterns
+                .push(crate::edit::precision::pattern::Pattern::Hex { value });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `bytes`, less trailing NULs, read as text of at least four
+/// characters with no control characters, as UTF-8 or as UTF-16LE.
+fn readable_credit(bytes: &[u8]) -> bool {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    let trimmed = &bytes[..end];
+    let readable = |text: &str| text.chars().count() >= 4 && !text.chars().any(char::is_control);
+    if let Ok(text) = std::str::from_utf8(trimmed)
+        && readable(text)
+    {
+        return true;
+    }
+    if !trimmed.len().is_multiple_of(2) {
+        return false;
+    }
+    let units: Vec<u16> = trimmed
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units).is_ok_and(|text| readable(&text))
 }
 
 /// Stream both files and compare, with each target's new bytes laid over the

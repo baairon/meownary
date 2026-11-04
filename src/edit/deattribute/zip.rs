@@ -1265,6 +1265,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_pe_that_keeps_its_identity_fails_the_same_way_in_a_zip_and_a_tar() {
+        use super::super::tar;
+        let dir = tempfile::tempdir().unwrap();
+        // The import name keeps the vendor's name, which deep mode may not
+        // touch, so the copy carries a residual whichever archive holds it.
+        let mut pe = pe_fixture(0x1234);
+        pe.extend_from_slice(b"NovaFlow private build\0");
+        let zip_path = dir.path().join("bundle.zip");
+        let zip_out = dir.path().join("bundle.deattributed.zip");
+        fs::write(
+            &zip_path,
+            build(&[item("tools/renderer.aex", &pe, false)], b""),
+        )
+        .unwrap();
+        deattribute_zip_mode(&zip_path, &zip_out, false, Mode::Deep).unwrap();
+        let in_zip = verify_copy(&zip_path, &zip_out, Mode::Deep);
+        let mut tar_bytes = Vec::new();
+        tar::tests::entry(&mut tar_bytes, "tools/renderer.aex", b'0', &pe);
+        tar_bytes.extend_from_slice(&[0; 1024]);
+        let tar_path = dir.path().join("bundle.tar");
+        let tar_out = dir.path().join("bundle.deattributed.tar");
+        fs::write(&tar_path, &tar_bytes).unwrap();
+        tar::deattribute_tar_mode(&tar_path, false, &tar_out, Mode::Deep)
+            .unwrap()
+            .unwrap();
+        let in_tar = tar::verify_copy(&tar_path, &tar_out, false, Mode::Deep);
+        assert!(!in_zip.0, "{in_zip:?}");
+        assert_eq!(in_zip, in_tar, "one verdict, whichever archive");
+        assert!(in_tar.1.is_some());
+        for (kind, original, output) in [
+            (super::super::ArchiveKind::Zip, &zip_path, &zip_out),
+            (super::super::ArchiveKind::Tar, &tar_path, &tar_out),
+        ] {
+            let verified = super::super::verify_archive_copy(original, output, kind, Mode::Deep);
+            assert!(!verified.ok(), "{kind:?}: {verified:?}");
+            assert_eq!(verified.residual, in_zip.1, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn entry_order_timestamps_attributes_and_descriptors_survive() {
         let dir = tempfile::tempdir().unwrap();
         let (_, exe, text) = fixture();
