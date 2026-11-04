@@ -4,175 +4,138 @@
 <clipPath id="frame"><rect width="960" height="600" rx="12"/></clipPath>
 </defs>
 <g clip-path="url(#frame)">
-<rect width="960" height="600" fill="#16131d"/>
+<rect width="960" height="600" fill="#120a1a"/>
 <g>
-<rect x="852" y="16" width="84" height="17" rx="3" fill="#733649"/>
-<rect x="443" y="73" width="93" height="17" rx="3" fill="#5a4076"/>
-<rect x="136" y="92" width="56" height="17" rx="3" fill="#c084fc"/>
-<rect x="833" y="92" width="103" height="36" rx="3" fill="#221c32"/>
-<rect x="145" y="206" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="206" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="225" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="225" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="244" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="244" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="263" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="263" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="282" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="282" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="301" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="301" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="24" y="282" width="93" height="17" rx="3" fill="#1c1826"/>
-<rect x="145" y="320" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="320" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="377" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="377" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="396" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="396" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="415" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="415" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="434" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="536" y="434" width="102" height="17" rx="3" fill="#a78bfa"/>
-<rect x="145" y="453" width="168" height="17" rx="3" fill="#a78bfa"/>
-<rect x="527" y="510" width="55" height="17" rx="3" fill="#705a38"/>
-<rect x="24" y="567" width="47" height="17" rx="3" fill="#504375"/>
-<rect x="824" y="567" width="112" height="17" rx="3" fill="#645377"/>
+<rect x="917" y="111" width="19" height="17" rx="3" fill="#1d122c"/>
+<rect x="24" y="301" width="10" height="17" rx="3" fill="#170e23"/>
+<rect x="545" y="510" width="56" height="17" rx="3" fill="#6e5436"/>
+<rect x="824" y="567" width="112" height="17" rx="3" fill="#615276"/>
 </g>
 <g fill="none">
-<path d="M24.3 81.5 H23.65 A4.15 4.15 0 0 0 19.5 85.65 V552.35 A4.15 4.15 0 0 0 23.65 556.5 H415.35 A4.15 4.15 0 0 0 419.5 552.35 V509" stroke="#2b2639" stroke-width="1.2"/>
-<path d="M145.2 81.5 H368.4" stroke="#2b2639" stroke-width="1.2"/>
-<path d="M419.5 91 V85.65 A4.15 4.15 0 0 0 415.35 81.5 H414.9" stroke="#2b2639" stroke-width="1.2"/>
-<path d="M433.5 81.5 H432.65 A4.15 4.15 0 0 0 428.5 85.65 V91" stroke="#5a4076" stroke-width="1.2"/>
-<path d="M545.1 81.5 H721.8" stroke="#5a4076" stroke-width="1.2"/>
-<path d="M935.7 81.5 H936.35 A4.15 4.15 0 0 1 940.5 85.65 V552.35 A4.15 4.15 0 0 1 936.35 556.5 H432.65 A4.15 4.15 0 0 1 428.5 552.35 V509" stroke="#5a4076" stroke-width="1.2"/>
-<path d="M126.6 100.5 H125.65 A4.15 4.15 0 0 0 121.5 104.65 V495.35 A4.15 4.15 0 0 0 125.65 499.5 H359.1" stroke="#c084fc" stroke-width="1.2"/>
-<path d="M201 100.5 H824.35 A4.15 4.15 0 0 1 828.5 104.65 V495.35 A4.15 4.15 0 0 1 824.35 499.5 H582.3" stroke="#c084fc" stroke-width="1.2"/>
-<path d="M191.7 195.5 H507.9" stroke="#4a4263" stroke-width="1.2"/>
-<path d="M573 195.5 H805.5" stroke="#4a4263" stroke-width="1.2"/>
-<path d="M191.7 366.5 H507.9" stroke="#4a4263" stroke-width="1.2"/>
-<path d="M610.2 366.5 H805.5" stroke="#4a4263" stroke-width="1.2"/>
-<path d="M833.4 442.5 H926.4" stroke="#2b2639" stroke-width="1.2"/>
+<path d="M679.5 15 V34" stroke="#251934" stroke-width="1.2"/>
+<path d="M24.3 62.5 H23.65 A4.15 4.15 0 0 0 19.5 66.65 V552.35 A4.15 4.15 0 0 0 23.65 556.5 H415.35 A4.15 4.15 0 0 0 419.5 552.35 V471" stroke="#251934" stroke-width="1.2"/>
+<path d="M145.2 62.5 H368.4" stroke="#251934" stroke-width="1.2"/>
+<path d="M414.9 62.5 H415.35 A4.15 4.15 0 0 1 419.5 66.65 V110" stroke="#251934" stroke-width="1.2"/>
+<path d="M442.8 62.5 H442.65 A4.15 4.15 0 0 0 438.5 66.65 V110" stroke="#533e76" stroke-width="1.2"/>
+<path d="M554.4 62.5 H721.8" stroke="#533e76" stroke-width="1.2"/>
+<path d="M935.7 62.5 H936.35 A4.15 4.15 0 0 1 940.5 66.65 V552.35 A4.15 4.15 0 0 1 936.35 556.5 H442.65 A4.15 4.15 0 0 1 438.5 552.35 V471" stroke="#533e76" stroke-width="1.2"/>
+<path d="M517.2 100.5 H907.8" stroke="#251934" stroke-width="1.2"/>
+<path d="M42.9 119.5 H42.65 A4.15 4.15 0 0 0 38.5 123.65 V457.35 A4.15 4.15 0 0 0 42.65 461.5 H359.1" stroke="#b48cff" stroke-width="1.2"/>
+<path d="M117.3 119.5 H908.35 A4.15 4.15 0 0 1 912.5 123.65 V457.35 A4.15 4.15 0 0 1 908.35 461.5 H582.3" stroke="#b48cff" stroke-width="1.2"/>
+<path d="M108 214.5 H331.2" stroke="#41305c" stroke-width="1.2"/>
+<path d="M405.6 214.5 H573" stroke="#41305c" stroke-width="1.2"/>
+<path d="M656.7 214.5 H889.2" stroke="#41305c" stroke-width="1.2"/>
+<path d="M684.6 347.5 H889.2" stroke="#41305c" stroke-width="1.2"/>
+<path d="M926.4 442.5 H917.1" stroke="#251934" stroke-width="1.2"/>
 </g>
 <g>
-<circle cx="38.25" cy="100.5" r="3.1" fill="#645377"/>
-<circle cx="38.25" cy="119.5" r="3.1" fill="#645377"/>
-<circle cx="38.25" cy="138.5" r="3.1" fill="#645377"/>
-<circle cx="38.25" cy="157.5" r="3.1" fill="#645377"/>
-<circle cx="38.25" cy="214.5" r="3.1" fill="#465777"/>
-<circle cx="38.25" cy="233.5" r="3.1" fill="#645377"/>
-<circle cx="38.25" cy="271.5" r="3.1" fill="#733649"/>
-<circle cx="38.25" cy="290.5" r="3.1" fill="#705a38"/>
-<circle cx="38.25" cy="309.5" r="3.1" fill="#645377"/>
 </g>
-<text x="24.3" y="29.34" fill="#73252b">m</text>
-<text x="33.6" y="29.34" fill="#73255e">e</text>
-<text x="42.9" y="29.34" fill="#5a2577">o</text>
-<text x="52.2" y="29.34" fill="#272577">w</text>
-<text x="61.5" y="29.34" fill="#504375">n</text>
-<text x="70.8" y="29.34" fill="#564976">a</text>
-<text x="80.1" y="29.34" fill="#5d4e77">r</text>
-<text x="89.4" y="29.34" fill="#645377">y</text>
-<text x="861.3" y="29.34" textLength="65.1" lengthAdjust="spacing" fill="#16131d">1 alert</text>
-<text x="24.3" y="48.34" textLength="530.1" lengthAdjust="spacing" fill="#6c6774">Scanned 16 files: 11 with findings, 12 removable markers.</text>
-<text x="24.3" y="67.34" textLength="251.1" lengthAdjust="spacing" fill="#383441">Enter opens a folder. Press</text>
-<text x="284.7" y="67.34" fill="#504375">?</text>
-<text x="303.3" y="67.34" textLength="83.7" lengthAdjust="spacing" fill="#383441">for keys,</text>
-<text x="396.3" y="67.34" fill="#504375">q</text>
-<text x="414.9" y="67.34" textLength="74.4" lengthAdjust="spacing" fill="#383441">to quit.</text>
-<text x="42.9" y="86.34" textLength="83.7" lengthAdjust="spacing" fill="#4b4558">downloads</text>
-<text x="377.7" y="86.34" textLength="18.6" lengthAdjust="spacing" fill="#4b4558">16</text>
-<text x="452.1" y="86.34" textLength="74.4" lengthAdjust="spacing" fill="#16131d">findings</text>
-<text x="731.1" y="86.34" textLength="186" lengthAdjust="spacing" fill="#4b4558">setup-tool-2.4.1.exe</text>
-<text x="52.2" y="105.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">Documen</text>
-<text x="145.2" y="105.34" textLength="37.2" lengthAdjust="spacing" fill="#16131d" font-weight="bold">keys</text>
-<text x="52.2" y="124.34" textLength="55.8" lengthAdjust="spacing" fill="#6c6774">Games\</text>
-<text x="145.2" y="124.34"><tspan fill="#ff4040" font-weight="bold">m<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff4040;#ff7240;#ffa340;#ffd540;#f7ff40;#c5ff40;#93ff40;#61ff40;#40ff50;#40ff82;#40ffb4;#40ffe6;#40e6ff;#40b4ff;#4082ff;#4051ff;#6140ff;#9340ff;#c540ff;#f740ff;#ff40d6;#ff40a4;#ff4072;#ff4040"/></tspan></text>
-<text x="154.5" y="124.34"><tspan fill="#ff40bf" font-weight="bold">e<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff40bf;#ff408d;#ff405c;#ff5640;#ff8840;#ffb940;#ffec40;#e1ff40;#afff40;#7dff40;#4bff40;#40ff66;#40ff98;#40ffca;#40fffc;#40d0ff;#409eff;#406cff;#4540ff;#7740ff;#a940ff;#db40ff;#ff40f1;#ff40bf"/></tspan></text>
-<text x="163.8" y="124.34"><tspan fill="#bf40ff" font-weight="bold">o<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#bf40ff;#f140ff;#ff40db;#ff40a9;#ff4077;#ff4046;#ff6c40;#ff9e40;#ffd040;#fcff40;#cbff40;#99ff40;#67ff40;#40ff4b;#40ff7d;#40ffae;#40ffe0;#40ecff;#40baff;#4088ff;#4056ff;#5b40ff;#8d40ff;#bf40ff"/></tspan></text>
-<text x="173.1" y="124.34"><tspan fill="#4040ff" font-weight="bold">w<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#4040ff;#7240ff;#a340ff;#d540ff;#ff40f7;#ff40c5;#ff4093;#ff4061;#ff5040;#ff8240;#ffb440;#ffe640;#e6ff40;#b4ff40;#82ff40;#51ff40;#40ff61;#40ff93;#40ffc5;#40fff7;#40d6ff;#40a4ff;#4072ff;#4040ff"/></tspan></text>
-<text x="182.4" y="124.34" fill="#a78bfa" font-weight="bold">n</text>
-<text x="191.7" y="124.34" fill="#b799fb" font-weight="bold">a</text>
-<text x="201" y="124.34" fill="#c8a6fd" font-weight="bold">r</text>
-<text x="210.3" y="124.34" fill="#d8b4fe" font-weight="bold">y</text>
-<text x="842.7" y="124.34" textLength="83.7" lengthAdjust="spacing" fill="#6f4d65">removable</text>
-<text x="52.2" y="143.34" textLength="55.8" lengthAdjust="spacing" fill="#6c6774">Media\</text>
-<text x="145.2" y="143.34" textLength="502.2" lengthAdjust="spacing" fill="#6b6577">Edits keep the original in the trash. Press u to undo.</text>
-<text x="833.4" y="143.34" textLength="46.5" lengthAdjust="spacing" fill="#6c6774">ctory</text>
-<text x="52.2" y="162.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">Photos\</text>
-<text x="145.2" y="162.34" textLength="446.4" lengthAdjust="spacing" fill="#6b6577">Weak findings are never included in bulk scrubs.</text>
-<text x="842.7" y="162.34" textLength="83.7" lengthAdjust="spacing" fill="#6f4d65">removable</text>
-<text x="33.6" y="181.34" fill="#383441">·</text>
-<text x="52.2" y="181.34" textLength="65.1" lengthAdjust="spacing" fill="#4b4558">icon.pn</text>
-<text x="833.4" y="181.34" textLength="27.9" lengthAdjust="spacing" fill="#6c6774">ure</text>
-<text x="33.6" y="200.34" fill="#383441">·</text>
-<text x="52.2" y="200.34" textLength="65.1" lengthAdjust="spacing" fill="#4b4558">install</text>
-<text x="145.2" y="200.34" textLength="37.2" lengthAdjust="spacing" fill="#d8b4fe" font-weight="bold">move</text>
-<text x="535.8" y="200.34" textLength="27.9" lengthAdjust="spacing" fill="#d8b4fe" font-weight="bold">act</text>
-<text x="52.2" y="219.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">invoice</text>
-<text x="154.5" y="219.34" textLength="83.7" lengthAdjust="spacing" fill="#16131d" font-weight="bold">up/dn j/k</text>
-<text x="321.9" y="219.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">move</text>
-<text x="545.1" y="219.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">space</text>
-<text x="647.4" y="219.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">select</text>
-<text x="833.4" y="219.34" textLength="46.5" lengthAdjust="spacing" fill="#6c6774">ader)</text>
-<text x="52.2" y="238.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">lease-d</text>
-<text x="154.5" y="238.34" textLength="83.7" lengthAdjust="spacing" fill="#16131d" font-weight="bold">pgup/pgdn</text>
-<text x="321.9" y="238.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">page</text>
-<text x="545.1" y="238.34" fill="#16131d" font-weight="bold">d</text>
-<text x="647.4" y="238.34" textLength="120.9" lengthAdjust="spacing" fill="#9a91b0">scrub markers</text>
-<text x="33.6" y="257.34" fill="#383441">·</text>
-<text x="52.2" y="257.34" textLength="65.1" lengthAdjust="spacing" fill="#4b4558">notes.t</text>
-<text x="154.5" y="257.34" textLength="111.6" lengthAdjust="spacing" fill="#16131d" font-weight="bold">home/end g/G</text>
-<text x="321.9" y="257.34" textLength="111.6" lengthAdjust="spacing" fill="#9a91b0">top / bottom</text>
-<text x="545.1" y="257.34" fill="#16131d" font-weight="bold">a</text>
-<text x="647.4" y="257.34" textLength="102.3" lengthAdjust="spacing" fill="#9a91b0">deattribute</text>
-<text x="833.4" y="257.34" textLength="37.2" lengthAdjust="spacing" fill="#6c6774">.09)</text>
-<text x="52.2" y="276.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">photo.j</text>
-<text x="154.5" y="276.34" textLength="120.9" lengthAdjust="spacing" fill="#16131d" font-weight="bold">enter right/l</text>
-<text x="321.9" y="276.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">open</text>
-<text x="545.1" y="276.34" fill="#16131d" font-weight="bold">A</text>
-<text x="647.4" y="276.34" textLength="148.8" lengthAdjust="spacing" fill="#9a91b0">deep deattribute</text>
-<text x="52.2" y="295.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">setup-t</text>
-<text x="154.5" y="295.34" textLength="148.8" lengthAdjust="spacing" fill="#16131d" font-weight="bold">left/h backspace</text>
-<text x="321.9" y="295.34" textLength="102.3" lengthAdjust="spacing" fill="#9a91b0">up a folder</text>
-<text x="545.1" y="295.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">D / x</text>
-<text x="647.4" y="295.34" textLength="102.3" lengthAdjust="spacing" fill="#9a91b0">delete file</text>
-<text x="52.2" y="314.34" textLength="65.1" lengthAdjust="spacing" fill="#6c6774">sources</text>
-<text x="154.5" y="314.34" textLength="27.9" lengthAdjust="spacing" fill="#16131d" font-weight="bold">tab</text>
-<text x="321.9" y="314.34" textLength="102.3" lengthAdjust="spacing" fill="#9a91b0">switch pane</text>
-<text x="545.1" y="314.34" fill="#16131d" font-weight="bold">e</text>
-<text x="647.4" y="314.34" textLength="130.2" lengthAdjust="spacing" fill="#9a91b0">open in editor</text>
-<text x="154.5" y="333.34" textLength="27.9" lengthAdjust="spacing" fill="#16131d" font-weight="bold">esc</text>
-<text x="321.9" y="333.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">back</text>
-<text x="545.1" y="333.34" fill="#16131d" font-weight="bold">u</text>
-<text x="647.4" y="333.34" textLength="83.7" lengthAdjust="spacing" fill="#9a91b0">undo last</text>
-<text x="145.2" y="371.34" textLength="37.2" lengthAdjust="spacing" fill="#d8b4fe" font-weight="bold">view</text>
-<text x="535.8" y="371.34" textLength="65.1" lengthAdjust="spacing" fill="#d8b4fe" font-weight="bold">prompts</text>
-<text x="154.5" y="390.34" fill="#16131d" font-weight="bold">o</text>
-<text x="321.9" y="390.34" textLength="176.7" lengthAdjust="spacing" fill="#9a91b0">open file or folder</text>
-<text x="545.1" y="390.34" fill="#16131d" font-weight="bold">y</text>
-<text x="647.4" y="390.34" textLength="65.1" lengthAdjust="spacing" fill="#9a91b0">confirm</text>
-<text x="154.5" y="409.34" fill="#16131d" font-weight="bold">b</text>
-<text x="321.9" y="409.34" textLength="65.1" lengthAdjust="spacing" fill="#9a91b0">buckets</text>
-<text x="545.1" y="409.34" textLength="65.1" lengthAdjust="spacing" fill="#16131d" font-weight="bold">n / esc</text>
-<text x="647.4" y="409.34" textLength="139.5" lengthAdjust="spacing" fill="#9a91b0">cancel or clear</text>
-<text x="154.5" y="428.34" fill="#16131d" font-weight="bold">/</text>
-<text x="321.9" y="428.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">filter</text>
-<text x="545.1" y="428.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">enter</text>
-<text x="647.4" y="428.34" textLength="139.5" lengthAdjust="spacing" fill="#9a91b0">keep the filter</text>
-<text x="154.5" y="447.34" fill="#16131d" font-weight="bold">?</text>
-<text x="321.9" y="447.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">keys</text>
-<text x="545.1" y="447.34" textLength="83.7" lengthAdjust="spacing" fill="#16131d" font-weight="bold">backspace</text>
-<text x="647.4" y="447.34" textLength="46.5" lengthAdjust="spacing" fill="#9a91b0">erase</text>
-<text x="154.5" y="466.34" textLength="93" lengthAdjust="spacing" fill="#16131d" font-weight="bold">q / ctrl+c</text>
-<text x="321.9" y="466.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">quit</text>
-<text x="368.4" y="504.34" textLength="204.6" lengthAdjust="spacing" fill="#9a91b0" font-weight="bold">Press any key to close</text>
-<text x="442.8" y="523.34" textLength="65.1" lengthAdjust="spacing" fill="#4b4558">verdict</text>
-<text x="535.8" y="523.34" textLength="37.2" lengthAdjust="spacing" fill="#16131d">warn</text>
-<text x="600.9" y="523.34" textLength="306.9" lengthAdjust="spacing" fill="#705a38">truncating may remove an appended</text>
-<text x="526.5" y="542.34" textLength="130.2" lengthAdjust="spacing" fill="#705a38">code signature</text>
-<text x="33.6" y="580.34" textLength="27.9" lengthAdjust="spacing" fill="#16131d">esc</text>
-<text x="80.1" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#4b4558">close</text>
-<text x="833.4" y="580.34" textLength="93" lengthAdjust="spacing" fill="#16131d">1 selected</text>
+<text x="24.3" y="29.34" fill="#712029">m</text>
+<text x="33.6" y="29.34" fill="#71205c">e</text>
+<text x="42.9" y="29.34" fill="#572076">o</text>
+<text x="52.2" y="29.34" fill="#242076">w</text>
+<text x="61.5" y="29.34" fill="#4a3776">n</text>
+<text x="70.8" y="29.34" fill="#524076">a</text>
+<text x="80.1" y="29.34" fill="#594976">r</text>
+<text x="89.4" y="29.34" fill="#615276">y</text>
+<text x="108" y="29.34" fill="#251934">·</text>
+<text x="126.6" y="29.34" textLength="83.7" lengthAdjust="spacing" fill="#4f4662">downloads</text>
+<text x="554.4" y="29.34" textLength="18.6" lengthAdjust="spacing" fill="#6e4464">12</text>
+<text x="582.3" y="29.34" textLength="83.7" lengthAdjust="spacing" fill="#4f4662">removable</text>
+<text x="693.9" y="29.34" fill="#712b41">1</text>
+<text x="712.5" y="29.34" textLength="46.5" lengthAdjust="spacing" fill="#4f4662">alert</text>
+<text x="777.6" y="29.34" fill="#6e5436">1</text>
+<text x="796.2" y="29.34" textLength="37.2" lengthAdjust="spacing" fill="#4f4662">warn</text>
+<text x="852" y="29.34" textLength="18.6" lengthAdjust="spacing" fill="#615276">11</text>
+<text x="879.9" y="29.34" textLength="55.8" lengthAdjust="spacing" fill="#4f4662">notice</text>
+<text x="24.3" y="48.34" textLength="530.1" lengthAdjust="spacing" fill="#6a6274">Scanned 16 files: 11 with findings, 12 removable markers.</text>
+<text x="42.9" y="67.34" textLength="83.7" lengthAdjust="spacing" fill="#4f4662">downloads</text>
+<text x="377.7" y="67.34" textLength="18.6" lengthAdjust="spacing" fill="#4f4662">16</text>
+<text x="461.4" y="67.34" textLength="74.4" lengthAdjust="spacing" fill="#533e76">findings</text>
+<text x="731.1" y="67.34" textLength="186" lengthAdjust="spacing" fill="#4f4662">setup-tool-2.4.1.exe</text>
+<text x="42.9" y="105.34" fill="#4a3776">▸</text>
+<text x="61.5" y="105.34" textLength="93" lengthAdjust="spacing" fill="#4a3776">Documents/</text>
+<text x="312.6" y="105.34" textLength="55.8" lengthAdjust="spacing" fill="#4f4662">1 file</text>
+<text x="387" y="105.34" fill="#615276">1</text>
+<text x="470.7" y="105.34" textLength="37.2" lengthAdjust="spacing" fill="#6e5436">warn</text>
+<text x="917.1" y="105.34" fill="#4f4662">1</text>
+<text x="61.5" y="124.34" textLength="37.2" lengthAdjust="spacing" fill="#b48cff" font-weight="bold">keys</text>
+<text x="917.1" y="124.34" fill="#6e4464">*</text>
+<text x="61.5" y="143.34"><tspan fill="#ff4040" font-weight="bold">m<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff4040;#ff7240;#ffa340;#ffd540;#f7ff40;#c5ff40;#93ff40;#61ff40;#40ff50;#40ff82;#40ffb4;#40ffe6;#40e6ff;#40b4ff;#4082ff;#4051ff;#6140ff;#9340ff;#c540ff;#f740ff;#ff40d6;#ff40a4;#ff4072;#ff4040"/></tspan></text>
+<text x="70.8" y="143.34"><tspan fill="#ff40bf" font-weight="bold">e<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff40bf;#ff408d;#ff405c;#ff5640;#ff8840;#ffb940;#ffec40;#e1ff40;#afff40;#7dff40;#4bff40;#40ff66;#40ff98;#40ffca;#40fffc;#40d0ff;#409eff;#406cff;#4540ff;#7740ff;#a940ff;#db40ff;#ff40f1;#ff40bf"/></tspan></text>
+<text x="80.1" y="143.34"><tspan fill="#bf40ff" font-weight="bold">o<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#bf40ff;#f140ff;#ff40db;#ff40a9;#ff4077;#ff4046;#ff6c40;#ff9e40;#ffd040;#fcff40;#cbff40;#99ff40;#67ff40;#40ff4b;#40ff7d;#40ffae;#40ffe0;#40ecff;#40baff;#4088ff;#4056ff;#5b40ff;#8d40ff;#bf40ff"/></tspan></text>
+<text x="89.4" y="143.34"><tspan fill="#4040ff" font-weight="bold">w<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#4040ff;#7240ff;#a340ff;#d540ff;#ff40f7;#ff40c5;#ff4093;#ff4061;#ff5040;#ff8240;#ffb440;#ffe640;#e6ff40;#b4ff40;#82ff40;#51ff40;#40ff61;#40ff93;#40ffc5;#40fff7;#40d6ff;#40a4ff;#4072ff;#4040ff"/></tspan></text>
+<text x="98.7" y="143.34" fill="#9d7bff" font-weight="bold">n</text>
+<text x="108" y="143.34" fill="#b192ff" font-weight="bold">a</text>
+<text x="117.3" y="143.34" fill="#c4a8ff" font-weight="bold">r</text>
+<text x="126.6" y="143.34" fill="#d8bfff" font-weight="bold">y</text>
+<text x="61.5" y="162.34" textLength="502.2" lengthAdjust="spacing" fill="#7d719c">Edits keep the original in the trash. Press u to undo.</text>
+<text x="917.1" y="162.34" fill="#4f4662">2</text>
+<text x="61.5" y="181.34" textLength="446.4" lengthAdjust="spacing" fill="#7d719c">Weak findings are never included in bulk scrubs.</text>
+<text x="917.1" y="181.34" fill="#6e4464">*</text>
+<text x="61.5" y="219.34" textLength="37.2" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">move</text>
+<text x="368.4" y="219.34" textLength="27.9" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">act</text>
+<text x="610.2" y="219.34" textLength="37.2" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">view</text>
+<text x="61.5" y="238.34" textLength="83.7" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">up/dn j/k</text>
+<text x="219.6" y="238.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">move</text>
+<text x="368.4" y="238.34" textLength="46.5" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">space</text>
+<text x="424.2" y="238.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">select</text>
+<text x="610.2" y="238.34" fill="#d8bfff" font-weight="bold">o</text>
+<text x="712.5" y="238.34" textLength="176.7" lengthAdjust="spacing" fill="#ab9fcf">open file or folder</text>
+<text x="917.1" y="238.34" fill="#4f4662">2</text>
+<text x="61.5" y="257.34" textLength="83.7" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">pgup/pgdn</text>
+<text x="219.6" y="257.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">page</text>
+<text x="368.4" y="257.34" fill="#d8bfff" font-weight="bold">d</text>
+<text x="424.2" y="257.34" textLength="120.9" lengthAdjust="spacing" fill="#ab9fcf">scrub markers</text>
+<text x="610.2" y="257.34" fill="#d8bfff" font-weight="bold">b</text>
+<text x="712.5" y="257.34" textLength="65.1" lengthAdjust="spacing" fill="#ab9fcf">buckets</text>
+<text x="61.5" y="276.34" textLength="111.6" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">home/end g/G</text>
+<text x="219.6" y="276.34" textLength="111.6" lengthAdjust="spacing" fill="#ab9fcf">top / bottom</text>
+<text x="368.4" y="276.34" fill="#d8bfff" font-weight="bold">a</text>
+<text x="424.2" y="276.34" textLength="102.3" lengthAdjust="spacing" fill="#ab9fcf">deattribute</text>
+<text x="610.2" y="276.34" fill="#d8bfff" font-weight="bold">/</text>
+<text x="712.5" y="276.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">filter</text>
+<text x="61.5" y="295.34" textLength="120.9" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">enter right/l</text>
+<text x="219.6" y="295.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">open</text>
+<text x="368.4" y="295.34" fill="#d8bfff" font-weight="bold">A</text>
+<text x="424.2" y="295.34" textLength="148.8" lengthAdjust="spacing" fill="#ab9fcf">deep deattribute</text>
+<text x="610.2" y="295.34" fill="#d8bfff" font-weight="bold">?</text>
+<text x="712.5" y="295.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">keys</text>
+<text x="24.3" y="314.34" fill="#251934">▎</text>
+<text x="61.5" y="314.34" textLength="148.8" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">left/h backspace</text>
+<text x="219.6" y="314.34" textLength="102.3" lengthAdjust="spacing" fill="#ab9fcf">up a folder</text>
+<text x="368.4" y="314.34" textLength="46.5" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">D / x</text>
+<text x="424.2" y="314.34" textLength="102.3" lengthAdjust="spacing" fill="#ab9fcf">delete file</text>
+<text x="610.2" y="314.34" textLength="93" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">q / ctrl+c</text>
+<text x="712.5" y="314.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">quit</text>
+<text x="61.5" y="333.34" textLength="27.9" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">tab</text>
+<text x="219.6" y="333.34" textLength="102.3" lengthAdjust="spacing" fill="#ab9fcf">switch pane</text>
+<text x="368.4" y="333.34" fill="#d8bfff" font-weight="bold">e</text>
+<text x="424.2" y="333.34" textLength="130.2" lengthAdjust="spacing" fill="#ab9fcf">open in editor</text>
+<text x="61.5" y="352.34" textLength="27.9" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">esc</text>
+<text x="219.6" y="352.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">back</text>
+<text x="368.4" y="352.34" fill="#d8bfff" font-weight="bold">u</text>
+<text x="424.2" y="352.34" textLength="83.7" lengthAdjust="spacing" fill="#ab9fcf">undo last</text>
+<text x="610.2" y="352.34" textLength="65.1" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">prompts</text>
+<text x="610.2" y="371.34" fill="#d8bfff" font-weight="bold">y</text>
+<text x="712.5" y="371.34" textLength="65.1" lengthAdjust="spacing" fill="#ab9fcf">confirm</text>
+<text x="610.2" y="390.34" textLength="65.1" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">n / esc</text>
+<text x="712.5" y="390.34" textLength="139.5" lengthAdjust="spacing" fill="#ab9fcf">cancel or clear</text>
+<text x="610.2" y="409.34" textLength="46.5" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">enter</text>
+<text x="712.5" y="409.34" textLength="139.5" lengthAdjust="spacing" fill="#ab9fcf">keep the filter</text>
+<text x="610.2" y="428.34" textLength="83.7" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">backspace</text>
+<text x="712.5" y="428.34" textLength="46.5" lengthAdjust="spacing" fill="#ab9fcf">erase</text>
+<text x="368.4" y="466.34" textLength="204.6" lengthAdjust="spacing" fill="#ab9fcf" font-weight="bold">Press any key to close</text>
+<text x="461.4" y="485.34" textLength="37.2" lengthAdjust="spacing" fill="#4f4662">note</text>
+<text x="545.1" y="485.34" textLength="93" lengthAdjust="spacing" fill="#6a6274">at 0x9c400</text>
+<text x="461.4" y="504.34" textLength="55.8" lengthAdjust="spacing" fill="#4f4662">action</text>
+<text x="545.1" y="504.34" textLength="213.9" lengthAdjust="spacing" fill="#6a6274">cut the file at 0x9c400</text>
+<text x="461.4" y="523.34" textLength="65.1" lengthAdjust="spacing" fill="#4f4662">verdict</text>
+<text x="554.4" y="523.34" textLength="37.2" lengthAdjust="spacing" fill="#120a1a">warn</text>
+<text x="619.5" y="523.34" textLength="223.2" lengthAdjust="spacing" fill="#6e5436">truncating may remove an</text>
+<text x="545.1" y="542.34" textLength="213.9" lengthAdjust="spacing" fill="#6e5436">appended code signature</text>
+<text x="24.3" y="580.34" textLength="83.7" lengthAdjust="spacing" fill="#4f4662">esc close</text>
+<text x="833.4" y="580.34" textLength="93" lengthAdjust="spacing" fill="#120a1a">1 selected</text>
 </g>
-<rect x="0.5" y="0.5" width="959" height="599" rx="11.5" fill="none" stroke="#4a4263"/>
+<rect x="0.5" y="0.5" width="959" height="599" rx="11.5" fill="none" stroke="#41305c"/>
 </svg>
