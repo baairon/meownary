@@ -45,7 +45,10 @@ All notable changes to meownary are recorded here. The format follows
   `esc` stops after the current file.
 - **Picker**: browses with keys like the view (`enter` opens, `left` goes up,
   `s` scans, `/` filters or takes a path), reads folders in the background,
-  counts each folder's files, and keeps its layout still.
+  counts each folder's files, and keeps its layout still. Its rows use the
+  view's glyphs with a blank row between subfolders and files, the scan row
+  shows its `s`, and inside a folder the recent picks and places wait under
+  the rows as a numbered jump group that a digit opens.
 - **Previews**: the README images draw seamless borders with rounded corners,
   rounded chips and gradient progress bars.
 - **Progress bar shimmer**: the span of the file in work, and the whole bar

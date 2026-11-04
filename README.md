@@ -712,15 +712,19 @@ picker's last five picks, written only when you pick something in the picker.
 `meownary <path>` opens a terminal view over a streaming scan, one folder at
 a time; `meownary` alone opens a picker first.
 
-<p align="center"><img src="assets/picker.svg" width="960" alt="The meownary picker browsing Downloads: the wordmark, one line saying nothing is changed until you confirm an action, the folder's path, a pinned Scan this folder row with its file count still counting, then the subfolders with their counts and the files with their sizes. Footer: up/dn move, enter open, left up, s scan here, / filter, ? keys, esc quit."></p>
+<p align="center"><img src="assets/picker.svg" width="960" alt="The meownary picker browsing Downloads: the wordmark, one line saying nothing is changed until you confirm an action, the folder's path, a pinned row reading s Scan this folder with its file count still counting, then the subfolders behind a folder glyph with their counts, a blank row, the files with their sizes, and under them a numbered jump group of places: Desktop, Documents and Pictures. Footer: s scan here, then up/dn move, enter open, left up, / filter, ? keys, esc quit."></p>
 
 - **Picker**: browse with the arrows or `j` and `k`; `enter` or `right` opens
   a folder or scans a file, `left` or `backspace` goes up, and `s` scans the
   folder you are in. `/` filters the folder, or takes a typed path, and a
   pasted path jumps there. Recent picks come first, then common folders,
-  drives and home. Folders show their file counts as they are counted, and
-  the picker asks before scanning a whole home folder, the folder that holds
-  every user's home, or a drive, with the count so far.
+  drives and home; inside a folder they wait under its rows as a numbered
+  jump group when there is room, and a digit opens one. Rows use the view's
+  glyphs: `▸` a folder, `·` a file, `→` a link, `○` a cloud-only file, `↺` a
+  recent pick, with a blank row between the subfolders and the files.
+  Folders show their file counts as they are counted, and the picker asks
+  before scanning a whole home folder, the folder that holds every user's
+  home, or a drive, with the count so far.
 - **Reopen**: `o` brings the picker back over the view, at the folder you are
   in; `esc` returns to the view unchanged.
 - **Header**: the wordmark and the scanned folder, with the removable count
@@ -779,12 +783,10 @@ a time; `meownary` alone opens a picker first.
   signature id or title. `tab` switches panes, and `left` goes back from the
   findings to the files.
 
-<details>
-<summary>Key reference</summary>
+The `?` sheet lists every key:
 
 <p align="center"><img src="assets/keys.svg" width="960" alt="The meownary key reference, the ? sheet, drawn over the dimmed interactive view with its grouped findings. Move: up/dn or j/k move, pgup/pgdn page, home/end or g/G top or bottom, enter or right/l open, left/h or backspace up a folder, tab switch pane, esc back. Act: space select, d scrub markers, a deattribute, A deep deattribute, D or x delete file, e open in editor, u undo last. View: o open file or folder, b buckets, / filter, ? keys, q or ctrl+c quit. Prompts: y confirm, n or esc cancel or clear, enter keep the filter, backspace erase. Press any key to close."></p>
 
-</details>
 
 ## JSON output
 
