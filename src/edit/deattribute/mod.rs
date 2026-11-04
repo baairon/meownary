@@ -1259,8 +1259,10 @@ fn readable_credit(bytes: &[u8]) -> bool {
         return false;
     }
     let units: Vec<u16> = trimmed
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&units).is_ok_and(|text| readable(&text))
 }
