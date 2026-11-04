@@ -8,6 +8,13 @@ All notable changes to meownary are recorded here. The format follows
 
 ### Added
 
+- **Undo preview**: `u` lists the newest journal group, each file with what
+  undo does and when the edit was made, before `y` reverts it.
+- **More of the engine in the view**: alert, warn and notice counts in the
+  header; each deattributed copy's verification on its chip, in the peek and
+  in the status; skipped files summed up by reason; the full reason a file
+  was only partly read; a verdict that follows the marker's own reversible
+  flag; and how long a job took on its final status.
 - **Wider deep mode**: `--deep` and `A` also clean Macintosh resource forks
   and AppleDouble `._` files, PE dialog, message table and PiPL plug-in
   resources, .NET assembly attributes, MISC and embedded PDB debug records,
@@ -17,6 +24,18 @@ All notable changes to meownary are recorded here. The format follows
 
 ### Changed
 
+- **Layout**: the header is two rows, the wordmark and folder with the
+  removable, alert, warn and notice counts at the right, then the activity
+  line, the latest message or the scan. Findings sit under a header per
+  severity, one line each, with the signature id and a `*` for a removable
+  marker; the peek names the highlighted finding's severity, confidence and
+  id. Folders lead the files list behind a `▸` with a blank row before the
+  files, panes keep a column and a row of air, the footer leads with the
+  keys that act, and the detail view is split into finding, file and bytes.
+- **Look**: a deep violet ground with more contrast, pane titles as bold
+  text instead of filled chips, footer and help keys as bright words with dim
+  labels, a thin bar at the left of the cursor row, and `✓` or `✗` in front
+  of a status line whose outcome matters.
 - **Folders in the view**: the files pane shows one folder at a time, its
   subfolders first, instead of every scanned file in one list. Rows stay put
   while a scan fills them in, each folder shows its own progress, file count

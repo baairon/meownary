@@ -21,11 +21,11 @@ use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::edit::deattribute;
+use crate::edit::deattribute::{self, Verified};
 use crate::edit::{self, Risk};
 use crate::model::{
     Bucket, BucketBy, Confidence, ContainerKind, FileReport, Finding, Marker, Region,
-    RemovalStrategy, bucketize,
+    RemovalStrategy, Severity, bucketize,
 };
 use crate::scan::walk::CountDelta;
 use crate::scan::{Scanned, WindowedFile};
@@ -36,7 +36,7 @@ use super::listing::Listing;
 use super::picker::{PickOutcome, Picker};
 use super::progress::{Activity, Progress, Silent};
 use super::theme::Tone;
-use super::tree::{Tree, subtree};
+use super::tree::{Tree, severity_slot, subtree};
 
 /// Run the interactive view. With a path it scans that folder right away;
 /// without one it opens on the folder picker. Sets up and tears down the
@@ -53,6 +53,7 @@ pub const MSG_QUIT_ARMED: &str = "Press Esc again to quit, or press q.";
 pub const MSG_NEVER_MIND: &str = "Cancelled. Nothing changed.";
 pub const MSG_UNDO_RUNS: &str = "Undo cannot be stopped. It finishes on its own.";
 pub const MSG_QUIT_AFTER_UNDO: &str = "Quitting when the undo finishes.";
+pub const MSG_NOTHING_TO_UNDO: &str = "Nothing to undo.";
 
 /// Which list has focus on the main screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,35 @@ pub enum Overlay {
     /// The filter prompt; typing edits `App::filter` live.
     Filter,
     Confirm(Plan),
+    /// What `u` would revert, awaiting a yes.
+    ConfirmUndo(UndoPlan),
+}
+
+/// One journal record the undo confirm lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoItem {
+    /// The file, as the view knows it.
+    pub path: PathBuf,
+    /// The journal label: a signature id, or what the edit was.
+    pub label: String,
+    /// What undo will do to it, in a few words.
+    pub action: String,
+    /// How long ago the edit was made.
+    pub age: String,
+}
+
+/// The newest undo group, awaiting confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoPlan {
+    pub items: Vec<UndoItem>,
+    pub scroll: usize,
+}
+
+impl UndoPlan {
+    pub fn title(&self) -> String {
+        let n = self.items.len();
+        format!("Undo {n} {}?", plural(n, "edit", "edits"))
+    }
 }
 
 /// The message line under the scan status.
@@ -228,6 +258,9 @@ pub enum Effect {
     /// Apply a confirmed plan as one undo group (a deattribute plan writes
     /// its copies off the input thread instead).
     Apply(Plan),
+    /// `u` was pressed: read the newest journal group and offer it through
+    /// [`App::offer_undo`].
+    PreviewUndo,
     /// Build a deattribute plan off the input thread and hand it back
     /// through [`App::plan_ready`].
     PlanDeattribute(DeattributeRequest),
@@ -290,6 +323,8 @@ pub struct Saved {
     pub output: PathBuf,
     /// Edits saved into `output` this session.
     pub edits: usize,
+    /// What checking a deattributed copy found, when it was checked.
+    pub verified: Option<Verified>,
 }
 
 /// One file an action saved, for [`App::record_saved`].
@@ -301,6 +336,22 @@ pub struct SavedItem {
     pub output: PathBuf,
     /// Edits this action saved.
     pub edits: usize,
+    /// What checking the copy found, for a deattribute.
+    pub verified: Option<Verified>,
+}
+
+/// The word a verification gets in the view, and its tone: `None` for a
+/// copy that checked out.
+pub fn verification_note(v: &Verified) -> Option<(String, Tone)> {
+    if v.ok() {
+        return None;
+    }
+    let text = match v.residual {
+        Some(category) => format!("attribution remains in {category}"),
+        None if v.partial => "the copy could only be partly rescanned".to_string(),
+        None => "the copy did not verify clean".to_string(),
+    };
+    Some((text, Tone::Warn))
 }
 
 /// Work the view is waiting on. Edit keys are ignored until it finishes, so
@@ -379,6 +430,8 @@ pub struct Stats {
     pub flagged: usize,
     pub removable: usize,
     pub alerts: usize,
+    pub warns: usize,
+    pub notices: usize,
 }
 
 /// The most common signatures under a folder, as last worked out.
@@ -464,6 +517,9 @@ pub struct App {
     pub activity: Option<Activity>,
     /// When the running job started, on the animation clock.
     pub busy_since: u64,
+    /// How long the last job took, until the next message replaces its
+    /// outcome.
+    pub done_in: Option<u64>,
     /// The running job was asked to stop after its current item.
     pub stopping: bool,
     /// Quit once the running job has ended.
@@ -523,6 +579,7 @@ impl App {
             confirm_drawn: false,
             activity: None,
             busy_since: 0,
+            done_in: None,
             stopping: false,
             quit_after: false,
             busy_note: None,
@@ -744,6 +801,7 @@ impl App {
             text: text.into(),
             tone,
         });
+        self.done_in = None;
     }
 
     // ---- saved marks ---------------------------------------------------
@@ -751,7 +809,14 @@ impl App {
     /// Mark `path` as saved. Another scrub of the same file adds its edits to
     /// the count; a new deattributed copy replaces the old one, so its count
     /// replaces the old count.
-    pub fn mark_saved(&mut self, path: &Path, kind: SavedKind, output: PathBuf, edits: usize) {
+    pub fn mark_saved(
+        &mut self,
+        path: &Path,
+        kind: SavedKind,
+        output: PathBuf,
+        edits: usize,
+        verified: Option<Verified>,
+    ) {
         match self.saved.get_mut(path) {
             Some(s) if kind == SavedKind::Scrubbed && s.kind == kind && s.output == output => {
                 s.edits += edits
@@ -763,10 +828,18 @@ impl App {
                         kind,
                         output,
                         edits,
+                        verified,
                     },
                 );
             }
         }
+    }
+
+    /// The verification of the copy at `path`, through the original it was
+    /// made from.
+    pub fn copy_verified(&self, path: &Path) -> Option<&Verified> {
+        let original = self.copy_of(path)?;
+        self.saved.get(original)?.verified.as_ref()
     }
 
     /// The saved mark on `path`, if any.
@@ -838,6 +911,9 @@ impl App {
     /// The work running off the input thread ended, whatever its outcome:
     /// the edit keys work again. A quit asked for while it ran happens now.
     pub fn end_busy(&mut self) {
+        if self.busy.is_some() {
+            self.done_in = Some(self.anim_ms.saturating_sub(self.busy_since));
+        }
         self.busy = None;
         self.activity = None;
         self.stopping = false;
@@ -933,7 +1009,7 @@ impl App {
             }
             status
                 .text
-                .push_str(&format!("; verification incomplete for {first}"));
+                .push_str(&format!("; not verified clean: {first}"));
             if out.unverified.len() > 1 {
                 status
                     .text
@@ -958,7 +1034,13 @@ impl App {
         refused: &[String],
     ) {
         for item in items {
-            self.mark_saved(&item.path, kind, item.output.clone(), item.edits);
+            self.mark_saved(
+                &item.path,
+                kind,
+                item.output.clone(),
+                item.edits,
+                item.verified,
+            );
         }
         self.status = Some(self.saved_status(kind, items, skipped, refused));
     }
@@ -977,7 +1059,7 @@ impl App {
                     text: format!(
                         "Saved nothing; skipped {}: {}.",
                         thousands(skipped.len()),
-                        skipped[0]
+                        skip_summary(skipped)
                     ),
                     tone: Tone::Bad,
                 };
@@ -1012,11 +1094,16 @@ impl App {
         if items.len() > 1 {
             text.push_str(&format!(" +{} more", thousands(items.len() - 1)));
         }
+        if kind == SavedKind::Deattributed
+            && items.iter().all(|i| i.verified.is_some_and(|v| v.ok()))
+        {
+            text.push_str(", verified clean");
+        }
         if !skipped.is_empty() {
             text.push_str(&format!(
                 "; skipped {}: {}",
                 thousands(skipped.len()),
-                skipped[0]
+                skip_summary(skipped)
             ));
         }
         if !refused.is_empty() {
@@ -1093,6 +1180,19 @@ impl App {
 
     // ---- queries -------------------------------------------------------
 
+    /// How many files the scan has delivered.
+    pub fn scanned(&self) -> usize {
+        self.tree.scanned()
+    }
+
+    /// The scanned root's own name.
+    pub fn root_name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string())
+    }
+
     /// Counts for the whole scan, from the tree's root.
     pub fn stats(&self) -> Stats {
         let a = self.tree.root_agg();
@@ -1100,6 +1200,20 @@ impl App {
             flagged: a.flagged,
             removable: a.removable,
             alerts: a.alerts(),
+            warns: a.severity[severity_slot(Severity::Warn)],
+            notices: a.severity[severity_slot(Severity::Notice)],
+        }
+    }
+
+    /// Offer the newest undo group, or say there is none.
+    pub fn offer_undo(&mut self, plan: Result<UndoPlan, String>) {
+        match plan {
+            Ok(plan) if plan.items.is_empty() => self.set_status(MSG_NOTHING_TO_UNDO, Tone::Info),
+            Ok(plan) => {
+                self.overlay = Some(Overlay::ConfirmUndo(plan));
+                self.confirm_drawn = false;
+            }
+            Err(why) => self.set_status(why, Tone::Bad),
         }
     }
 
@@ -1353,7 +1467,7 @@ impl App {
         match &self.overlay {
             Some(Overlay::Help) => return "help",
             Some(Overlay::Filter) => return "filter",
-            Some(Overlay::Confirm(_)) => return "confirm",
+            Some(Overlay::Confirm(_)) | Some(Overlay::ConfirmUndo(_)) => return "confirm",
             None => {}
         }
         match (self.screen, self.pane) {
@@ -1499,6 +1613,25 @@ impl App {
                 }
                 return Effect::None;
             }
+            Some(Overlay::ConfirmUndo(plan)) => {
+                let len = plan.items.len();
+                match key {
+                    Key::Yes if !self.confirm_drawn => {}
+                    Key::Yes => {
+                        self.overlay = None;
+                        return Effect::Undo;
+                    }
+                    Key::No | Key::Esc | Key::Quit => {
+                        self.overlay = None;
+                        self.set_status(MSG_NEVER_MIND, Tone::Info);
+                    }
+                    Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => {
+                        plan.scroll = step(plan.scroll, len, key, self.page.max(1));
+                    }
+                    _ => {}
+                }
+                return Effect::None;
+            }
             Some(Overlay::Filter) | None => {}
         }
 
@@ -1558,7 +1691,7 @@ impl App {
                 self.overlay = Some(Overlay::Filter);
                 Effect::None
             }
-            Key::Undo => Effect::Undo,
+            Key::Undo => Effect::PreviewUndo,
             Key::Open => Effect::Pick,
             Key::Help => {
                 self.overlay = Some(Overlay::Help);
@@ -2670,7 +2803,7 @@ pub fn stopped_status(
         text.push_str(&format!(
             "; skipped {}: {}",
             thousands(skipped.len()),
-            skipped[0]
+            skip_summary(skipped)
         ));
     }
     if !refused.is_empty() {
@@ -2689,6 +2822,47 @@ pub fn stopped_status(
         text,
         tone: Tone::Warn,
     }
+}
+
+/// Skips in a few words: one skip as it is, several grouped by reason, the
+/// most common first, with at most three reasons named.
+pub fn skip_summary(skipped: &[String]) -> String {
+    if skipped.len() <= 1 {
+        return skipped.first().cloned().unwrap_or_default();
+    }
+    let reason = |s: &str| -> String {
+        // Each skip reads "path: reason"; a path may hold a colon itself, so
+        // the reason is what follows the last ": " that leaves a path before
+        // it.
+        match s.rsplit_once(": ") {
+            Some((_, r)) if !r.is_empty() => r.to_string(),
+            _ => s.to_string(),
+        }
+    };
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for s in skipped {
+        let r = reason(s);
+        match groups.iter_mut().find(|(g, _)| *g == r) {
+            Some((_, n)) => *n += 1,
+            None => groups.push((r, 1)),
+        }
+    }
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let shown: Vec<String> = groups
+        .iter()
+        .take(3)
+        .map(|(r, n)| format!("{} {r}", thousands(*n)))
+        .collect();
+    let mut text = shown.join(", ");
+    if groups.len() > 3 {
+        let more = groups.len() - 3;
+        text.push_str(&format!(
+            " +{} more {}",
+            thousands(more),
+            plural(more, "reason", "reasons")
+        ));
+    }
+    text
 }
 
 /// The status after an edit batch. `skipped` and `refused` carry reasons.
@@ -2724,7 +2898,11 @@ pub fn batch_status(kind: PlanKind, ok: usize, skipped: &[String], refused: &[St
         }
     };
     if !skipped.is_empty() {
-        text.push_str(&format!("; skipped {}: {}", skipped.len(), skipped[0]));
+        text.push_str(&format!(
+            "; skipped {}: {}",
+            skipped.len(),
+            skip_summary(skipped)
+        ));
     }
     if !refused.is_empty() {
         text.push_str(&format!("; refused {}", refused.len()));
@@ -2907,7 +3085,7 @@ mod tests {
         let s = app.status.as_ref().unwrap();
         assert_eq!(
             s.text,
-            "Saved nothing; skipped 2: tool.exe: changed since scan."
+            "Saved nothing; skipped 2: 1 already a deattributed copy, 1 changed since scan."
         );
         assert_eq!(s.tone, Tone::Bad);
         assert!(app.busy.is_none());
@@ -3675,6 +3853,7 @@ mod tests {
 
     fn item(path: &str, output: &str, edits: usize) -> SavedItem {
         SavedItem {
+            verified: None,
             path: PathBuf::from(path),
             output: PathBuf::from(output),
             edits,
@@ -3733,13 +3912,14 @@ mod tests {
                 .text
                 .starts_with("Saved tool.exe")
         );
-        app.mark_saved(&tool, SavedKind::Scrubbed, tool.clone(), 1);
+        app.mark_saved(&tool, SavedKind::Scrubbed, tool.clone(), 1, None);
         assert_eq!(app.saved(&tool).unwrap().edits, 3, "a second scrub adds up");
         app.mark_saved(
             &photo,
             SavedKind::Deattributed,
             PathBuf::from("root/photo.deattributed.jpg"),
             1,
+            None,
         );
 
         // The rescan after an edit replaces the report; the mark stays.
@@ -3781,8 +3961,8 @@ mod tests {
         let mut app = sample();
         let tool = PathBuf::from("root/tool.exe");
         let copy = PathBuf::from("root/tool.deattributed.exe");
-        app.mark_saved(&tool, SavedKind::Deattributed, copy.clone(), 3);
-        app.mark_saved(&tool, SavedKind::Deattributed, copy, 2);
+        app.mark_saved(&tool, SavedKind::Deattributed, copy.clone(), 3, None);
+        app.mark_saved(&tool, SavedKind::Deattributed, copy, 2, None);
         assert_eq!(app.saved(&tool).unwrap().edits, 2, "the copy was replaced");
     }
 
@@ -4209,11 +4389,10 @@ mod tests {
         for r in app.reports() {
             s.flagged += usize::from(!r.findings.is_empty());
             s.removable += r.findings.iter().filter(|f| f.is_removable()).count();
-            s.alerts += r
-                .findings
-                .iter()
-                .filter(|f| f.severity == Severity::Alert)
-                .count();
+            let count = |sev: Severity| r.findings.iter().filter(|f| f.severity == sev).count();
+            s.alerts += count(Severity::Alert);
+            s.warns += count(Severity::Warn);
+            s.notices += count(Severity::Notice);
         }
         s
     }

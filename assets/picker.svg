@@ -4,20 +4,13 @@
 <clipPath id="frame"><rect width="960" height="600" rx="12"/></clipPath>
 </defs>
 <g clip-path="url(#frame)">
-<rect width="960" height="600" fill="#16131d"/>
+<rect width="960" height="600" fill="#120a1a"/>
 <g>
-<rect x="99" y="168" width="762" height="17" rx="3" fill="#332952"/>
-<rect x="24" y="567" width="65" height="17" rx="3" fill="#a78bfa"/>
-<rect x="155" y="567" width="65" height="17" rx="3" fill="#a78bfa"/>
-<rect x="285" y="567" width="56" height="17" rx="3" fill="#a78bfa"/>
-<rect x="387" y="567" width="28" height="17" rx="3" fill="#a78bfa"/>
-<rect x="527" y="567" width="27" height="17" rx="3" fill="#a78bfa"/>
-<rect x="638" y="567" width="28" height="17" rx="3" fill="#a78bfa"/>
-<rect x="731" y="567" width="47" height="17" rx="3" fill="#a78bfa"/>
+<rect x="99" y="168" width="762" height="17" rx="3" fill="#2e1d48"/>
 </g>
 <g fill="none">
-<path d="M321.9 138.5 H861.3" stroke="#4a4263" stroke-width="1.2"/>
-<path d="M80.1 43.5 H79.65 A4.15 4.15 0 0 0 75.5 47.65 V533.35 A4.15 4.15 0 0 0 79.65 537.5 H880.35 A4.15 4.15 0 0 0 884.5 533.35 V47.65 A4.15 4.15 0 0 0 880.35 43.5 H80.1 Z" stroke="#4a4263" stroke-width="1.2"/>
+<path d="M321.9 138.5 H861.3" stroke="#41305c" stroke-width="1.2"/>
+<path d="M80.1 43.5 H79.65 A4.15 4.15 0 0 0 75.5 47.65 V533.35 A4.15 4.15 0 0 0 79.65 537.5 H880.35 A4.15 4.15 0 0 0 884.5 533.35 V47.65 A4.15 4.15 0 0 0 880.35 43.5 H80.1 Z" stroke="#41305c" stroke-width="1.2"/>
 </g>
 <g>
 </g>
@@ -25,63 +18,65 @@
 <text x="452.1" y="86.34"><tspan fill="#ff40bf" font-weight="bold">e<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#ff40bf;#ff408d;#ff405c;#ff5640;#ff8840;#ffb940;#ffec40;#e1ff40;#afff40;#7dff40;#4bff40;#40ff66;#40ff98;#40ffca;#40fffc;#40d0ff;#409eff;#406cff;#4540ff;#7740ff;#a940ff;#db40ff;#ff40f1;#ff40bf"/></tspan></text>
 <text x="461.4" y="86.34"><tspan fill="#bf40ff" font-weight="bold">o<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#bf40ff;#f140ff;#ff40db;#ff40a9;#ff4077;#ff4046;#ff6c40;#ff9e40;#ffd040;#fcff40;#cbff40;#99ff40;#67ff40;#40ff4b;#40ff7d;#40ffae;#40ffe0;#40ecff;#40baff;#4088ff;#4056ff;#5b40ff;#8d40ff;#bf40ff"/></tspan></text>
 <text x="470.7" y="86.34"><tspan fill="#4040ff" font-weight="bold">w<animate attributeName="fill" dur="3.5s" repeatCount="indefinite" values="#4040ff;#7240ff;#a340ff;#d540ff;#ff40f7;#ff40c5;#ff4093;#ff4061;#ff5040;#ff8240;#ffb440;#ffe640;#e6ff40;#b4ff40;#82ff40;#51ff40;#40ff61;#40ff93;#40ffc5;#40fff7;#40d6ff;#40a4ff;#4072ff;#4040ff"/></tspan></text>
-<text x="480" y="86.34" fill="#a78bfa" font-weight="bold">n</text>
-<text x="489.3" y="86.34" fill="#b799fb" font-weight="bold">a</text>
-<text x="498.6" y="86.34" fill="#c8a6fd" font-weight="bold">r</text>
-<text x="507.9" y="86.34" fill="#d8b4fe" font-weight="bold">y</text>
-<text x="117.3" y="105.34" textLength="725.4" lengthAdjust="spacing" fill="#9a91b0">Pick a file or folder to scan. Nothing is changed until you confirm an action.</text>
-<text x="108" y="143.34" textLength="120.9" lengthAdjust="spacing" fill="#9a91b0">C:\Users\you\</text>
-<text x="228.9" y="143.34" textLength="83.7" lengthAdjust="spacing" fill="#d8b4fe" font-weight="bold">Downloads</text>
-<text x="108" y="162.34" textLength="37.2" lengthAdjust="spacing" fill="#f5a3d0" font-weight="bold">scan</text>
-<text x="182.4" y="162.34" textLength="148.8" lengthAdjust="spacing" fill="#d8b4fe" font-weight="bold">Scan this folder</text>
-<text x="749.7" y="162.34" textLength="111.6" lengthAdjust="spacing" fill="#6b6577">3,912+ files</text>
-<text x="108" y="181.34" textLength="55.8" lengthAdjust="spacing" fill="#6b6577">folder</text>
-<text x="182.4" y="181.34" textLength="55.8" lengthAdjust="spacing" fill="#a78bfa" font-weight="bold">Games\</text>
-<text x="749.7" y="181.34" textLength="102.3" lengthAdjust="spacing" fill="#9a91b0">1,030 files</text>
-<text x="108" y="200.34" textLength="55.8" lengthAdjust="spacing" fill="#6b6577">folder</text>
-<text x="182.4" y="200.34" textLength="102.3" lengthAdjust="spacing" fill="#a78bfa">Installers\</text>
-<text x="768.3" y="200.34" textLength="83.7" lengthAdjust="spacing" fill="#9a91b0">612 files</text>
-<text x="108" y="219.34" textLength="55.8" lengthAdjust="spacing" fill="#6b6577">folder</text>
-<text x="182.4" y="219.34" textLength="46.5" lengthAdjust="spacing" fill="#a78bfa">Mods\</text>
-<text x="740.4" y="219.34" textLength="111.6" lengthAdjust="spacing" fill="#6b6577">2,264+ files</text>
-<text x="108" y="238.34" textLength="55.8" lengthAdjust="spacing" fill="#6b6577">folder</text>
-<text x="182.4" y="238.34" textLength="55.8" lengthAdjust="spacing" fill="#a78bfa">Music\</text>
-<text x="108" y="257.34" textLength="55.8" lengthAdjust="spacing" fill="#6b6577">folder</text>
-<text x="182.4" y="257.34" textLength="65.1" lengthAdjust="spacing" fill="#a78bfa">Photos\</text>
-<text x="108" y="276.34" textLength="55.8" lengthAdjust="spacing" fill="#6b6577">folder</text>
-<text x="182.4" y="276.34" textLength="46.5" lengthAdjust="spacing" fill="#a78bfa">Work\</text>
-<text x="108" y="295.34" textLength="37.2" lengthAdjust="spacing" fill="#6b6577">file</text>
-<text x="182.4" y="295.34" textLength="120.9" lengthAdjust="spacing" fill="#ece6f7">beach-day.jpg</text>
-<text x="796.2" y="295.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">3.1 MB</text>
-<text x="108" y="314.34" textLength="37.2" lengthAdjust="spacing" fill="#6b6577">file</text>
-<text x="182.4" y="314.34" textLength="130.2" lengthAdjust="spacing" fill="#ece6f7">game-patch.zip</text>
-<text x="796.2" y="314.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">8.4 MB</text>
-<text x="108" y="333.34" textLength="37.2" lengthAdjust="spacing" fill="#6b6577">file</text>
-<text x="182.4" y="333.34" textLength="139.5" lengthAdjust="spacing" fill="#ece6f7">lease-draft.pdf</text>
-<text x="777.6" y="333.34" textLength="74.4" lengthAdjust="spacing" fill="#9a91b0">184.3 KB</text>
-<text x="108" y="352.34" textLength="37.2" lengthAdjust="spacing" fill="#6b6577">file</text>
-<text x="182.4" y="352.34" textLength="83.7" lengthAdjust="spacing" fill="#ece6f7">notes.txt</text>
-<text x="796.2" y="352.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">1.2 KB</text>
-<text x="108" y="371.34" textLength="37.2" lengthAdjust="spacing" fill="#6b6577">file</text>
-<text x="182.4" y="371.34" textLength="186" lengthAdjust="spacing" fill="#ece6f7">setup-tool-2.4.1.exe</text>
-<text x="796.2" y="371.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">2.4 MB</text>
-<text x="108" y="390.34" textLength="37.2" lengthAdjust="spacing" fill="#6b6577">file</text>
-<text x="182.4" y="390.34" textLength="102.3" lengthAdjust="spacing" fill="#6b6577">desktop.ini</text>
-<text x="805.5" y="390.34" textLength="46.5" lengthAdjust="spacing" fill="#9a91b0">282 B</text>
-<text x="33.6" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">up/dn</text>
-<text x="98.7" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">move</text>
-<text x="163.8" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#16131d" font-weight="bold">enter</text>
-<text x="228.9" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">open</text>
-<text x="294" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#16131d" font-weight="bold">left</text>
-<text x="349.8" y="580.34" textLength="18.6" lengthAdjust="spacing" fill="#9a91b0">up</text>
-<text x="396.3" y="580.34" fill="#16131d" font-weight="bold">s</text>
-<text x="424.2" y="580.34" textLength="83.7" lengthAdjust="spacing" fill="#9a91b0">scan here</text>
-<text x="535.8" y="580.34" fill="#16131d" font-weight="bold">/</text>
-<text x="563.7" y="580.34" textLength="55.8" lengthAdjust="spacing" fill="#9a91b0">filter</text>
-<text x="647.4" y="580.34" fill="#16131d" font-weight="bold">?</text>
-<text x="675.3" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">keys</text>
-<text x="740.4" y="580.34" textLength="27.9" lengthAdjust="spacing" fill="#16131d" font-weight="bold">esc</text>
-<text x="786.9" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#9a91b0">quit</text>
+<text x="480" y="86.34" fill="#9d7bff" font-weight="bold">n</text>
+<text x="489.3" y="86.34" fill="#b192ff" font-weight="bold">a</text>
+<text x="498.6" y="86.34" fill="#c4a8ff" font-weight="bold">r</text>
+<text x="507.9" y="86.34" fill="#d8bfff" font-weight="bold">y</text>
+<text x="117.3" y="105.34" textLength="725.4" lengthAdjust="spacing" fill="#ab9fcf">Pick a file or folder to scan. Nothing is changed until you confirm an action.</text>
+<text x="108" y="143.34" textLength="120.9" lengthAdjust="spacing" fill="#ab9fcf">C:\Users\you\</text>
+<text x="228.9" y="143.34" textLength="83.7" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">Downloads</text>
+<text x="108" y="162.34" textLength="37.2" lengthAdjust="spacing" fill="#f79ad3" font-weight="bold">scan</text>
+<text x="182.4" y="162.34" textLength="148.8" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">Scan this folder</text>
+<text x="749.7" y="162.34" textLength="111.6" lengthAdjust="spacing" fill="#7d719c">3,912+ files</text>
+<text x="98.7" y="181.34" fill="#b48cff" font-weight="bold">▎</text>
+<text x="108" y="181.34" textLength="55.8" lengthAdjust="spacing" fill="#7d719c">folder</text>
+<text x="182.4" y="181.34" textLength="55.8" lengthAdjust="spacing" fill="#9d7bff" font-weight="bold">Games/</text>
+<text x="749.7" y="181.34" textLength="102.3" lengthAdjust="spacing" fill="#ab9fcf">1,030 files</text>
+<text x="108" y="200.34" textLength="55.8" lengthAdjust="spacing" fill="#7d719c">folder</text>
+<text x="182.4" y="200.34" textLength="102.3" lengthAdjust="spacing" fill="#9d7bff">Installers/</text>
+<text x="768.3" y="200.34" textLength="83.7" lengthAdjust="spacing" fill="#ab9fcf">612 files</text>
+<text x="108" y="219.34" textLength="55.8" lengthAdjust="spacing" fill="#7d719c">folder</text>
+<text x="182.4" y="219.34" textLength="46.5" lengthAdjust="spacing" fill="#9d7bff">Mods/</text>
+<text x="740.4" y="219.34" textLength="111.6" lengthAdjust="spacing" fill="#7d719c">2,264+ files</text>
+<text x="108" y="238.34" textLength="55.8" lengthAdjust="spacing" fill="#7d719c">folder</text>
+<text x="182.4" y="238.34" textLength="55.8" lengthAdjust="spacing" fill="#9d7bff">Music/</text>
+<text x="108" y="257.34" textLength="55.8" lengthAdjust="spacing" fill="#7d719c">folder</text>
+<text x="182.4" y="257.34" textLength="65.1" lengthAdjust="spacing" fill="#9d7bff">Photos/</text>
+<text x="108" y="276.34" textLength="55.8" lengthAdjust="spacing" fill="#7d719c">folder</text>
+<text x="182.4" y="276.34" textLength="46.5" lengthAdjust="spacing" fill="#9d7bff">Work/</text>
+<text x="108" y="295.34" textLength="37.2" lengthAdjust="spacing" fill="#7d719c">file</text>
+<text x="182.4" y="295.34" textLength="120.9" lengthAdjust="spacing" fill="#ede7fb">beach-day.jpg</text>
+<text x="796.2" y="295.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">3.1 MB</text>
+<text x="108" y="314.34" textLength="37.2" lengthAdjust="spacing" fill="#7d719c">file</text>
+<text x="182.4" y="314.34" textLength="130.2" lengthAdjust="spacing" fill="#ede7fb">game-patch.zip</text>
+<text x="796.2" y="314.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">8.4 MB</text>
+<text x="108" y="333.34" textLength="37.2" lengthAdjust="spacing" fill="#7d719c">file</text>
+<text x="182.4" y="333.34" textLength="139.5" lengthAdjust="spacing" fill="#ede7fb">lease-draft.pdf</text>
+<text x="777.6" y="333.34" textLength="74.4" lengthAdjust="spacing" fill="#ab9fcf">184.3 KB</text>
+<text x="108" y="352.34" textLength="37.2" lengthAdjust="spacing" fill="#7d719c">file</text>
+<text x="182.4" y="352.34" textLength="83.7" lengthAdjust="spacing" fill="#ede7fb">notes.txt</text>
+<text x="796.2" y="352.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">1.2 KB</text>
+<text x="108" y="371.34" textLength="37.2" lengthAdjust="spacing" fill="#7d719c">file</text>
+<text x="182.4" y="371.34" textLength="186" lengthAdjust="spacing" fill="#ede7fb">setup-tool-2.4.1.exe</text>
+<text x="796.2" y="371.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">2.4 MB</text>
+<text x="108" y="390.34" textLength="37.2" lengthAdjust="spacing" fill="#7d719c">file</text>
+<text x="182.4" y="390.34" textLength="102.3" lengthAdjust="spacing" fill="#7d719c">desktop.ini</text>
+<text x="805.5" y="390.34" textLength="46.5" lengthAdjust="spacing" fill="#ab9fcf">282 B</text>
+<text x="24.3" y="580.34" fill="#d8bfff" font-weight="bold">s</text>
+<text x="42.9" y="580.34" textLength="83.7" lengthAdjust="spacing" fill="#ab9fcf">scan here</text>
+<text x="145.2" y="580.34" fill="#41305c">·</text>
+<text x="173.1" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#ab9fcf" font-weight="bold">up/dn</text>
+<text x="228.9" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">move</text>
+<text x="284.7" y="580.34" textLength="46.5" lengthAdjust="spacing" fill="#ab9fcf" font-weight="bold">enter</text>
+<text x="340.5" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">open</text>
+<text x="396.3" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf" font-weight="bold">left</text>
+<text x="442.8" y="580.34" textLength="18.6" lengthAdjust="spacing" fill="#ab9fcf">up</text>
+<text x="480" y="580.34" fill="#ab9fcf" font-weight="bold">/</text>
+<text x="498.6" y="580.34" textLength="55.8" lengthAdjust="spacing" fill="#ab9fcf">filter</text>
+<text x="573" y="580.34" fill="#ab9fcf" font-weight="bold">?</text>
+<text x="591.6" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">keys</text>
+<text x="647.4" y="580.34" textLength="27.9" lengthAdjust="spacing" fill="#d8bfff" font-weight="bold">esc</text>
+<text x="684.6" y="580.34" textLength="37.2" lengthAdjust="spacing" fill="#ab9fcf">quit</text>
 </g>
-<rect x="0.5" y="0.5" width="959" height="599" rx="11.5" fill="none" stroke="#4a4263"/>
+<rect x="0.5" y="0.5" width="959" height="599" rx="11.5" fill="none" stroke="#41305c"/>
 </svg>

@@ -17,7 +17,7 @@
   <a href="#exit-codes">Exit codes</a>
 </p>
 
-<p align="center"><img src="assets/preview.svg" width="960" alt="The meownary interactive view after a scan of 16 files, while a deattribute writes its copies: under the summary, an activity line reads Writing copies 5 of 5 with a thin rainbow progress bar and the archive being rebuilt. Left: the downloads folder, its subfolders first, each with a severity dot, its file count and a finding count, then its files with their detected type. Right: the five findings of the highlighted executable, each with severity, title, confidence and signature id, removable ones tagged and one picked. Under them a peek box for the highlighted finding: kind tamper: appended data, action cut the file at 0x9c400, verdict warn, truncating may remove an appended code signature. Footer: key hints including d scrub and a deattribute, and 1 selected."></p>
+<p align="center"><img src="assets/preview.svg" width="960" alt="The meownary interactive view after a scan of 16 files, while a deattribute writes its copies. Header: the wordmark and the folder name, with 12 removable, 1 alert, 1 warn and 11 notice at the right, then an activity line reading Writing copies 5 of 5 with a thin rainbow progress bar and the archive being rebuilt. Left: the downloads folder, its subfolders first behind a folder glyph with their file counts, a blank row, then its files with a severity dot, their detected type and a finding count. Right: the five findings of the highlighted executable under warn, notice and info headers, one line each with the title, the signature id and a star on the removable ones, one picked. Under them a peek for the highlighted finding: warn, moderate confidence, pe.overlay, kind tamper: appended data, action cut the file at 0x9c400, verdict warn, truncating may remove an appended code signature. Footer: space select, then enter detail, tab files, ? keys, and 1 selected."></p>
 
 ## What it does
 
@@ -723,21 +723,37 @@ a time; `meownary` alone opens a picker first.
   every user's home, or a drive, with the count so far.
 - **Reopen**: `o` brings the picker back over the view, at the folder you are
   in; `esc` returns to the view unchanged.
-- **Folders**: the files pane shows one folder: its subfolders first, then its
-  files. Rows stay put while the scan fills them in; a folder being scanned
-  shows its own progress bar, then its file count and findings. `enter` or
-  `right` opens a folder, `left` or `backspace` goes up, and the highlighted
-  folder's summary fills the findings pane. `space` picks a folder, and `d`
-  or `a` on a folder covers every file under it; delete works on files only.
+- **Header**: the wordmark and the scanned folder, with the removable count
+  and the alert, warn and notice counts at the right; under them the work
+  that is running, the latest message, the scan's progress, or its summary.
+- **Folders**: the files pane shows one folder: its subfolders first behind a
+  `▸`, then its files behind a severity dot. Rows stay put while the scan
+  fills them in; a folder being scanned shows its own progress bar, then its
+  file count and findings. `enter` or `right` opens a folder, `left` or
+  `backspace` goes up, and the highlighted folder's summary fills the
+  findings pane. `space` picks a folder, and `d` or `a` on a folder covers
+  every file under it; delete works on files only.
+- **Findings**: grouped under a header per severity, worst first, one line
+  each: the title, the signature id when both fit, and a `*` on a finding
+  with a removable marker, as `scan` prints it; weak findings are dim. The
+  peek under the list names the highlighted finding's severity, confidence
+  and id, what it is, what `d` would do, and the verdict. `+` marks a pick.
 - **Progress**: scans, plans, copies, scrubs, deletes and undo run in the
   background with a thin progress bar on the header, naming the file being
   worked on. The bar flows in the wordmark's rainbow, and a sheen in the same
   colors runs over the file in progress, or over the whole bar until there is
   something to count. `esc` stops after the current file; undo runs to the
-  end.
+  end. The status line that follows says how long the work took.
+- **Verdicts**: a deattributed copy that did not verify clean carries an
+  `unverified` chip, and the peek names the section that still holds
+  attribution. Skipped files are summed up by reason, and a partly read file
+  says why. A status line opens with `✓` or `✗` when its outcome matters.
 - **Saved marks**: a file you scrub gets a `scrubbed` chip in the list. After
   deattribute, the original gets a `deattributed` chip and its copy a `copy`
-  chip. The status line names what was saved.
+  chip; a chip shrinks to `✓` when the name needs the room. The status line
+  names what was saved.
+- **Footer**: the keys that act come first, then after a dot the keys that
+  move or show; `?` opens the full key sheet.
 
 | | `d` scrub | `a` deattribute, `A` deep | `D` or `x` delete |
 |---|---|---|---|
@@ -753,8 +769,9 @@ a time; `meownary` alone opens a picker first.
 - **Force**: for scrub and delete the confirm stands in for `--force`;
   deattribute never forces.
 - **Deep**: `A` deattributes like `a`, in deep mode, the way `--deep` does.
-- **Undo**: `u` reverts the newest scrub or delete group, a `clean` run
-  included.
+- **Undo**: `u` lists the newest scrub or delete group, a `clean` run
+  included, with each file, what undo does to it and when the edit was made;
+  `y` reverts it.
 - **Editor**: `e` opens the highlighted file in `$VISUAL` or `$EDITOR`, else
   `notepad` on Windows and `vi` elsewhere. A change is journaled like a scrub.
 - **Browse**: `enter` opens a finding's detail with the bytes around it, `b`
@@ -765,7 +782,7 @@ a time; `meownary` alone opens a picker first.
 <details>
 <summary>Key reference</summary>
 
-<p align="center"><img src="assets/keys.svg" width="960" alt="The meownary key reference, the ? sheet, drawn over the dimmed interactive view. Move: up/dn or j/k move, pgup/pgdn page, home/end or g/G top or bottom, enter or right/l open, left/h or backspace up a folder, tab switch pane, esc back. Act: space select, d scrub markers, a deattribute, A deep deattribute, D or x delete file, e open in editor, u undo last. View: o open file or folder, b buckets, / filter, ? keys, q or ctrl+c quit. Prompts: y confirm, n or esc cancel or clear, enter keep the filter, backspace erase. Press any key to close."></p>
+<p align="center"><img src="assets/keys.svg" width="960" alt="The meownary key reference, the ? sheet, drawn over the dimmed interactive view with its grouped findings. Move: up/dn or j/k move, pgup/pgdn page, home/end or g/G top or bottom, enter or right/l open, left/h or backspace up a folder, tab switch pane, esc back. Act: space select, d scrub markers, a deattribute, A deep deattribute, D or x delete file, e open in editor, u undo last. View: o open file or folder, b buckets, / filter, ? keys, q or ctrl+c quit. Prompts: y confirm, n or esc cancel or clear, enter keep the filter, backspace erase. Press any key to close."></p>
 
 </details>
 

@@ -3,7 +3,7 @@
 //! README previews (see `preview`) run exactly the same code.
 //!
 //! The renderer writes a few facts back into the app (pane height for paging,
-//! scroll offsets, whether the layout is narrow, where the rainbow letters
+//! scroll offsets, whether the layout is narrow, where the wordmark letters
 //! landed); the state machine reads them on the next key.
 
 #![cfg(feature = "tui")]
@@ -67,7 +67,7 @@ pub fn draw_into(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
         return;
     }
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(2),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -91,6 +91,12 @@ pub fn draw_into(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
             backdrop(buf, area, look);
             app.rainbow_cells.clear();
             draw_confirm(buf, body, app, look);
+            app.confirm_drawn = true;
+        }
+        Some(Overlay::ConfirmUndo(_)) => {
+            backdrop(buf, area, look);
+            app.rainbow_cells.clear();
+            draw_confirm_undo(buf, body, app, look);
             app.confirm_drawn = true;
         }
         Some(Overlay::Filter) | None => {}
@@ -269,19 +275,31 @@ pub(crate) fn sev_chip(s: Severity, look: &Look) -> Span<'static> {
     Span::styled(format!(" {:<6}  ", severity_name(s)), look.severity_chip(s))
 }
 
-/// The key-chip and label pair used by the footer, the help and modals.
-/// The chip is padded to `key_w`, so a stacked column of chips forms one even
-/// block and the labels line up; callers that pass the key's own length get a
-/// chip that hugs the key.
+/// The key and label pair used by the footer, the help and modals: the key
+/// bright and bold, the label dim. The key is padded to `key_w`, so a
+/// stacked column of keys lines its labels up; callers that pass the key's
+/// own length get a key that hugs its label.
 pub(crate) fn hint_spans(key: &str, label: &str, key_w: usize, look: &Look) -> Vec<Span<'static>> {
+    hint_spans_with(key, label, key_w, look.key(), look)
+}
+
+/// [`hint_spans`] with the key in `key_style`.
+pub(crate) fn hint_spans_with(
+    key: &str,
+    label: &str,
+    key_w: usize,
+    key_style: Style,
+    look: &Look,
+) -> Vec<Span<'static>> {
     vec![
-        Span::styled(format!(" {key:<key_w$} "), look.key_chip()),
+        Span::styled(format!("{key:<key_w$}"), key_style),
         Span::styled(format!(" {label}"), look.dim()),
     ]
 }
 
 /// "meownary": "meow" in the rainbow, "nary" in the pastel gradient. Records
-/// the rainbow cells when the wordmark starts at `(x, y)` and fits `max_w`.
+/// the rainbow cells when the wordmark starts at `(x, y)` and fits `max_w`,
+/// so the SVG preview can animate them.
 pub(crate) fn wordmark(
     app: &mut App,
     look: &Look,
@@ -305,6 +323,24 @@ pub(crate) fn wordmark(
     spans
 }
 
+/// Mark the cursor row with a thin bar in its first column, when that
+/// column is free (a pick mark keeps its place).
+pub(crate) fn cursor_mark(buf: &mut Buffer, rect: Rect, focused: bool, look: &Look) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    if let Some(cell) = buf.cell_mut((rect.x, rect.y))
+        && cell.symbol() == " "
+    {
+        let style = look.cursor_mark(focused);
+        cell.set_symbol("▎");
+        if let Some(fg) = style.fg {
+            cell.fg = fg;
+        }
+        cell.modifier.insert(style.add_modifier);
+    }
+}
+
 // ---- header -------------------------------------------------------------
 
 fn draw_header(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
@@ -315,30 +351,91 @@ fn draw_header(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
     let w = area.right() - x;
     let line0 = Rect::new(x, area.y, w, 1);
 
-    // Row 0: the wordmark, the tagline, and an alert count on the right.
-    let spans = wordmark(app, look, x, area.y, w);
-    let stats = app.stats();
-    let mut right: Vec<Span> = Vec::new();
-    if stats.alerts > 0 {
-        right.push(Span::styled(
-            format!(
-                " {} {} ",
-                app::thousands(stats.alerts),
-                app::plural(stats.alerts, "alert", "alerts")
-            ),
-            look.chip(Tone::Bad),
-        ));
-        right.push(Span::raw(" "));
+    // Row 0: the wordmark and the scanned folder, and the counts on the
+    // right. Row 1: what is running, the latest message, or the scan.
+    let mut left = wordmark(app, look, x, area.y, w);
+    let root = app.root_name();
+    if !root.is_empty() {
+        let room = (w as usize).saturating_sub(width_of(&left) + 3);
+        if room >= 4 {
+            left.push(Span::styled(" · ", look.rule()));
+            left.push(Span::styled(truncate_left(&root, room), look.dim()));
+        }
     }
-    put(buf, line0, &Line::from(spans));
-    if !right.is_empty() {
-        put(buf, line0, &Line::from(right).right_aligned());
+    let room = (w as usize).saturating_sub(width_of(&left) + 3);
+    let strip = stat_strip(app, look, room);
+    put(buf, line0, &Line::from(left));
+    if !strip.is_empty() {
+        put(buf, line0, &Line::from(strip).right_aligned());
     }
+    if area.height > 1 {
+        views::status::draw_status_row(buf, row(line0, 1), app, look);
+    }
+}
 
-    // Row 1: scan progress or the summary. Row 2: what is running, the
-    // latest message, or a gentle pointer at the keys.
-    views::files::draw_scan_row(buf, row(line0, 1), app, look);
-    views::status::draw_status_row(buf, row(line0, 2), app, look);
+/// The counts for the header's right side: what can be removed, then a
+/// rule and the alert, warn and notice counts, each in its color. Zero
+/// counts are left out. When the row is short of `room` the pieces leave
+/// notice first, then warn, then alert; the removable count goes last.
+fn stat_strip(app: &App, look: &Look, room: usize) -> Vec<Span<'static>> {
+    let s = app.stats();
+    let mut parts: Vec<(&str, Vec<Span<'static>>)> = Vec::new();
+    if s.removable > 0 {
+        parts.push((
+            "removable",
+            vec![
+                Span::styled(app::thousands(s.removable), look.pink()),
+                Span::styled(" removable", look.dim()),
+            ],
+        ));
+    }
+    for (count, severity, name) in [
+        (s.alerts, Severity::Alert, "alert"),
+        (s.warns, Severity::Warn, "warn"),
+        (s.notices, Severity::Notice, "notice"),
+    ] {
+        if count > 0 {
+            parts.push((
+                name,
+                vec![
+                    Span::styled(
+                        app::thousands(count),
+                        look.severity(severity).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {name}"), look.dim()),
+                ],
+            ));
+        }
+    }
+    const DROP: [&str; 4] = ["notice", "warn", "alert", "removable"];
+    let compose = |parts: &[(&str, Vec<Span<'static>>)]| {
+        let mut out: Vec<Span<'static>> = Vec::new();
+        for (k, (name, spans)) in parts.iter().enumerate() {
+            if k > 0 {
+                let first_severity = *name != "removable" && parts[k - 1].0 == "removable";
+                out.push(Span::styled(
+                    if first_severity { " │ " } else { "  " },
+                    look.rule(),
+                ));
+            }
+            out.extend(spans.iter().cloned());
+        }
+        if !out.is_empty() {
+            out.push(Span::raw(" "));
+        }
+        out
+    };
+    let mut drop = DROP.iter();
+    loop {
+        let out = compose(&parts);
+        if width_of(&out) <= room {
+            return out;
+        }
+        let Some(next) = drop.next() else {
+            return Vec::new();
+        };
+        parts.retain(|(k, _)| k != next);
+    }
 }
 
 // ---- detail ---------------------------------------------------------------
@@ -395,26 +492,20 @@ pub fn detail_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> 
         spans.extend(value);
         Line::from(spans)
     };
+    let section = |name: &str| {
+        Line::from(vec![
+            Span::styled(name.to_string(), look.bright()),
+            Span::raw(" "),
+            Span::styled(
+                "─".repeat(width.saturating_sub(name.len() + 1)),
+                look.rule(),
+            ),
+        ])
+    };
     let text = |s: String| Span::styled(s, look.text());
 
-    out.push(field("file", {
-        let mut v = vec![text(truncate_left(
-            &app.display_path(&r.path),
-            width.saturating_sub(32),
-        ))];
-        v.push(Span::styled(
-            format!(
-                "  {}, {}",
-                r.format.as_deref().unwrap_or("unknown format"),
-                human_size(r.size)
-            ),
-            look.dim(),
-        ));
-        v
-    }));
-    if let Some(value) = views::files::saved_field(app, &r.path, width.saturating_sub(11), look) {
-        out.push(field("saved", value));
-    }
+    // What it is.
+    out.push(section("finding"));
     out.push(field("kind", vec![text(category_text(&f.category))]));
     let mut rating = vec![
         sev_chip(f.severity, look),
@@ -445,6 +536,28 @@ pub fn detail_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> 
             width.saturating_sub(11),
         ))],
     ));
+    out.push(Line::from(""));
+
+    // Where it is, and what scrubbing it would do.
+    out.push(section("file"));
+    out.push(field("file", {
+        let mut v = vec![text(truncate_left(
+            &app.display_path(&r.path),
+            width.saturating_sub(32),
+        ))];
+        v.push(Span::styled(
+            format!(
+                "  {}, {}",
+                r.format.as_deref().unwrap_or("unknown format"),
+                human_size(r.size)
+            ),
+            look.dim(),
+        ));
+        v
+    }));
+    if let Some(value) = views::files::saved_field(app, &r.path, width.saturating_sub(11), look) {
+        out.push(field("saved", value));
+    }
     out.push(field(
         "offset",
         vec![text(format!(
@@ -465,7 +578,7 @@ pub fn detail_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> 
                 ],
             ));
             let risk = edit::assess(r.format.as_deref(), r.size, m);
-            out.push(field("verdict", verdict_spans(&risk, look)));
+            out.push(field("verdict", verdict_spans(&risk, m.reversible, look)));
         }
         None => out.push(field(
             "marker",
@@ -474,9 +587,11 @@ pub fn detail_lines(app: &App, look: &Look, width: usize) -> Vec<Line<'static>> 
     }
     out.push(Line::from(""));
 
+    // The bytes around the evidence.
+    out.push(section("bytes"));
     let base = app::hex_base(f.evidence.offset);
     out.push(Line::from(vec![
-        Span::styled("bytes ", look.label()),
+        Span::styled("window ", look.label()),
         Span::styled(
             format!("0x{:x}..0x{:x}", base, base + app::HEX_WINDOW),
             look.dim(),
@@ -573,11 +688,20 @@ pub fn hex_lines(bytes: &[u8], base: u64, f: &Finding, look: &Look) -> Vec<Line<
     out
 }
 
-pub(crate) fn verdict_spans(risk: &Risk, look: &Look) -> Vec<Span<'static>> {
+/// The verdict chip and its note. `reversible` is the marker's own word on
+/// whether undo restores the file exactly.
+pub(crate) fn verdict_spans(risk: &Risk, reversible: bool, look: &Look) -> Vec<Span<'static>> {
     match risk {
-        Risk::Safe => vec![
+        Risk::Safe if reversible => vec![
             Span::styled(" safe ", look.chip(Tone::Good)),
             Span::styled("  reversible: press u to undo", look.dim()),
+        ],
+        Risk::Safe => vec![
+            Span::styled(" safe ", look.chip(Tone::Good)),
+            Span::styled(
+                "  one-way: undo brings back the trashed original",
+                look.tone(Tone::Warn),
+            ),
         ],
         Risk::Warn(r) => vec![
             Span::styled(" warn ", look.chip(Tone::Warn)),
@@ -681,7 +805,8 @@ fn draw_buckets(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
             break;
         };
         let rect = row(inner, 1 + k as u16);
-        if pos == app.bucket_cursor {
+        let on = pos == app.bucket_cursor;
+        if on {
             buf.set_style(rect, look.cursor_row(true));
         }
         let mut name = b.label.clone();
@@ -714,6 +839,9 @@ fn draw_buckets(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
             Span::styled(format!("{:>6} ", app::thousands(b.files)), look.text()),
         ]);
         put(buf, rect, &line);
+        if on {
+            cursor_mark(buf, rect, true, look);
+        }
     }
 }
 
@@ -760,9 +888,11 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
     let budget = (area.width as usize).saturating_sub(width_of(&right) + 1);
 
     // The way to the key reference (on the picker, the way out) always
-    // stays; the rest fill what is left.
-    let piece = |h: &Hint| {
-        let mut p = hint_spans(h.key, h.label, h.key.len(), look);
+    // stays. The keys that act come first, bright; the keys that move or
+    // show follow a dot, quieter.
+    let piece = |h: &Hint, strong: bool| {
+        let style = if strong { look.key() } else { look.key_dim() };
+        let mut p = hint_spans_with(h.key, h.label, h.key.len(), style, look);
         p.push(Span::raw("  "));
         p
     };
@@ -771,19 +901,46 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
         .iter()
         .position(|h| h.key == keep)
         .map(|i| hints.remove(i));
-    let reserve = help.as_ref().map(|h| width_of(&piece(h))).unwrap_or(0);
+    // On one pane at a time the way to the other pane leads, whatever else
+    // fits.
+    let first = app
+        .narrow
+        .then(|| hints.iter().position(|h| h.key == "tab"))
+        .flatten()
+        .map(|i| hints.remove(i));
+    let (actions, moves): (Vec<Hint>, Vec<Hint>) = hints.into_iter().partition(keymap::is_action);
+    let reserve = help
+        .as_ref()
+        .map(|h| width_of(&piece(h, true)))
+        .unwrap_or(0);
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    for hint in &hints {
-        let p = piece(hint);
+    let mut shown = 0;
+    for hint in first.iter().chain(&actions) {
+        let p = piece(hint, true);
         if width_of(&spans) + width_of(&p) + reserve > budget {
             break;
+        }
+        spans.extend(p);
+        shown += 1;
+    }
+    let mut parted = shown == 0;
+    for hint in &moves {
+        let p = piece(hint, false);
+        let sep = if parted { 0 } else { 3 };
+        if width_of(&spans) + sep + width_of(&p) + reserve > budget {
+            break;
+        }
+        if !parted {
+            spans.push(Span::styled("·", look.rule()));
+            spans.push(Span::raw("  "));
+            parted = true;
         }
         spans.extend(p);
     }
     if let Some(h) = &help
         && width_of(&spans) + reserve <= budget
     {
-        spans.extend(piece(h));
+        spans.extend(piece(h, true));
     }
     put(buf, area, &Line::from(spans));
     if !right.is_empty() {
@@ -796,24 +953,22 @@ fn draw_filter_bar(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
         app::Filter::Text(t) => t.clone(),
         _ => String::new(),
     };
-    let right = vec![
-        Span::styled(
-            format!(
-                "{} of {} files  ",
-                app::thousands(if app.filter.is_active() {
-                    app.rows().len()
-                } else {
-                    app.cwd_files()
-                }),
-                app::thousands(app.cwd_files())
-            ),
-            look.dim(),
+    let mut right = vec![Span::styled(
+        format!(
+            "{} of {} files   ",
+            app::thousands(if app.filter.is_active() {
+                app.rows().len()
+            } else {
+                app.cwd_files()
+            }),
+            app::thousands(app.cwd_files())
         ),
-        Span::styled(" enter ", look.key_chip()),
-        Span::styled(" keep  ", look.dim()),
-        Span::styled(" esc ", look.key_chip()),
-        Span::styled(" clear ", look.dim()),
-    ];
+        look.dim(),
+    )];
+    right.extend(hint_spans("enter", "keep", 5, look));
+    right.push(Span::raw("  "));
+    right.extend(hint_spans("esc", "clear", 3, look));
+    right.push(Span::raw(" "));
     let room = (area.width as usize).saturating_sub(width_of(&right) + 8);
     let line = Line::from(vec![
         Span::raw(" "),
@@ -869,7 +1024,7 @@ fn draw_help(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
         .iter()
         .map(|(title, hints)| Group { title, hints })
         .collect();
-    const GAP: usize = 3;
+    const GAP: usize = 4;
     const PAD: u16 = 2;
 
     let mut chosen = None;
@@ -883,7 +1038,7 @@ fn draw_help(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
                 (kw, lw)
             })
             .collect();
-        let total: usize = widths.iter().map(|(k, l)| k + 2 + 2 + l).sum::<usize>()
+        let total: usize = widths.iter().map(|(k, l)| k + 1 + l).sum::<usize>()
             + GAP * cols.len().saturating_sub(1);
         let outer = total + 2 * PAD as usize + 2;
         if outer <= area.width as usize || n == 1 {
@@ -956,7 +1111,7 @@ fn draw_help(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
     let mut x = inner.x;
     for (c, col) in cols.iter().enumerate() {
         let (kw, lw) = widths[c];
-        let cw = kw + 2 + 2 + lw;
+        let cw = kw + 1 + lw;
         let mut y = top;
         for (k, &g) in col.iter().enumerate() {
             if k > 0 {
@@ -1264,6 +1419,110 @@ fn draw_confirm(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
     start = start.min(total.saturating_sub(list_h));
     let mut y = inner.y + 1;
     for line in plan_lines(app, plan, &starts, (start, list_h), inner_w, look) {
+        put(buf, Rect::new(inner.x, y, inner.width, 1), &line);
+        y += 1;
+    }
+    y += 1;
+    for line in &notes {
+        if y >= inner.bottom() {
+            break;
+        }
+        put(buf, Rect::new(inner.x, y, inner.width, 1), line);
+        y += 1;
+    }
+    if y < inner.bottom() {
+        let mut spans = hint_spans("y", "confirm", 1, look);
+        spans.push(Span::raw("   "));
+        spans.extend(hint_spans("n", "cancel", 1, look));
+        if total > list_h {
+            spans.push(Span::raw("   "));
+            spans.extend(hint_spans("up/down", "scroll", 7, look));
+        }
+        put(
+            buf,
+            Rect::new(inner.x, y, inner.width, 1),
+            &Line::from(spans),
+        );
+    }
+}
+
+// ---- undo preview -----------------------------------------------------------
+
+/// The confirm for an undo: what the newest group changed, one line per
+/// journal record, so `u` never reverts something unseen.
+fn draw_confirm_undo(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
+    let Some(Overlay::ConfirmUndo(plan)) = &app.overlay else {
+        return;
+    };
+    let w = area.width.saturating_sub(4).clamp(30, 88);
+    let inner_w = w.saturating_sub(4) as usize;
+    let notes = [
+        Line::from(Span::styled(
+            "Each file goes back to how it was before this group.",
+            look.faint(),
+        )),
+        Line::from(Span::styled(
+            "A file changed since the edit is left as it is.",
+            look.faint(),
+        )),
+    ];
+    let chrome = 2 + 1 + 1 + notes.len() + 1 + 1;
+    let max_h = area.height.saturating_sub(1) as usize;
+    let total = plan.items.len();
+    let list_h = total.min(max_h.saturating_sub(chrome)).max(1);
+    let h = (list_h + chrome).min(area.height as usize) as u16;
+    let rect = centered(area, w, h);
+
+    Clear.render(rect, buf);
+    buf.set_style(rect, look.base());
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(look.border(true))
+        .title_top(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!(" {} ", plan.title()), look.chip(Tone::Warn)),
+            Span::raw(" "),
+        ]));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+
+    let start = plan.scroll.min(total.saturating_sub(list_h));
+    let widest = |f: fn(&app::UndoItem) -> &str, cap: usize| {
+        plan.items
+            .iter()
+            .map(|i| f(i).width())
+            .max()
+            .unwrap_or(0)
+            .min(cap)
+    };
+    let label_w = widest(|i| &i.label, 24);
+    let action_w = widest(|i| &i.action, 32);
+    let age_w = widest(|i| &i.age, 12);
+    let mut y = inner.y + 1;
+    for item in plan.items.iter().skip(start).take(list_h) {
+        let fixed = 1 + label_w + 2 + 2 + action_w + 2 + age_w;
+        let path_w = inner_w.saturating_sub(fixed).max(8);
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(pad(&item.label, label_w), look.accent()),
+            Span::raw("  "),
+            Span::styled(
+                pad(
+                    &truncate_left(&app.display_path(&item.path), path_w),
+                    path_w,
+                ),
+                look.strong(),
+            ),
+            Span::raw("  "),
+            Span::styled(pad(&item.action, action_w), look.dim()),
+            Span::raw("  "),
+            Span::styled(truncate(&item.age, age_w), look.faint()),
+        ]);
         put(buf, Rect::new(inner.x, y, inner.width, 1), &line);
         y += 1;
     }

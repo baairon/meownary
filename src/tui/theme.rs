@@ -1,4 +1,4 @@
-//! The pastel-violet palette, shared across every view, plus the rainbow math
+//! The deep-violet palette, shared across every view, plus the rainbow math
 //! behind the animated wordmark and the progress bars.
 //!
 //! Colors live in a [`Palette`] so the whole view can drop to the terminal's
@@ -13,62 +13,56 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::model::{Confidence, Severity};
 
-pub const ACCENT: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
-pub const TEXT: Color = Color::Rgb(0xec, 0xe6, 0xf7);
-pub const ALT: Color = Color::Rgb(0xb9, 0xa7, 0xe6);
-pub const GOOD: Color = Color::Rgb(0x7e, 0xe0, 0xa1);
-pub const WARN: Color = Color::Rgb(0xf6, 0xc5, 0x60);
-pub const BAD: Color = Color::Rgb(0xff, 0x6b, 0x8b);
-pub const BRIGHT: Color = Color::Rgb(0xd8, 0xb4, 0xfe);
-pub const RULE: Color = Color::Rgb(0x6b, 0x65, 0x77);
-/// The view's own background, painted under everything.
-pub const BG: Color = Color::Rgb(0x16, 0x13, 0x1d);
-/// Soft violet tint for the cursor row in a focused pane.
-pub const TINT: Color = Color::Rgb(0x33, 0x29, 0x52);
-/// A fainter tint for the cursor row in an unfocused pane.
-pub const TINT_DIM: Color = Color::Rgb(0x24, 0x1f, 0x33);
-/// Calm blue for informational facts.
-pub const INFO: Color = Color::Rgb(0x8f, 0xbc, 0xff);
-/// Rose pink, the second accent (selection marks, the logo blush).
-pub const PINK: Color = Color::Rgb(0xf5, 0xa3, 0xd0);
-/// Vivid violet for whatever has focus: the active pane's border and title.
-pub const FOCUS: Color = Color::Rgb(0xc0, 0x84, 0xfc);
-/// Muted violet for unfocused borders.
-pub const BORDER: Color = Color::Rgb(0x4a, 0x42, 0x63);
+/// The view's own background, painted under everything: a deep violet,
+/// warmer than blue-black and well short of plum.
+pub const BG: Color = Color::Rgb(0x12, 0x0a, 0x1a);
+/// Primary text.
+pub const TEXT: Color = Color::Rgb(0xed, 0xe7, 0xfb);
 /// Secondary text: readable, clearly below the primary text.
-pub const DIM: Color = Color::Rgb(0x9a, 0x91, 0xb0);
-
-/// Color for a severity (drives the row accent).
-pub fn severity_color(s: Severity) -> Color {
-    match s {
-        Severity::Info => INFO,
-        Severity::Notice => ALT,
-        Severity::Warn => WARN,
-        Severity::Alert => BAD,
-    }
-}
-
-/// Color for a confidence badge.
-pub fn confidence_color(c: Confidence) -> Color {
-    match c {
-        Confidence::Strong => GOOD,
-        Confidence::Moderate => WARN,
-        Confidence::Weak => RULE,
-    }
-}
-
-/// Two-stop gradient for the wordmark.
-pub const ACCENT_RAMP: [Color; 2] = [ACCENT, BRIGHT];
+pub const DIM: Color = Color::Rgb(0xab, 0x9f, 0xcf);
+/// Faint text: tips, zero bytes, weak findings.
+pub const RULE: Color = Color::Rgb(0x7d, 0x71, 0x9c);
+/// Unfocused borders, rules and the empty track of a progress bar.
+pub const BORDER: Color = Color::Rgb(0x41, 0x30, 0x5c);
+/// Vivid violet for whatever has focus: the active pane's border and title.
+pub const FOCUS: Color = Color::Rgb(0xb4, 0x8c, 0xff);
+/// The violet accent: signature ids, keys, folder names.
+pub const ACCENT: Color = Color::Rgb(0x9d, 0x7b, 0xff);
+/// Lavender highlight: group titles, the notice severity.
+pub const BRIGHT: Color = Color::Rgb(0xd8, 0xbf, 0xff);
+/// Rose pink, the second accent: selection marks, removable tags, the hex
+/// marker.
+pub const PINK: Color = Color::Rgb(0xf7, 0x9a, 0xd3);
+/// The cursor row in a focused pane.
+pub const TINT: Color = Color::Rgb(0x2e, 0x1d, 0x48);
+/// The cursor row in an unfocused pane.
+pub const TINT_DIM: Color = Color::Rgb(0x1f, 0x14, 0x31);
+pub const GOOD: Color = Color::Rgb(0x6e, 0xe7, 0xa8);
+pub const WARN: Color = Color::Rgb(0xf7, 0xc3, 0x5f);
+pub const BAD: Color = Color::Rgb(0xff, 0x5c, 0x7c);
+/// Calm blue for informational facts.
+pub const INFO: Color = Color::Rgb(0x7f, 0xb8, 0xff);
+/// Soft chip backgrounds: a filled chip that stays quiet.
+pub const CHIP_INFO_BG: Color = Color::Rgb(0x17, 0x25, 0x40);
+pub const CHIP_NOTICE_BG: Color = Color::Rgb(0x2f, 0x21, 0x54);
+pub const CHIP_GOOD_BG: Color = Color::Rgb(0x16, 0x31, 0x25);
+pub const CHIP_WARN_BG: Color = Color::Rgb(0x3a, 0x2d, 0x14);
 
 /// Interpolate between two RGB colors (t in 0..=1). Non-RGB inputs return `a`.
 pub fn lerp(a: Color, b: Color, t: f32) -> Color {
     if let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a, b) {
+        let t = t.clamp(0.0, 1.0);
         let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
         Color::Rgb(m(ar, br), m(ag, bg), m(ab, bb))
     } else {
         a
     }
 }
+
+// ---- the wordmark and the bars ---------------------------------------------
+
+/// Two-stop gradient for the wordmark.
+pub const ACCENT_RAMP: [Color; 2] = [ACCENT, BRIGHT];
 
 /// One full trip around the color wheel for the wordmark, in milliseconds.
 pub const RAINBOW_CYCLE_MS: u64 = 3500;
@@ -180,10 +174,14 @@ pub struct Palette {
     pub warn: Color,
     pub bad: Color,
     pub info: Color,
+    pub chip_info: Color,
+    pub chip_notice: Color,
+    pub chip_good: Color,
+    pub chip_warn: Color,
 }
 
 impl Palette {
-    /// The pastel-violet identity with vivid accents.
+    /// The deep-violet identity with vivid accents.
     pub const fn vivid() -> Self {
         Self {
             bg: BG,
@@ -201,6 +199,10 @@ impl Palette {
             warn: WARN,
             bad: BAD,
             info: INFO,
+            chip_info: CHIP_INFO_BG,
+            chip_notice: CHIP_NOTICE_BG,
+            chip_good: CHIP_GOOD_BG,
+            chip_warn: CHIP_WARN_BG,
         }
     }
 
@@ -223,6 +225,10 @@ impl Palette {
             warn: r,
             bad: r,
             info: r,
+            chip_info: r,
+            chip_notice: r,
+            chip_good: r,
+            chip_warn: r,
         }
     }
 }
@@ -347,6 +353,17 @@ impl Look {
         }
     }
 
+    /// The mark a status line leads with when its outcome matters: a check
+    /// for a good one, a cross for a failure. Plain messages and warnings
+    /// carry only their color.
+    pub fn tone_glyph(&self, t: Tone) -> &'static str {
+        match t {
+            Tone::Info | Tone::Warn => "",
+            Tone::Good => "✓ ",
+            Tone::Bad => "✗ ",
+        }
+    }
+
     /// Pane border: pops in the vivid focus violet when focused.
     pub fn border(&self, focused: bool) -> Style {
         match (self.mono, focused) {
@@ -357,15 +374,12 @@ impl Look {
         }
     }
 
-    /// Pane title: a filled chip when focused, dim text otherwise.
+    /// Pane title: bold in the focus violet when focused, dim otherwise.
     pub fn title(&self, focused: bool) -> Style {
         match (self.mono, focused) {
-            (true, true) => Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            (true, true) => Style::new().add_modifier(Modifier::BOLD),
             (true, false) => Style::new().add_modifier(Modifier::DIM),
-            (false, true) => Style::new()
-                .fg(self.p.bg)
-                .bg(self.p.focus)
-                .add_modifier(Modifier::BOLD),
+            (false, true) => Style::new().fg(self.p.focus).add_modifier(Modifier::BOLD),
             (false, false) => Style::new().fg(self.p.dim),
         }
     }
@@ -377,6 +391,15 @@ impl Look {
             (true, false) => Style::new().add_modifier(Modifier::UNDERLINED),
             (false, true) => Style::new().bg(self.p.tint),
             (false, false) => Style::new().bg(self.p.tint_dim),
+        }
+    }
+
+    /// The thin bar at the left edge of the cursor row.
+    pub fn cursor_mark(&self, focused: bool) -> Style {
+        match (self.mono, focused) {
+            (true, _) => Style::new().add_modifier(Modifier::BOLD),
+            (false, true) => Style::new().fg(self.p.focus).add_modifier(Modifier::BOLD),
+            (false, false) => Style::new().fg(self.p.border),
         }
     }
 
@@ -404,12 +427,8 @@ impl Look {
             };
         }
         match s {
-            Severity::Info => Style::new()
-                .fg(self.p.info)
-                .bg(Color::Rgb(0x1f, 0x2b, 0x45)),
-            Severity::Notice => Style::new()
-                .fg(self.p.bright)
-                .bg(Color::Rgb(0x2e, 0x25, 0x4a)),
+            Severity::Info => Style::new().fg(self.p.info).bg(self.p.chip_info),
+            Severity::Notice => Style::new().fg(self.p.bright).bg(self.p.chip_notice),
             Severity::Warn => Style::new()
                 .fg(self.p.bg)
                 .bg(self.p.warn)
@@ -430,19 +449,27 @@ impl Look {
         base.add_modifier(Modifier::BOLD)
     }
 
-    /// A key name in the footer or a modal, as a small filled chip.
-    pub fn key_chip(&self) -> Style {
+    /// A key name in the footer, the help or a modal: bright and bold, with
+    /// no fill, so a row of them reads as words rather than buttons.
+    pub fn key(&self) -> Style {
         if self.mono {
-            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            Style::new().add_modifier(Modifier::BOLD)
         } else {
-            Style::new()
-                .fg(self.p.bg)
-                .bg(self.p.accent)
-                .add_modifier(Modifier::BOLD)
+            Style::new().fg(self.p.bright).add_modifier(Modifier::BOLD)
         }
     }
 
-    /// A chip carrying a verdict or a count.
+    /// A key that moves or shows rather than acts: bold but quiet, so the
+    /// action keys beside it read first.
+    pub fn key_dim(&self) -> Style {
+        if self.mono {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::DIM)
+        } else {
+            Style::new().fg(self.p.dim).add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// A solid chip carrying a verdict or a count.
     pub fn chip(&self, t: Tone) -> Style {
         if self.mono {
             return Style::new().add_modifier(Modifier::REVERSED);
@@ -457,6 +484,21 @@ impl Look {
             .fg(self.p.bg)
             .bg(bg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// A soft chip: the tone's color on a dark wash of it, for marks that
+    /// should be seen without shouting (saved files, notice counts).
+    pub fn soft_chip(&self, t: Tone) -> Style {
+        if self.mono {
+            return Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        }
+        let (fg, bg) = match t {
+            Tone::Info => (self.p.info, self.p.chip_info),
+            Tone::Good => (self.p.good, self.p.chip_good),
+            Tone::Warn => (self.p.warn, self.p.chip_warn),
+            Tone::Bad => (self.p.bright, self.p.chip_notice),
+        };
+        Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
     }
 
     /// Labels in front of detail fields and section titles in the help.
@@ -567,6 +609,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lerp_runs_between_its_ends() {
+        let a = Color::Rgb(0, 0, 0);
+        let b = Color::Rgb(200, 100, 50);
+        assert_eq!(lerp(a, b, 0.0), a);
+        assert_eq!(lerp(a, b, 1.0), b);
+        assert_eq!(lerp(a, b, 0.5), Color::Rgb(100, 50, 25));
+        assert_eq!(lerp(a, b, 7.0), b, "clamped");
+        assert_eq!(lerp(Color::Reset, b, 0.5), Color::Reset);
+    }
+
+    #[test]
     fn hsv_primaries() {
         assert_eq!(hsv_to_rgb(0.0, 1.0, 1.0), (255, 0, 0));
         assert_eq!(hsv_to_rgb(120.0, 1.0, 1.0), (0, 255, 0));
@@ -605,6 +658,8 @@ mod tests {
         assert_eq!(still.rainbow(1, 0), still.rainbow(1, 1800));
         let live = Look::vivid();
         assert_ne!(live.rainbow(1, 0), live.rainbow(1, 1800));
+        assert_eq!(live.gradient(0, 4).fg, Some(ACCENT));
+        assert_eq!(live.gradient(3, 4).fg, Some(BRIGHT));
     }
 
     #[test]
@@ -685,12 +740,23 @@ mod tests {
     }
 
     #[test]
+    fn keys_and_titles_carry_no_fill() {
+        let look = Look::vivid();
+        assert_eq!(look.key().bg, None);
+        assert_eq!(look.title(true).bg, None);
+        assert!(look.title(true).add_modifier.contains(Modifier::BOLD));
+        assert_eq!(look.title(false).fg, Some(DIM));
+        assert_eq!(look.soft_chip(Tone::Good).bg, Some(CHIP_GOOD_BG));
+    }
+
+    #[test]
     fn no_color_means_terminal_defaults() {
         let mono = Look::from_flags(true, false);
         assert!(mono.mono && !mono.animate);
         assert_eq!(mono.p, Palette::mono());
         assert_eq!(mono.text().fg, None);
         assert_eq!(mono.severity_chip(Severity::Alert).bg, None);
+        assert_eq!(mono.soft_chip(Tone::Info).bg, None);
         assert_eq!(mono.base().bg, None);
     }
 }

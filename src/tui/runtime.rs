@@ -68,6 +68,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
+use crate::edit::journal::{UndoAction, UndoRecord};
 use crate::edit::{EditEngine, EditError, Risk, UndoReport, deattribute};
 use crate::model::{FileReport, RemovalStrategy};
 use crate::scan::guard::{guarded, in_guard};
@@ -77,7 +78,7 @@ use crate::scan::{
 
 use super::app::{
     self, App, Busy, CopiesOutcome, DeattributeRequest, Effect, HexView, MSG_LOCKED, Plan,
-    PlanItem, PlanKind, SavedItem, SavedKind,
+    PlanItem, PlanKind, SavedItem, SavedKind, UndoItem, UndoPlan,
 };
 use super::bg::Pending;
 use super::keymap::Key;
@@ -899,6 +900,36 @@ impl Runtime {
         }
     }
 
+    /// Read the newest journal group and offer it, so `u` shows what it
+    /// would revert before anything moves. The journal is a small local
+    /// file, read here the way the undo itself reads it.
+    fn preview_undo(&mut self) {
+        if self.engine.is_none() {
+            match EditEngine::new() {
+                Ok(e) => self.engine = Some(e),
+                Err(e) => {
+                    self.app.offer_undo(Err(format!(
+                        "Read-only: the trash store could not be opened ({e})."
+                    )));
+                    return;
+                }
+            }
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let records = match engine.journal().records() {
+            Ok(records) => records,
+            Err(e) => {
+                self.app
+                    .offer_undo(Err(format!("The undo journal could not be read ({e}).")));
+                return;
+            }
+        };
+        let plan = undo_plan(&records, &self.known, &self.app.root, unix_now());
+        self.app.offer_undo(Ok(plan));
+    }
+
     /// Undo the last batch on a worker, which hands the engine back with the
     /// restored files already scanned again.
     fn spawn_undo(&mut self) {
@@ -987,7 +1018,7 @@ impl Runtime {
         self.engine = Some(engine);
         self.app.end_busy();
         let (text, tone) = undo_status(&report);
-        self.app.set_status(text, tone);
+        self.app.status = Some(app::Status { text, tone });
         for path in &restored {
             self.app.clear_scrubbed(path);
         }
@@ -1034,6 +1065,7 @@ impl Runtime {
             Effect::Apply(plan) => self.apply_plan(plan),
             Effect::PlanDeattribute(req) => self.spawn_plan(req),
             Effect::Edit(path) => return Some(path),
+            Effect::PreviewUndo => self.preview_undo(),
             Effect::Undo => self.spawn_undo(),
             Effect::Stop => self.stop_job(),
             Effect::Scan(path) => self.picked(&path),
@@ -1378,8 +1410,12 @@ pub fn write_copies_with(plan: &Plan, root: &Path, progress: &mut dyn Progress) 
     let mode = plan.mode();
     let mut out = CopiesOutcome::default();
     let mut registry: Option<Registry> = None;
-    let mut saved = |out: &mut CopiesOutcome, path: &Path, output: PathBuf, edits, ok: bool| {
-        if !ok {
+    let mut saved = |out: &mut CopiesOutcome,
+                     path: &Path,
+                     output: PathBuf,
+                     edits,
+                     verified: Option<deattribute::Verified>| {
+        if !verified.is_some_and(|v| v.ok()) {
             out.unverified.push(app::display_under(root, &output));
         }
         if app::under_root(root, &output) {
@@ -1391,6 +1427,7 @@ pub fn write_copies_with(plan: &Plan, root: &Path, progress: &mut dyn Progress) 
             path: path.to_path_buf(),
             output,
             edits,
+            verified,
         });
     };
     let mut archives: Vec<&PlanItem> = Vec::new();
@@ -1442,7 +1479,7 @@ pub fn write_copies_with(plan: &Plan, root: &Path, progress: &mut dyn Progress) 
             });
             match wrote {
                 Ok(Ok(done)) if done.entries_cleaned > 0 => {
-                    let ok = guarded(|| {
+                    let verified = guarded(|| {
                         deattribute::verify_archive_copy(
                             &item.path,
                             &done.output,
@@ -1450,13 +1487,13 @@ pub fn write_copies_with(plan: &Plan, root: &Path, progress: &mut dyn Progress) 
                             mode,
                         )
                     })
-                    .is_ok_and(|v| v.ok());
+                    .ok();
                     saved(
                         &mut out,
                         &item.path,
                         done.output,
                         done.brand + done.patch,
-                        ok,
+                        verified,
                     );
                 }
                 Ok(Ok(_)) => out.failed.push(format!("{shown}: changed since scan")),
@@ -1479,11 +1516,11 @@ pub fn write_copies_with(plan: &Plan, root: &Path, progress: &mut dyn Progress) 
             guarded(|| deattribute::write_deattributed(&first.path, format, first.size, &targets));
         match wrote {
             Ok(Ok(output)) => {
-                let ok = guarded(|| {
+                let verified = guarded(|| {
                     deattribute::verify_copy(&first.path, &output, format, &targets, mode)
                 })
-                .is_ok_and(|v| v.ok());
-                saved(&mut out, &first.path, output, targets.len(), ok);
+                .ok();
+                saved(&mut out, &first.path, output, targets.len(), verified);
             }
             Ok(Err(e)) => out
                 .failed
@@ -1513,11 +1550,80 @@ pub fn scrub_items(out: &BatchOutcome) -> Vec<SavedItem> {
                     path: path.clone(),
                     output: path.clone(),
                     edits: 1,
+                    verified: None,
                 });
             }
         }
     }
     items
+}
+
+/// Seconds since the Unix epoch, the journal's clock.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The newest journal group as the confirm lists it: one line per record,
+/// the view's path where the file is in view, with what undo does and how
+/// long ago the edit was made.
+pub fn undo_plan(
+    records: &[UndoRecord],
+    known: &HashMap<PathBuf, PathBuf>,
+    root: &Path,
+    now: u64,
+) -> UndoPlan {
+    let Some(group) = records.iter().map(|r| r.group).max() else {
+        return UndoPlan {
+            items: Vec::new(),
+            scroll: 0,
+        };
+    };
+    let items = records
+        .iter()
+        .filter(|r| r.group == group)
+        .map(|r| {
+            let path = view_paths(std::slice::from_ref(&r.path), known, root)
+                .pop()
+                .unwrap_or_else(|| r.path.clone());
+            UndoItem {
+                path,
+                label: r.label.clone(),
+                action: undo_action_text(&r.action),
+                age: age_text(now.saturating_sub(r.ts)),
+            }
+        })
+        .collect();
+    UndoPlan { items, scroll: 0 }
+}
+
+/// What undoing a record does, in a few words.
+fn undo_action_text(a: &UndoAction) -> String {
+    match a {
+        UndoAction::RestoreBytes { offset, bytes_hex } => format!(
+            "put {} back at 0x{offset:x}",
+            crate::util::fmt::human_size((bytes_hex.len() / 2) as u64)
+        ),
+        UndoAction::RestoreRange { offset, len, .. } => format!(
+            "put {} back at 0x{offset:x}",
+            crate::util::fmt::human_size(*len)
+        ),
+        UndoAction::RestoreTail { from, .. } => format!("restore the tail cut at 0x{from:x}"),
+        UndoAction::RestoreFile { .. } => "bring it back from the trash".to_string(),
+        UndoAction::RestoreSnapshot { .. } => "restore the copy kept in the trash".to_string(),
+    }
+}
+
+/// How long ago, in plain words.
+pub fn age_text(secs: u64) -> String {
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86_400 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
 }
 
 /// The status line after an undo run.
@@ -1759,7 +1865,7 @@ mod tests {
         let copy = dir.path().join("invented.deattributed.exe");
         assert_eq!(
             rt.app.status.as_ref().unwrap().text,
-            "Saved invented.deattributed.exe beside invented.exe."
+            "Saved invented.deattributed.exe beside invented.exe, verified clean."
         );
         assert_eq!(rt.app.saved(&path).unwrap().output, copy);
         assert_eq!(rt.app.copy_of(&copy), Some(path.as_path()));
