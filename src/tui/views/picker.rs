@@ -43,8 +43,8 @@ const PICKER_MAX_H: u16 = 32;
 const MIN_LIST: u16 = 3;
 /// Most lines a message wraps to.
 const MESSAGE_LINES: u16 = 3;
-/// Width of the picker's kind column.
-const KIND_W: usize = 6;
+/// Fewest jump rows worth a group under the list.
+const MIN_JUMPS: usize = 2;
 /// Widest a place or recent label column gets before its path.
 const PLACE_LABEL_W: usize = 18;
 
@@ -221,11 +221,13 @@ pub(crate) fn draw_picker(buf: &mut Buffer, area: Rect, app: &mut App, look: &Lo
     }
     draw_tagline(buf, lay.tagline, look);
 
-    // The list window, kept around the highlight.
-    let rows = lay.list.height as usize;
+    // The list window, kept around the highlight. Inside a folder a blank
+    // row parts the subfolders from the files, so one row is held back.
     let Some(picker) = app.picker.as_mut() else {
         return;
     };
+    let gap = list_gap(picker);
+    let rows = (lay.list.height as usize).saturating_sub(gap).max(1);
     picker.set_page(rows);
     let n = picker.entries().len();
     let selected = picker.selected();
@@ -242,8 +244,16 @@ pub(crate) fn draw_picker(buf: &mut Buffer, area: Rect, app: &mut App, look: &Lo
     if let Some(slot) = lay.slot {
         draw_slot(buf, slot, picker, look);
     }
-    draw_list(buf, lay.list, picker, look, offset);
+    draw_list(buf, lay.list, picker, look, offset, gap);
     draw_message(buf, lay.message, picker, look);
+}
+
+/// Whether the list parts its subfolders from its files with a blank row:
+/// inside a folder that holds both.
+fn list_gap(p: &Picker) -> usize {
+    let entries = p.entries();
+    let both = entries.iter().any(|e| e.dir) && entries.iter().any(|e| !e.dir);
+    usize::from(p.location().is_some() && both)
 }
 
 fn draw_tagline(buf: &mut Buffer, rect: Rect, look: &Look) {
@@ -327,7 +337,9 @@ fn crumb(path: &str, room: usize, look: &Look) -> Vec<Span<'static>> {
     ]
 }
 
-/// The pinned row: "Scan this folder" with its count, or the prompt.
+/// The pinned row: the prompt while it is open, else `s` and "Scan this
+/// folder" with the folder's count, drawn like the rows under it so the key
+/// reads as the shortcut it is.
 fn draw_slot(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look) {
     if rect.height == 0 {
         return;
@@ -365,10 +377,10 @@ fn draw_slot(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look) {
     };
     let mut spans = vec![
         Span::raw(" "),
-        Span::styled(format!("{:<KIND_W$}", "scan"), look.pink()),
-        Span::raw("  "),
+        Span::styled("s", look.pink()),
+        Span::raw(" "),
     ];
-    let room = w.saturating_sub(1 + KIND_W + 2 + right.width() + 1);
+    let room = w.saturating_sub(3 + right.width() + 1);
     let label = truncate(HERE_LABEL, room);
     let used = label.width();
     spans.push(Span::styled(label, label_style));
@@ -377,15 +389,22 @@ fn draw_slot(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look) {
         spans.push(Span::styled(right, right_style));
     }
     put(buf, rect, &Line::from(spans));
+    if on {
+        cursor_mark(buf, rect, true, look);
+    }
 }
 
-fn draw_list(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look, offset: usize) {
+/// The folder's rows from `offset`, with a blank row between the last
+/// subfolder and the first file when `gap` is set, and under them, when the
+/// rows are free, the jump group: the places a digit opens.
+fn draw_list(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look, offset: usize, gap: usize) {
     if rect.height == 0 {
         return;
     }
     let entries = p.entries();
     let w = rect.width as usize;
-    let rows = rect.height as usize;
+    let rows = (rect.height as usize).saturating_sub(gap).max(1);
+    let mut used = 0usize;
     if entries.is_empty() {
         if let Some(text) = empty_note(p) {
             put(
@@ -396,40 +415,107 @@ fn draw_list(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look, offset: usiz
                     look.dim(),
                 )),
             );
+            used = 1;
         }
+    } else {
+        let window: Vec<(usize, &Entry)> =
+            entries.iter().enumerate().skip(offset).take(rows).collect();
+        let label_w = label_width(window.iter().map(|(_, e)| *e));
+        let mut y = 0u16;
+        let mut last_dir: Option<bool> = None;
+        for (i, e) in window {
+            if gap > 0 && last_dir == Some(true) && !e.dir {
+                y += 1;
+            }
+            last_dir = Some(e.dir);
+            if y >= rect.height {
+                break;
+            }
+            let r = Rect::new(rect.x, rect.y + y, rect.width, 1);
+            let on = p.selected() == Some(i);
+            if on {
+                buf.set_style(r, look.cursor_row(true));
+            }
+            let (right, right_style) = right_text(p, e, look);
+            let lead = (" ".to_string(), Style::new());
+            put(
+                buf,
+                r,
+                &Line::from(entry_spans(
+                    e,
+                    w,
+                    label_w,
+                    on,
+                    right,
+                    right_style,
+                    lead,
+                    look,
+                )),
+            );
+            if on {
+                cursor_mark(buf, r, true, look);
+            }
+            y += 1;
+        }
+        used = y as usize;
+    }
+
+    // The jump group, anchored at the bottom: as many places as the free
+    // rows hold after a blank row and a header, when that is worth a group.
+    let jumps = p.jumps();
+    let free = (rect.height as usize).saturating_sub(used);
+    let shown = jumps.len().min(free.saturating_sub(2));
+    if shown < MIN_JUMPS {
         return;
     }
-    let window = entries.iter().enumerate().skip(offset).take(rows);
-    let label_w = entries
-        .iter()
-        .skip(offset)
-        .take(rows)
-        .filter(|e| {
-            matches!(
-                e.kind,
-                EntryKind::Place | EntryKind::Recent | EntryKind::Drive
-            )
-        })
-        .map(|e| e.label.width())
-        .max()
-        .unwrap_or(0)
-        .min(PLACE_LABEL_W);
-    for (k, (i, e)) in window.enumerate() {
-        let r = Rect::new(rect.x, rect.y + k as u16, rect.width, 1);
-        let on = p.selected() == Some(i);
-        if on {
-            buf.set_style(r, look.cursor_row(true));
-        }
+    let top = rect.height as usize - shown - 1;
+    let head = Rect::new(rect.x, rect.y + top as u16, rect.width, 1);
+    let rule = w.saturating_sub(1 + 4 + 1 + 1);
+    put(
+        buf,
+        head,
+        &Line::from(vec![
+            Span::raw(" "),
+            Span::styled("jump", look.label()),
+            Span::raw(" "),
+            Span::styled("─".repeat(rule), look.rule()),
+        ]),
+    );
+    let label_w = label_width(jumps.iter().take(shown));
+    for (k, e) in jumps.iter().take(shown).enumerate() {
+        let r = Rect::new(rect.x, head.y + 1 + k as u16, rect.width, 1);
         let (right, right_style) = right_text(p, e, look);
+        let lead = (format!("{} ", k + 1), look.key());
         put(
             buf,
             r,
-            &Line::from(entry_spans(e, w, label_w, on, right, right_style, look)),
+            &Line::from(entry_spans(
+                e,
+                w,
+                label_w,
+                false,
+                right,
+                right_style,
+                lead,
+                look,
+            )),
         );
-        if on {
-            cursor_mark(buf, r, true, look);
-        }
     }
+}
+
+/// The widest place, recent or drive label among `rows`, capped, so their
+/// paths line up.
+fn label_width<'a>(rows: impl Iterator<Item = &'a Entry>) -> usize {
+    rows.filter(|e| {
+        matches!(
+            e.kind,
+            EntryKind::Place | EntryKind::Recent | EntryKind::Drive
+        )
+    })
+    .map(|e| e.label.width())
+    .max()
+    .unwrap_or(0)
+    .min(PLACE_LABEL_W)
 }
 
 /// What the list says when it has no rows: nothing while it is read or when
@@ -473,9 +559,10 @@ fn right_text(p: &Picker, e: &Entry, look: &Look) -> (String, Style) {
     }
 }
 
-/// One row: a kind column, the name (folders in the accent color, hidden
-/// entries faint), a dim path for places and recent picks, and the right
-/// column.
+/// One row: `lead` (a space, or a jump's digit), the kind's glyph, the name
+/// (folders in the accent color, hidden entries faint), a dim path for
+/// places and drives, and the right column.
+#[allow(clippy::too_many_arguments)]
 fn entry_spans(
     e: &Entry,
     w: usize,
@@ -483,17 +570,10 @@ fn entry_spans(
     on: bool,
     right: String,
     right_style: Style,
+    lead: (String, Style),
     look: &Look,
 ) -> Vec<Span<'static>> {
-    let (kind, kind_style, name_style) = match e.kind {
-        EntryKind::Recent => ("recent", look.dim(), look.text()),
-        EntryKind::Place => ("place", look.dim(), look.text()),
-        EntryKind::Drive => ("drive", look.dim(), look.text()),
-        EntryKind::Dir if e.link => ("link", look.faint(), look.faint()),
-        EntryKind::Dir => ("folder", look.faint(), look.accent()),
-        EntryKind::File if e.cloud => ("cloud", look.faint(), look.faint()),
-        EntryKind::File => ("file", look.faint(), look.text()),
-    };
+    let (glyph, glyph_style, name_style) = kind_glyph(e, look);
     let name_style = if e.hidden { look.faint() } else { name_style };
     let name_style = if on && !e.cloud && !e.hidden {
         name_style.add_modifier(Modifier::BOLD)
@@ -505,11 +585,12 @@ fn entry_spans(
     } else {
         right.width() + 1
     };
-    let room = w.saturating_sub(1 + KIND_W + 2 + right_w + 1);
+    let lead_w = lead.0.width();
+    let room = w.saturating_sub(lead_w + 1 + 1 + right_w + 1);
     let mut spans = vec![
+        Span::styled(lead.0, lead.1),
+        Span::styled(glyph, glyph_style),
         Span::raw(" "),
-        Span::styled(format!("{kind:<KIND_W$}"), kind_style),
-        Span::raw("  "),
     ];
     let path = e.path.display().to_string();
     let with_path = matches!(e.kind, EntryKind::Place | EntryKind::Drive)
@@ -538,6 +619,20 @@ fn entry_spans(
         spans.push(Span::styled(right, right_style));
     }
     spans
+}
+
+/// The glyph that says what a row is, as the files pane draws them: a
+/// folder, place or drive, a file, a link a scan never follows, a cloud-only
+/// file, or a recent pick; with the glyph's style and the name's.
+fn kind_glyph(e: &Entry, look: &Look) -> (&'static str, Style, Style) {
+    match e.kind {
+        EntryKind::Recent => ("↺", look.dim(), look.text()),
+        EntryKind::Place | EntryKind::Drive => ("▸", look.dim(), look.text()),
+        EntryKind::Dir if e.link => ("→", look.faint(), look.faint()),
+        EntryKind::Dir => ("▸", look.accent(), look.accent()),
+        EntryKind::File if e.cloud => ("○", look.faint(), look.faint()),
+        EntryKind::File => ("·", look.faint(), look.text()),
+    }
 }
 
 /// The message, wrapped to at most the message rows and sitting on the

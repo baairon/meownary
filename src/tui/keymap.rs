@@ -224,6 +224,7 @@ pub const PICKER_HELP: &[(&str, &[Hint])] = &[
             h("left h backspace", "up a folder"),
             h("s", "scan this folder"),
             h("~", "home folder"),
+            h("1-9", "jump to a place"),
         ],
     ),
     (
@@ -266,6 +267,7 @@ pub const PICKER_KEYS: &[&str] = &[
     "backspace",
     "s",
     "~",
+    "1-9",
     "/",
     "tab",
     "ctrl+u",

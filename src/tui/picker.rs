@@ -36,6 +36,8 @@ use super::listing::{Item, Listing, MAX_READ, path_cloud_only};
 
 /// Most recent picks listed.
 const MAX_RECENT: usize = 5;
+/// Most places the jump group under a folder offers, one per digit.
+pub const MAX_JUMPS: usize = 9;
 /// The most files one count gets through before it stops, short.
 pub const COUNT_CAP: usize = 10_000_000;
 
@@ -43,7 +45,8 @@ pub const COUNT_CAP: usize = 10_000_000;
 pub const HERE_LABEL: &str = "Scan this folder";
 const CLOUD_WARNING: &str =
     "This file is only in the cloud. meownary never downloads files, so it cannot scan it.";
-const KEYS_HINT: &str = "Letters are keys here. Press / to filter or type a path.";
+const KEYS_HINT: &str =
+    "Letters are keys here. Press / to filter or type a path, or a digit to jump to a place.";
 const UNREADABLE: &str = "This folder cannot be read, so there is nothing to scan.";
 
 /// A suggested folder: a short label and its path. [`Picker::with_suggestions`]
@@ -629,10 +632,46 @@ impl Picker {
             }
             (_, Some('?')) => return PickOutcome::Help,
             (_, Some('~')) => self.go_home(),
+            (_, Some(c)) if ('1'..='9').contains(&c) => {
+                return self.jump(c as usize - '1' as usize, armed);
+            }
             (_, Some(_)) => self.hint(KEYS_HINT),
             _ => {}
         }
         PickOutcome::Stay
+    }
+
+    /// The places to jump to from inside a folder: the recent picks and the
+    /// places that were found, in the top level's order, without the folder
+    /// on show, at most [`MAX_JUMPS`]. Empty at the top level. The view
+    /// lists them under the folder when it has the room, numbered.
+    pub fn jumps(&self) -> Vec<Entry> {
+        let View::Folder(here) = &self.view else {
+            return Vec::new();
+        };
+        place_rows(&self.places, "")
+            .into_iter()
+            .filter(|e| !same_path(&e.path, here))
+            .take(MAX_JUMPS)
+            .collect()
+    }
+
+    /// A digit: open jump `n` the way Enter opens it on the top level.
+    fn jump(&mut self, n: usize, armed: Option<Confirm>) -> PickOutcome {
+        self.message = None;
+        let Some(entry) = self.jumps().get(n).cloned() else {
+            return PickOutcome::Stay;
+        };
+        if entry.dir {
+            self.open_folder(entry.path, None);
+            PickOutcome::Stay
+        } else if entry.cloud {
+            self.warn(CLOUD_WARNING);
+            PickOutcome::Stay
+        } else {
+            const DIGITS: [&str; MAX_JUMPS] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+            self.scan_request(entry.path, DIGITS[n], armed)
+        }
     }
 
     fn prompt_key(&mut self, code: KeyCode, ctrl: bool, typed: Option<char>) {
@@ -1899,6 +1938,46 @@ mod tests {
     }
 
     #[test]
+    fn digits_jump_to_the_places_listed_under_a_folder() {
+        let tmp = tree();
+        let file = tmp.path().join("notes.txt");
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        let place = |name: &str, path: &Path| Suggestion {
+            label: name.to_string(),
+            path: path.to_path_buf(),
+        };
+        let mut p = Picker::with_suggestions(
+            vec![place("Alpha", &alpha), place("Beta", &beta)],
+            vec![file.clone()],
+        );
+        serve(&mut p);
+        assert!(p.jumps().is_empty(), "no jumps on the top level");
+        // Inside alpha the jumps are the recent file and the other place.
+        press(&mut p, KeyCode::Down);
+        assert_eq!(press(&mut p, KeyCode::Enter), PickOutcome::Stay);
+        serve(&mut p);
+        assert_eq!(p.location(), Some(alpha.as_path()));
+        let jumps = p.jumps();
+        assert_eq!(
+            jumps.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            [file.clone(), beta.clone()],
+            "the folder on show is left out"
+        );
+        // 2 opens beta; 1 scans the recent file; 9 does nothing.
+        assert_eq!(p.on_key(ch('2')), PickOutcome::Stay);
+        serve(&mut p);
+        assert_eq!(p.location(), Some(beta.as_path()));
+        assert_eq!(p.on_key(ch('9')), PickOutcome::Stay);
+        assert_eq!(p.location(), Some(beta.as_path()));
+        assert_eq!(p.on_key(ch('1')), PickOutcome::Scan(file));
+        // In the prompt a digit is text.
+        p.on_key(ch('/'));
+        p.on_key(ch('1'));
+        assert_eq!(p.prompt(), Some("1"));
+    }
+
+    #[test]
     fn enter_opens_a_recent_folder_and_scans_a_recent_file() {
         let tmp = tree();
         let file = tmp.path().join("notes.txt");
@@ -2285,7 +2364,7 @@ mod tests {
     fn unbound_letters_point_at_the_prompt_and_q_never_quits() {
         let tmp = tree();
         let mut p = at(tmp.path());
-        for c in ['q', 'x', 'Q', '1'] {
+        for c in ['q', 'x', 'Q', '0'] {
             assert_eq!(p.on_key(ch(c)), PickOutcome::Stay);
             assert_eq!(p.message().unwrap().text, KEYS_HINT);
         }
