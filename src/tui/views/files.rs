@@ -9,7 +9,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -24,8 +24,8 @@ use crate::tui::keymap::Hint;
 use crate::tui::theme::{Look, Tone};
 use crate::tui::tree::{Agg, SEVERITIES, severity_slot};
 use crate::tui::ui::{
-    CHIP_W, category_text, confidence_name, hint_spans, marker_text, pane, put, row, scroll_offset,
-    sev_chip, severity_name, truncate, truncate_left, verdict_spans, width_of,
+    category_text, confidence_name, cursor_mark, hint_spans, marker_text, pane, put, row,
+    scroll_offset, severity_name, truncate, truncate_left, verdict_spans, width_of,
 };
 use crate::tui::widgets::Gauge;
 
@@ -35,6 +35,42 @@ const MINI_GAUGE: usize = 8;
 const GAUGE_MIN_W: usize = 40;
 /// The fewest columns a row's name keeps.
 const MIN_NAME: usize = 6;
+/// Panes at least this many rows tall inside get air: a blank row under the
+/// title, a column each side, a gap between groups.
+const AIRY_MIN_H: u16 = 10;
+/// Panes narrower than this inside have no room for the air.
+const AIRY_MIN_W: u16 = 24;
+
+/// The part of a pane's inside the text goes in, and whether the pane has
+/// air. The cursor tint still spans the whole `body`; the text sits in
+/// `text`.
+struct Inside {
+    body: Rect,
+    text: Rect,
+    airy: bool,
+}
+
+fn inside(inner: Rect) -> Inside {
+    let airy = inner.height >= AIRY_MIN_H && inner.width >= AIRY_MIN_W;
+    if !airy {
+        return Inside {
+            body: inner,
+            text: inner,
+            airy,
+        };
+    }
+    let body = Rect {
+        y: inner.y + 1,
+        height: inner.height - 1,
+        ..inner
+    };
+    let text = Rect {
+        x: body.x + 1,
+        width: body.width - 2,
+        ..body
+    };
+    Inside { body, text, airy }
+}
 
 pub(crate) fn draw_main(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look) {
     if app.narrow {
@@ -45,7 +81,9 @@ pub(crate) fn draw_main(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look
         return;
     }
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).areas(area);
+        Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
+            .spacing(1)
+            .areas(area);
     let files_focus = app.pane == Pane::Files;
     draw_files(buf, left, app, look, files_focus);
     draw_findings(buf, right, app, look, !files_focus);
@@ -76,7 +114,11 @@ fn draw_files(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focused:
     if inner.height == 0 || inner.width < 8 {
         return;
     }
-    let rows = inner.height as usize;
+    let Inside { body, text, airy } = inside(inner);
+    // Folders sit first; with air, a blank row parts them from the files.
+    let folders = app.rows().iter().filter(|r| r.dir).count();
+    let gap = usize::from(airy && folders > 0 && folders < shown);
+    let rows = (body.height as usize).saturating_sub(gap).max(1);
     if focused {
         app.page = rows;
     }
@@ -96,7 +138,7 @@ fn draw_files(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focused:
         };
         put(
             buf,
-            row(inner, 1),
+            row(body, 1),
             &Line::from(Span::styled(msg, look.dim())).centered(),
         );
         return;
@@ -123,27 +165,42 @@ fn draw_files(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focused:
         .max()
         .unwrap_or(1)
         .max(1);
-    let w = inner.width as usize;
+    let w = text.width as usize;
+    let mut y = 0u16;
+    let mut last_dir: Option<bool> = None;
     for (k, r) in window.iter().enumerate() {
-        let rect = row(inner, k as u16);
-        if app.file_offset + k == app.file_cursor {
+        if gap > 0 && last_dir == Some(true) && !r.dir {
+            y += 1;
+        }
+        last_dir = Some(r.dir);
+        if y >= body.height {
+            break;
+        }
+        let rect = row(body, y);
+        let trect = row(text, y);
+        let on = app.file_offset + k == app.file_cursor;
+        if on {
             buf.set_style(rect, look.cursor_row(focused));
         }
         if r.dir {
             let (line, bar) = folder_row(app, r, w, count_w, look);
-            put(buf, rect, &line);
+            put(buf, trect, &line);
             if let Some((x, ratio)) = bar {
-                let at = Rect::new(rect.x + x as u16, rect.y, MINI_GAUGE as u16, 1);
+                let at = Rect::new(trect.x + x as u16, trect.y, MINI_GAUGE as u16, 1);
                 Gauge::new(ratio)
                     .live(true)
                     .render(buf, at, look, app.anim_ms);
             }
         } else if let Some(report) = app.report(&r.path) {
             let line = file_row(app, report, &r.name, w, fmt_w, count_w, look);
-            put(buf, rect, &line);
+            put(buf, trect, &line);
         } else {
-            put(buf, rect, &listed_row(app, r, w, count_w, look));
+            put(buf, trect, &listed_row(app, r, w, count_w, look));
         }
+        if on {
+            cursor_mark(buf, rect, focused, look);
+        }
+        y += 1;
     }
 }
 
@@ -273,12 +330,13 @@ fn folder_row(
     } else {
         Span::raw(" ")
     };
-    let dot = severity_dot(agg.worst(), look);
+    // The shape says folder; the count's color says how bad it is inside.
+    let dot = Span::styled("▸", look.accent());
     let name = format!("{}{MAIN_SEPARATOR}", r.name);
     let quiet = if agg.findings > 0 {
-        look.text()
+        look.accent().add_modifier(Modifier::BOLD)
     } else {
-        look.dim()
+        look.accent()
     };
     let mut ratio = None;
     let (name_style, mid, mid_style) = match app.folder_state(r) {
@@ -308,7 +366,7 @@ fn folder_row(
                 app::thousands(of as usize),
                 if exact { "" } else { "+" }
             );
-            (look.text(), text, look.accent())
+            (look.accent(), text, look.accent())
         }
         FolderState::Done => (quiet, files_text(agg.files, true), look.dim()),
         FolderState::Empty => (look.dim(), "empty".to_string(), look.faint()),
@@ -383,10 +441,11 @@ fn file_row(
     let fixed = 1 + 1 + 1 + 1 + fmt_w + 2 + count_w + 1;
     let name_w = width.saturating_sub(fixed);
     // A saved file carries a chip after its name; it shrinks to a check
-    // mark when the name would be squeezed, so the columns never move.
+    // mark when the whole name and the word would not both fit, so the
+    // name stays whole and the columns never move.
     let chip = saved_chip(app, &r.path, look).map(|(word, style)| {
         let full = format!(" {word} ");
-        if name_w >= full.width() + 1 + 6 {
+        if name_w >= name.width() + 1 + full.width() {
             Span::styled(full, style)
         } else {
             Span::styled(" ✓ ", style)
@@ -431,24 +490,19 @@ fn file_row(
 }
 
 /// The chip word and style for a saved file or an output copy: a calm
-/// success tone for what was saved, the info tone for a copy.
+/// success tone for what was saved, the info tone for a copy, and a warning
+/// for a copy that did not verify clean.
 fn saved_chip(app: &App, path: &Path, look: &Look) -> Option<(&'static str, Style)> {
-    let soft = |fg: Color, bg: Color| {
-        if look.mono {
-            Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
-        }
-    };
     if app.is_copy(path) {
-        return Some(("copy", soft(look.p.info, Color::Rgb(0x1f, 0x2b, 0x45))));
+        let clean = app.copy_verified(path).is_none_or(|v| v.ok());
+        return Some(if clean {
+            ("copy", look.soft_chip(Tone::Info))
+        } else {
+            ("unverified", look.soft_chip(Tone::Warn))
+        });
     }
-    app.saved(path).map(|s| {
-        (
-            s.kind.word(),
-            soft(look.p.good, Color::Rgb(0x1a, 0x33, 0x27)),
-        )
-    })
+    app.saved(path)
+        .map(|s| (s.kind.word(), look.soft_chip(Tone::Good)))
 }
 
 /// The "saved" or "copy of" field for the detail view and the peek.
@@ -459,25 +513,54 @@ pub(crate) fn saved_field(
     look: &Look,
 ) -> Option<Vec<Span<'static>>> {
     if let Some(original) = app.copy_of(path) {
-        let shown = truncate_left(&original.display().to_string(), width.saturating_sub(9));
-        return Some(vec![
+        let note = app.copy_verified(path).and_then(app::verification_note);
+        let note_w = note.as_ref().map_or(0, |(t, _)| t.width() + 2);
+        let shown = truncate_left(
+            &original.display().to_string(),
+            width.saturating_sub(9 + note_w),
+        );
+        let mut spans = vec![
             Span::styled("copy of ", look.good()),
             Span::styled(shown, look.text()),
-        ]);
+        ];
+        if let Some((text, tone)) = note {
+            spans.push(Span::styled(format!("  {text}"), look.tone(tone)));
+        }
+        return Some(spans);
     }
     let s = app.saved(path)?;
     let word = s.kind.word();
-    let shown = truncate_left(
-        &s.output.display().to_string(),
-        width.saturating_sub(word.len() + 2),
-    );
-    Some(vec![
+    let note = match (s.kind, s.verified.as_ref()) {
+        (app::SavedKind::Deattributed, Some(v)) => {
+            app::verification_note(v).or_else(|| Some(("verified clean".to_string(), Tone::Good)))
+        }
+        _ => None,
+    };
+    let note_w = note.as_ref().map_or(0, |(t, _)| t.width() + 2);
+    let room = width.saturating_sub(word.len() + 2 + note_w);
+    // The whole path when it fits, else the file's own name.
+    let full = s.output.display().to_string();
+    let shown = if full.width() <= room {
+        full
+    } else {
+        let name = s
+            .output
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or(full);
+        truncate_left(&name, room)
+    };
+    let mut spans = vec![
         Span::styled(
             format!("{word}  "),
             look.good().add_modifier(Modifier::BOLD),
         ),
         Span::styled(shown, look.text()),
-    ])
+    ];
+    if let Some((text, tone)) = note {
+        spans.push(Span::styled(format!("  {text}"), look.tone(tone)));
+    }
+    Some(spans)
 }
 
 fn draw_findings(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focused: bool) {
@@ -517,18 +600,17 @@ fn draw_findings(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focus
     if inner.height == 0 || inner.width < 12 {
         return;
     }
-    // Tall enough: keep the bottom for a short peek at the highlighted finding.
-    let peek = inner.height >= PEEK_MIN_H && !idxs.is_empty();
+    let Inside { body, text, airy } = inside(inner);
+    let w = text.width as usize;
+    // Tall enough: keep the bottom for a short peek at the highlighted
+    // finding, with a blank row above it when the pane has air.
+    let peek = body.height >= PEEK_MIN_H && !idxs.is_empty();
+    let peek_h = PEEK_H + u16::from(airy);
     let list_h = if peek {
-        inner.height - PEEK_H
+        body.height - peek_h
     } else {
-        inner.height
+        body.height
     };
-    let rows = (list_h as usize / 2).max(1);
-    if focused {
-        app.page = rows;
-    }
-    app.finding_offset = scroll_offset(app.finding_cursor, app.finding_offset, rows, idxs.len());
 
     let Some(r) = app.current_file() else {
         let msg = if app.scanning {
@@ -538,7 +620,7 @@ fn draw_findings(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focus
         };
         put(
             buf,
-            row(inner, 1),
+            row(body, 1),
             &Line::from(Span::styled(msg, look.dim())).centered(),
         );
         return;
@@ -551,62 +633,137 @@ fn draw_findings(buf: &mut Buffer, area: Rect, app: &mut App, look: &Look, focus
         };
         put(
             buf,
-            row(inner, 1),
+            row(body, 1),
             &Line::from(Span::styled(msg, style)).centered(),
         );
         if r.partial {
+            let why = match app.tree().reason(&r.path) {
+                Some(why) => format!("Partly read: {}.", short_reason(why)),
+                None => "This file could only be partly read.".to_string(),
+            };
             put(
                 buf,
-                row(inner, 2),
-                &Line::from(Span::styled(
-                    "This file could only be partly read.",
-                    look.tone(Tone::Warn),
-                ))
-                .centered(),
+                row(body, 2),
+                &Line::from(Span::styled(truncate(&why, w), look.tone(Tone::Warn))).centered(),
             );
         }
         return;
     }
 
-    let w = inner.width as usize;
-    for k in 0..rows {
-        let pos = app.finding_offset + k;
-        let Some(&fi) = idxs.get(pos) else { break };
-        let Some(f) = r.findings.get(fi) else { break };
-        let y = (k * 2) as u16;
-        if y >= list_h {
-            break;
+    // The list, as rows: a header where the severity changes (after a
+    // blank row from the second group on, when there is air), then one
+    // row per finding. The findings come worst first.
+    let mut disp: Vec<Disp> = Vec::new();
+    let mut cursor_row = 0;
+    let mut last: Option<Severity> = None;
+    for (pos, &fi) in idxs.iter().enumerate() {
+        let Some(f) = r.findings.get(fi) else {
+            continue;
+        };
+        if last != Some(f.severity) {
+            if last.is_some() && airy {
+                disp.push(Disp::Blank);
+            }
+            let n = idxs
+                .iter()
+                .filter(|&&j| r.findings.get(j).is_some_and(|g| g.severity == f.severity))
+                .count();
+            disp.push(Disp::Header(f.severity, n));
+            last = Some(f.severity);
         }
-        let top = row(inner, y);
         if pos == app.finding_cursor {
-            let h = if y + 1 < list_h { 2 } else { 1 };
-            buf.set_style(Rect { height: h, ..top }, look.cursor_row(focused));
+            cursor_row = disp.len();
         }
-        let (first, second) = finding_rows(app, r, fi, f, w, look);
-        put(buf, top, &first);
-        if y + 1 < list_h {
-            put(buf, row(inner, y + 1), &second);
+        disp.push(Disp::Finding(pos));
+    }
+    let rows = (list_h as usize).max(1);
+    let mut offset = scroll_offset(cursor_row, app.finding_offset, rows, disp.len());
+    // A finding right under its header brings the header along.
+    if cursor_row >= 1 && matches!(disp[cursor_row - 1], Disp::Header(..)) && offset == cursor_row {
+        offset = cursor_row - 1;
+    }
+    let window = &disp[offset..(offset + rows).min(disp.len())];
+    let page = window
+        .iter()
+        .filter(|d| matches!(d, Disp::Finding(_)))
+        .count()
+        .max(1);
+    // The facts the state machine reads on the next key, written once the
+    // report is no longer borrowed.
+    let cursor = app.finding_cursor;
+    let _ = r;
+    app.finding_offset = offset;
+    if focused {
+        app.page = page;
+    }
+    let Some(r) = app.current_file() else {
+        return;
+    };
+    for (k, d) in window.iter().enumerate() {
+        let rect = row(body, k as u16);
+        let trect = row(text, k as u16);
+        match d {
+            Disp::Blank => {}
+            Disp::Header(s, n) => put(buf, trect, &group_header(*s, *n, w, look)),
+            Disp::Finding(pos) => {
+                let Some(&fi) = idxs.get(*pos) else { continue };
+                let Some(f) = r.findings.get(fi) else {
+                    continue;
+                };
+                let on = *pos == cursor;
+                if on {
+                    buf.set_style(rect, look.cursor_row(focused));
+                }
+                put(buf, trect, &finding_line(app, r, fi, f, w, look));
+                if on {
+                    cursor_mark(buf, rect, focused, look);
+                }
+            }
         }
     }
 
     if peek && let Some((r, _, f)) = app.current_finding() {
         let area = Rect {
-            y: inner.y + list_h,
+            y: body.y + list_h + u16::from(airy),
             height: PEEK_H,
-            ..inner
+            ..text
         };
         let saved = saved_field(app, &r.path, (area.width as usize).saturating_sub(11), look);
         draw_peek(buf, area, r, f, saved, look);
     }
 }
 
+/// One row of the findings list.
+enum Disp {
+    Blank,
+    Header(Severity, usize),
+    Finding(usize),
+}
+
+/// A severity group's header: its name in its color, a rule, how many.
+fn group_header(s: Severity, n: usize, w: usize, look: &Look) -> Line<'static> {
+    let name = severity_name(s);
+    let count = app::thousands(n);
+    let rule = w.saturating_sub(2 + name.len() + 1 + count.len() + 1);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(name, look.severity(s).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled("─".repeat(rule), look.rule()),
+        Span::raw(" "),
+        Span::styled(count, look.dim()),
+    ])
+}
+
 /// Rows the peek under the findings list takes.
 const PEEK_H: u16 = 6;
-/// The findings pane shows the peek from this inner height up.
-const PEEK_MIN_H: u16 = 17;
+/// The findings pane shows the peek from this many list rows up.
+const PEEK_MIN_H: u16 = 14;
 
 /// A few facts about the highlighted finding, so the common questions (what
 /// is it, what would `d` do, is that safe) need no trip to the detail view.
+/// Its rule names the finding's severity, confidence and signature, which
+/// the list rows leave out.
 fn draw_peek(
     buf: &mut Buffer,
     area: Rect,
@@ -616,17 +773,25 @@ fn draw_peek(
     look: &Look,
 ) {
     let w = area.width as usize;
-    let rule = w.saturating_sub(7);
-    put(
-        buf,
-        row(area, 0),
-        &Line::from(vec![
-            Span::raw(" "),
-            Span::styled("peek", look.label()),
-            Span::raw(" "),
-            Span::styled("─".repeat(rule), look.rule()),
-        ]),
-    );
+    let head = vec![
+        Span::raw(" "),
+        Span::styled(
+            severity_name(f.severity),
+            look.severity(f.severity).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", look.rule()),
+        Span::styled(
+            format!("{} confidence", confidence_name(f.confidence)),
+            look.confidence(f.confidence),
+        ),
+        Span::raw("  "),
+        Span::styled(f.signature_id.clone(), look.accent()),
+        Span::raw(" "),
+    ];
+    let rule = w.saturating_sub(width_of(&head));
+    let mut head = head;
+    head.push(Span::styled("─".repeat(rule), look.rule()));
+    put(buf, row(area, 0), &Line::from(head));
     let field = |name: &str, value: Vec<Span<'static>>| {
         let mut spans = vec![Span::styled(format!(" {name:<9}"), look.label())];
         spans.extend(value);
@@ -640,15 +805,9 @@ fn draw_peek(
             look.text(),
         )],
     )];
-    let note = f
-        .evidence
-        .note
-        .clone()
-        .unwrap_or_else(|| format!("at 0x{:x}", f.evidence.offset));
-    lines.push(field(
-        "note",
-        vec![Span::styled(truncate_left(&note, val_w), look.text())],
-    ));
+    if let Some(value) = saved {
+        lines.push(field("saved", value));
+    }
     match &f.marker {
         Some(m) => {
             lines.push(field(
@@ -656,7 +815,7 @@ fn draw_peek(
                 vec![Span::styled(truncate(&marker_text(m), val_w), look.text())],
             ));
             let risk = edit::assess(r.format.as_deref(), r.size, m);
-            let mut v = verdict_spans(&risk, look);
+            let mut v = verdict_spans(&risk, m.reversible, look);
             // The reason is exact, so it wraps onto the spare row rather than
             // being cut short.
             let chip_w = v.first().map(|c| c.content.width()).unwrap_or(0);
@@ -686,19 +845,23 @@ fn draw_peek(
             ));
         }
     }
-    // A saved file says so right under the kind; the note gives way when
-    // the rows run out.
-    if let Some(value) = saved {
-        lines.insert(1, field("saved", value));
-        if lines.len() > (area.height as usize).saturating_sub(1) {
-            lines.remove(2);
-        }
+    // The note takes a spare row, when there is one.
+    let spare = (area.height as usize).saturating_sub(1);
+    if lines.len() < spare {
+        let note = f
+            .evidence
+            .note
+            .clone()
+            .unwrap_or_else(|| format!("at 0x{:x}", f.evidence.offset));
+        lines.insert(
+            1,
+            field(
+                "note",
+                vec![Span::styled(truncate_left(&note, val_w), look.text())],
+            ),
+        );
     }
-    for (k, line) in lines
-        .iter()
-        .take((area.height as usize).saturating_sub(1))
-        .enumerate()
-    {
+    for (k, line) in lines.iter().take(spare).enumerate() {
         put(buf, row(area, 1 + k as u16), line);
     }
 }
@@ -724,49 +887,49 @@ fn wrap_once(s: &str, w: usize) -> (String, String) {
     }
 }
 
-fn finding_rows(
+/// One finding on one row: the pick mark, the title, and at the right a
+/// `*` when it carries a removable marker, as `scan` prints it, with the
+/// signature id before it when both fit whole. A weak finding is dim
+/// throughout. Its severity is the group it sits under; its confidence and
+/// its id wait in the peek.
+fn finding_line(
     app: &App,
     r: &FileReport,
     fi: usize,
     f: &Finding,
     w: usize,
     look: &Look,
-) -> (Line<'static>, Line<'static>) {
+) -> Line<'static> {
     let weak = f.confidence == Confidence::Weak;
     let mark = if app.is_finding_picked(&r.path, fi) {
         Span::styled("+", look.pink())
     } else {
         Span::raw(" ")
     };
-    let title_w = w.saturating_sub(2 + CHIP_W + 1 + 1);
-    let title_style = if weak { look.dim() } else { look.strong() };
-    let first = Line::from(vec![
+    let star = if f.is_removable() { "*" } else { " " };
+    let title_room = w.saturating_sub(2 + 1);
+    let with_id = f.title.width() + 2 + f.signature_id.width() <= title_room;
+    let title_w = if with_id { f.title.width() } else { title_room };
+    let title = truncate(&f.title, title_w);
+    let mut spans = vec![
         mark,
         Span::raw(" "),
-        sev_chip(f.severity, look),
-        Span::raw(" "),
-        Span::styled(truncate(&f.title, title_w), title_style),
-    ]);
-
-    // The confidence sits under the chip's text, the signature under the title.
-    let tag = if f.is_removable() { "removable" } else { "" };
-    let sig_w = w.saturating_sub(3 + 8 + 1 + tag.len() + 2);
-    let sig = truncate(&f.signature_id, sig_w);
-    let mut spans = vec![
-        Span::raw("   "),
-        Span::styled(
-            format!("{:<8}", confidence_name(f.confidence)),
-            look.confidence(f.confidence),
-        ),
-        Span::raw(" "),
-        Span::styled(sig, if weak { look.faint() } else { look.accent() }),
+        Span::styled(title.clone(), if weak { look.dim() } else { look.strong() }),
     ];
-    let used = width_of(&spans);
-    if !tag.is_empty() && w > used + tag.len() + 1 {
-        spans.push(Span::raw(" ".repeat(w - used - tag.len() - 1)));
-        spans.push(Span::styled(tag, look.pink()));
+    if with_id {
+        let pad = title_room.saturating_sub(title.width() + f.signature_id.width());
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            f.signature_id.clone(),
+            if weak { look.faint() } else { look.accent() },
+        ));
+    } else {
+        spans.push(Span::raw(
+            " ".repeat(title_room.saturating_sub(title.width())),
+        ));
     }
-    (first, Line::from(spans))
+    spans.push(Span::styled(star, look.pink()));
+    Line::from(spans)
 }
 
 /// Header row 1: while the scan runs, how far it has got, a bar, and the

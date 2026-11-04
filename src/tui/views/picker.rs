@@ -23,7 +23,9 @@ use crate::tui::keymap::{self, Hint};
 use crate::tui::logo;
 use crate::tui::picker::{self, Entry, EntryKind, HERE_LABEL, Highlight, MessageKind, Picker};
 use crate::tui::theme::{Look, Tone};
-use crate::tui::ui::{pad, put, scroll_offset, truncate, truncate_left, width_of, wordmark};
+use crate::tui::ui::{
+    cursor_mark, pad, put, scroll_offset, truncate, truncate_left, width_of, wordmark,
+};
 use crate::tui::widgets::Gauge;
 
 /// The line under the wordmark on the picker.
@@ -424,6 +426,9 @@ fn draw_list(buf: &mut Buffer, rect: Rect, p: &Picker, look: &Look, offset: usiz
             r,
             &Line::from(entry_spans(e, w, label_w, on, right, right_style, look)),
         );
+        if on {
+            cursor_mark(buf, r, true, look);
+        }
     }
 }
 

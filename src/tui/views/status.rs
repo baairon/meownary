@@ -1,5 +1,6 @@
-//! Header row 2: the latest message, or a gentle pointer at the keys, and the
-//! footer hints for work that is running.
+//! Header row 1: the activity row while work runs, else the latest message,
+//! else the scan's progress or its summary; and the footer hints for work
+//! that is running.
 //!
 //! While work runs off the input thread the row becomes the activity row:
 //! what is running and how far it is, the thin bar (filled by weight, with
@@ -19,7 +20,7 @@ use crate::tui::app::{self, App, Busy};
 use crate::tui::keymap::{Hint, hint_names};
 use crate::tui::progress::Activity;
 use crate::tui::theme::{Look, Tone};
-use crate::tui::ui::{put, truncate_left, width_of};
+use crate::tui::ui::{put, truncate, truncate_left, width_of};
 use crate::tui::widgets::Gauge;
 
 /// The bar's width bounds, in columns.
@@ -30,30 +31,31 @@ const NAME_MIN: usize = 8;
 /// Elapsed time shows from this many milliseconds on.
 const ELAPSED_FROM_MS: u64 = 2000;
 
-/// Header row 2.
+/// Header row 1.
 pub(crate) fn draw_status_row(buf: &mut Buffer, area: Rect, app: &App, look: &Look) {
     if let Some(work) = app.busy {
         draw_activity(buf, area, app, work, look);
         return;
     }
-    let line = match &app.status {
-        Some(s) => Line::from(Span::styled(s.text.clone(), look.tone(s.tone))),
-        None => Line::from(vec![
-            Span::styled(
-                if app.has_subfolders() {
-                    "Enter opens a folder. Press "
-                } else {
-                    "Press "
-                },
-                look.faint(),
-            ),
-            Span::styled("?", look.accent()),
-            Span::styled(" for keys, ", look.faint()),
-            Span::styled("q", look.accent()),
-            Span::styled(" to quit.", look.faint()),
-        ]),
+    let Some(s) = &app.status else {
+        crate::tui::views::files::draw_scan_row(buf, area, app, look);
+        return;
     };
-    put(buf, area, &line);
+    // How long the job behind this message took, once it is worth saying;
+    // the message gives way to it rather than hiding it.
+    let took = app
+        .done_in
+        .filter(|&ms| ms >= ELAPSED_FROM_MS)
+        .map(|ms| format!(" · {}", elapsed_text(ms)));
+    let room = (area.width as usize).saturating_sub(2 + took.as_ref().map_or(0, |t| t.width()));
+    let mut spans = vec![
+        Span::styled(look.tone_glyph(s.tone), look.tone(s.tone)),
+        Span::styled(truncate(&s.text, room), look.tone(s.tone)),
+    ];
+    if let Some(t) = took {
+        spans.push(Span::styled(t, look.faint()));
+    }
+    put(buf, area, &Line::from(spans));
 }
 
 /// The verb the activity row leads with.
@@ -120,8 +122,8 @@ fn draw_activity(buf: &mut Buffer, area: Rect, app: &App, work: Busy, look: &Loo
     let elapsed = (ms >= ELAPSED_FROM_MS).then(|| elapsed_text(ms));
     let key_hint = |key: &str, label: &str| {
         vec![
-            Span::styled(key.to_string(), look.accent()),
-            Span::styled(format!(" {label}"), look.faint()),
+            Span::styled(key.to_string(), look.key()),
+            Span::styled(format!(" {label}"), look.dim()),
         ]
     };
 
@@ -335,12 +337,12 @@ mod tests {
         app.activity = Some(a);
     }
 
-    /// Draw `app` at `w` by `h` and return header row 2 and the buffer.
+    /// Draw `app` at `w` by `h` and return header row 1 and the buffer.
     fn row2(app: &mut App, look: &Look, w: u16, h: u16) -> (String, Buffer) {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         draw_into(&mut buf, area, app, look);
-        let text = (0..w).map(|x| buf[(x, 2)].symbol().to_string()).collect();
+        let text = (0..w).map(|x| buf[(x, 1)].symbol().to_string()).collect();
         (text, buf)
     }
 
@@ -439,7 +441,7 @@ mod tests {
         let (text, buf) = row2(&mut app, &mono, 80, 24);
         assert!(text.contains('━'), "{text}");
         for x in 0..80 {
-            let c = &buf[(x, 2)];
+            let c = &buf[(x, 1)];
             assert!(!matches!(c.fg, Color::Rgb(..)) && !matches!(c.bg, Color::Rgb(..)));
         }
     }

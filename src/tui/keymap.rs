@@ -309,6 +309,21 @@ pub fn help_groups(ctx: &str) -> &'static [(&'static str, &'static [Hint])] {
     }
 }
 
+/// Whether a hint acts on files or findings (scrub, deattribute, delete,
+/// select, confirm, undo, edit, scan, stop) rather than moving or showing.
+/// The footer leads with these.
+pub fn is_action(h: &Hint) -> bool {
+    if h.key == "esc" {
+        return h.label == "stop";
+    }
+    hint_names(h.key).iter().any(|n| {
+        matches!(
+            *n,
+            "d" | "a" | "A" | "D" | "x" | "space" | "y" | "n" | "u" | "e" | "s"
+        )
+    })
+}
+
 /// The key names a hint lists.
 pub fn hint_names(key: &'static str) -> Vec<&'static str> {
     if key == "/" {

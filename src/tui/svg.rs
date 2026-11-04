@@ -112,15 +112,15 @@ fn rgb_of(c: Color, fallback: Color) -> Rgb {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
         Color::Reset => rgb_of(fallback, Color::Rgb(0xff, 0xff, 0xff)),
-        Color::Black => (0x16, 0x13, 0x1d),
-        Color::Red => (0xff, 0x6b, 0x8b),
-        Color::Green => (0x7e, 0xe0, 0xa1),
-        Color::Yellow => (0xf6, 0xc5, 0x60),
-        Color::Blue => (0x8f, 0xbc, 0xff),
-        Color::Magenta => (0xd8, 0xb4, 0xfe),
+        Color::Black => rgb_of(theme::BG, Color::Reset),
+        Color::Red => rgb_of(theme::BAD, Color::Reset),
+        Color::Green => rgb_of(theme::GOOD, Color::Reset),
+        Color::Yellow => rgb_of(theme::WARN, Color::Reset),
+        Color::Blue => rgb_of(theme::INFO, Color::Reset),
+        Color::Magenta => rgb_of(theme::BRIGHT, Color::Reset),
         Color::Cyan => (0x7f, 0xdb, 0xe6),
-        Color::Gray => (0x9a, 0x91, 0xb0),
-        Color::DarkGray => (0x6b, 0x65, 0x77),
+        Color::Gray => rgb_of(theme::DIM, Color::Reset),
+        Color::DarkGray => rgb_of(theme::RULE, Color::Reset),
         _ => rgb_of(fallback, Color::Rgb(0xff, 0xff, 0xff)),
     }
 }
@@ -1298,7 +1298,7 @@ mod tests {
         let svg = svg_of(&buf);
         assert!(!svg.contains('●'));
         assert!(
-            svg.contains("<circle cx=\"56.85\" cy=\"138.5\" r=\"3.1\" fill=\"#f6c560\"/>"),
+            svg.contains("<circle cx=\"56.85\" cy=\"138.5\" r=\"3.1\" fill=\"#f7c35f\"/>"),
             "{svg}"
         );
         assert!(svg.contains(">report.pdf</text>"));

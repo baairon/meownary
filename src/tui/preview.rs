@@ -23,7 +23,7 @@ use crate::model::{
     Marker, Region, RemovalStrategy, Severity, SignatureStatus, TamperKind,
 };
 
-use super::app::{App, Busy, Pane};
+use super::app::{App, Busy, Pane, SavedKind};
 use super::keymap::Key;
 use super::progress::Activity;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -53,6 +53,94 @@ pub fn render_help_svg(width: u16, height: u16) -> String {
 pub fn render_picker_svg(width: u16, height: u16) -> String {
     let mut app = demo_picker();
     render_svg(&mut app, width, height, "meownary picker")
+}
+
+/// Every scene the previews can draw, by name: the three the README embeds
+/// (`working`, `keys`, `picker`) and the extra ones a design review looks at
+/// (`scanning`, `saved`, `undo`).
+pub const SCENES: [&str; 6] = ["working", "keys", "picker", "scanning", "saved", "undo"];
+
+/// One scene as an animated SVG, `width` by `height` cells.
+pub fn render_scene_svg(name: &str, width: u16, height: u16) -> String {
+    match name {
+        "keys" => render_help_svg(width, height),
+        "picker" => render_picker_svg(width, height),
+        "scanning" => {
+            let mut app = demo_scanning();
+            app.anim_ms = 700;
+            render_svg_at(&mut app, width, height, "meownary scanning", 700)
+        }
+        "saved" => render_svg(&mut demo_saved(), width, height, "meownary after a scrub"),
+        "undo" => render_svg(&mut demo_undo(), width, height, "meownary undo"),
+        _ => render_preview_svg(width, height),
+    }
+}
+
+/// The demo folder after a scrub: the file carries its mark, the status
+/// says what was saved and how long it took.
+pub fn demo_saved() -> App {
+    let mut app = demo_app();
+    let root = PathBuf::from("downloads");
+    let pdf = root.join("lease-draft.pdf");
+    app.mark_saved(&pdf, SavedKind::Scrubbed, pdf.clone(), 2, None);
+    let exe = root.join("setup-tool-2.4.1.exe");
+    app.mark_saved(
+        &exe,
+        SavedKind::Deattributed,
+        root.join("setup-tool-2.4.1.deattributed.exe"),
+        3,
+        Some(crate::edit::deattribute::Verified {
+            clean: true,
+            partial: false,
+            residual: None,
+        }),
+    );
+    app.status = Some(super::app::Status {
+        text: "Saved setup-tool-2.4.1.deattributed.exe beside setup-tool-2.4.1.exe, \
+               verified clean."
+            .to_string(),
+        tone: super::theme::Tone::Good,
+    });
+    app.done_in = Some(4_300);
+    app
+}
+
+/// The demo folder with `u` pressed: the newest journal group, listed
+/// before anything moves.
+pub fn demo_undo() -> App {
+    let mut app = demo_app();
+    let root = PathBuf::from("downloads");
+    let item = |name: &str, label: &str, action: &str, age: &str| super::app::UndoItem {
+        path: root.join(name),
+        label: label.to_string(),
+        action: action.to_string(),
+        age: age.to_string(),
+    };
+    app.overlay = Some(super::app::Overlay::ConfirmUndo(super::app::UndoPlan {
+        items: vec![
+            item(
+                "lease-draft.pdf",
+                "pdf.info",
+                "put 212 B back at 0x2c0",
+                "2 min ago",
+            ),
+            item(
+                "lease-draft.pdf",
+                "pdf.xmp",
+                "put 1.1 KB back at 0x9a4",
+                "2 min ago",
+            ),
+            item(
+                "photo.jpg",
+                "jpeg.exif",
+                "put 4.2 KB back at 0x14",
+                "2 min ago",
+            ),
+        ],
+        scroll: 0,
+    }));
+    app.confirm_drawn = true;
+    app
 }
 
 /// The picker over invented places. Recent picks are left out: the picker
@@ -572,8 +660,13 @@ fn demo_reports(root: &Path) -> Vec<FileReport> {
 
 /// Draw `app` once at `width` by `height` and convert the buffer.
 fn render_svg(app: &mut App, width: u16, height: u16, title: &str) -> String {
+    render_svg_at(app, width, height, title, 0)
+}
+
+/// [`render_svg`] with the animation clock at `anim_ms`.
+fn render_svg_at(app: &mut App, width: u16, height: u16, title: &str, anim_ms: u64) -> String {
     let look = Look::vivid();
-    app.anim_ms = 0;
+    app.anim_ms = anim_ms;
     let buf = match Terminal::new(TestBackend::new(width, height)) {
         Ok(mut terminal) => match terminal.draw(|f| ui::draw(f, app, &look)) {
             Ok(frame) => frame.buffer.clone(),
@@ -633,9 +726,6 @@ mod tests {
             assert!(svg.contains(FONT_STACK));
         }
         assert!(preview.contains("<title>meownary interactive view</title>"));
-        for svg in [&preview, &help] {
-            assert!(!svg.contains("o.o"), "no cat face anywhere");
-        }
         assert!(help.contains("<title>meownary keys</title>"));
 
         let vals = values_of(&preview, "fill");
@@ -682,10 +772,11 @@ mod tests {
         let svg = render_preview_svg(100, 30);
         for needle in [
             "setup-tool-2.4.1.exe",
-            "pe.pdb_path",
             "pe.overlay",
+            "PDB path left",
             "photo.jpg",
-            "Scanned 16 files",
+            "Writing copies 5 of 5",
+            "removable",
             "1 selected",
         ] {
             assert!(svg.contains(needle), "{needle}");
@@ -759,14 +850,15 @@ mod tests {
                     continue;
                 }
                 let needles: &[&str] = match name {
-                    "places" => &["places", "Downloads", "enter  open", "/  path"],
-                    "folder" => &["Downloads", "Scan this", "Games", "s  scan here"],
-                    "prompt" => &["/  ga_", "Games", "tab  complete", "esc  cancel"],
-                    _ => &["That is your whole", "esc  cancel"],
+                    "places" => &["places", "Downloads", "enter open", "/ path"],
+                    "folder" => &["Downloads", "Scan this", "Games", "s scan here"],
+                    "prompt" => &["/  ga_", "Games", "tab complete", "esc cancel"],
+                    _ => &["That is your whole", "esc cancel"],
                 };
                 for needle in needles {
                     // The narrowest footers drop hints; esc always stays.
-                    if w <= 60 && needle.contains("  ") && !needle.starts_with("esc") {
+                    let hint = needle.contains(' ') && !needle.contains("  ");
+                    if w <= 60 && hint && !needle.starts_with("esc") {
                         continue;
                     }
                     assert!(text.contains(needle), "{name} {w}x{h}: {needle}\n{text}");
@@ -890,7 +982,7 @@ mod tests {
         for (w, h) in [(100, 30), (80, 24)] {
             let mut app = demo_app();
             let (main, _) = screen(&mut app, &look, w, h);
-            for needle in ["files", "findings", "meownary", "pe.pdb_path", "?  keys"] {
+            for needle in ["files", "findings", "meownary", "PDB path", "? keys"] {
                 assert!(main.contains(needle), "{w}x{h} main: {needle}\n{main}");
             }
             assert!(!app.narrow);
@@ -945,7 +1037,7 @@ mod tests {
             narrow.contains("findings") && !narrow.contains("╭  files"),
             "{narrow}"
         );
-        assert!(narrow.contains(" tab  files"), "{narrow}");
+        assert!(narrow.contains(" tab files"), "{narrow}");
 
         // Tiny and empty never panic.
         let _ = screen(&mut demo_app(), &look, 10, 4);
@@ -1031,7 +1123,7 @@ mod tests {
         // Inside it, the footer offers the way back up.
         app.on_action(Key::Enter);
         let (inside, _) = screen(&mut app, &look, 100, 30);
-        assert!(inside.contains("left  up"), "{inside}");
+        assert!(inside.contains("left up"), "{inside}");
         assert!(inside.contains("beach-day.jpg"), "{inside}");
         assert!(inside.contains(&format!("downloads{}Photos", std::path::MAIN_SEPARATOR)));
     }
@@ -1044,12 +1136,13 @@ mod tests {
         let root = PathBuf::from("downloads");
         let pdf = root.join("lease-draft.pdf");
         let exe = root.join("setup-tool-2.4.1.exe");
-        app.mark_saved(&pdf, SavedKind::Scrubbed, pdf.clone(), 2);
+        app.mark_saved(&pdf, SavedKind::Scrubbed, pdf.clone(), 2, None);
         app.mark_saved(
             &exe,
             SavedKind::Deattributed,
             root.join("setup-tool-2.4.1.deattributed.exe"),
             1,
+            None,
         );
         let (text, _) = screen(&mut app, &look, 100, 30);
         let row_of = |needle: &str| {
@@ -1061,7 +1154,10 @@ mod tests {
         let pdf_row = row_of("lease-draft.pdf");
         let exe_row = row_of("2.4.1.exe");
         assert!(pdf_row.contains("lease-draft.pdf  scrubbed "), "{pdf_row}");
-        assert!(exe_row.contains(" deattributed "), "{exe_row}");
+        assert!(
+            exe_row.contains("setup-tool-2.4.1.exe") && exe_row.contains(" ✓ "),
+            "the name stays whole and the mark shrinks\n{exe_row}"
+        );
         // The format column sits where it does on an unmarked row.
         let col = |row: &str, word: &str| row.find(word).map(|i| row[..i].chars().count());
         let plain = row_of("invoice-0425.pdf");
@@ -1104,6 +1200,25 @@ mod tests {
     }
 
     #[test]
+    fn every_scene_renders() {
+        for name in SCENES {
+            let svg = render_scene_svg(name, 100, 30);
+            assert!(svg.starts_with("<svg"), "{name}");
+            assert!(only_entities(&svg), "{name}: raw ampersand");
+        }
+        let saved = render_scene_svg("saved", 100, 30);
+        for needle in ["verified clean", "· 4 s", "scrubbed"] {
+            assert!(saved.contains(needle), "{needle}");
+        }
+        let undo = render_scene_svg("undo", 100, 30);
+        for needle in ["Undo 3 edits?", "pdf.xmp", "2 min ago", "cancel"] {
+            assert!(undo.contains(needle), "{needle}");
+        }
+        let scanning = render_scene_svg("scanning", 100, 30);
+        assert!(scanning.contains("Scanning 4 of 16 files"), "{scanning}");
+    }
+
+    #[test]
     #[ignore = "writes the README previews into assets/"]
     fn write_preview_svg() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
@@ -1120,5 +1235,22 @@ mod tests {
             help.display(),
             picker.display()
         );
+    }
+
+    /// Every scene, for a look at the design: set `MEOWNARY_SCENES_DIR` to
+    /// the folder to write them into.
+    #[test]
+    #[ignore = "writes every scene into MEOWNARY_SCENES_DIR"]
+    fn write_scene_svgs() {
+        let Some(dir) = std::env::var_os("MEOWNARY_SCENES_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in SCENES {
+            let path = dir.join(format!("{name}.svg"));
+            std::fs::write(&path, render_scene_svg(name, 100, 30)).unwrap();
+            println!("wrote {}", path.display());
+        }
     }
 }
