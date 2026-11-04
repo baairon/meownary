@@ -177,8 +177,13 @@ These apply to every precision command:
 - `--help` or `-h` anywhere (outside option values, before `--`) prints the
   precision help and exits 0.
 - Paths are passed through as raw OS strings, so non-UTF-8 file names work.
-- Inputs must be regular files. Symbolic links, including symbolic-link parent
-  folders, are refused with exit 2.
+- Inputs must be regular files. An input, an existing output or a pack folder
+  that is itself a symbolic link is refused with exit 2. Links in parent
+  folders resolve like any other path, so macOS `/tmp` and `/var` and Windows
+  junctions work.
+- Paths are compared in one resolved spelling, so two names for the same place
+  (`/var` and `/private/var`, or a Windows 8.3 short name and its long name)
+  count as the same file in every collision check.
 
 Legacy commands use a stricter parser: option values may not start with `-`,
 and unknown options exit 2.
@@ -728,7 +733,7 @@ Common precision messages. All exit 2 unless noted.
 | `--x does not apply to this command` | option belongs to another verb | drop it |
 | `duplicate option: --x` | option given twice | pass it once |
 | `expected N positional path(s)` | wrong number of paths | `diff` and `verify` take two; others take one |
-| `symbolic links are not followed` | the input or a parent folder is a link | resolve the link first |
+| `symbolic links are not followed` | the input or an existing output is itself a link | pass the link's target instead |
 | `expected a regular file` | a folder or device was given | use `inventory` or `clean` for folders |
 | `choose exactly one --text or --hex` | zero or both patterns | pass one |
 | `text matching options do not apply to hex search` | `--encoding`/`--boundary`/`--ignore-case` with hex | drop them |

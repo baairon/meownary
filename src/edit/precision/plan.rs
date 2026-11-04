@@ -270,14 +270,12 @@ fn check_requests(requests: &[Request], size: u64) -> io::Result<u64> {
     Ok(output_size)
 }
 
+/// An existing regular file that is not itself a symbolic link. Links in
+/// parent folders resolve like any other path, so system aliases such as
+/// macOS `/var` and Windows junctions keep working.
 pub fn regular(path: &Path) -> io::Result<()> {
-    for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
-            return Err(invalid("symbolic links are not followed"));
-        }
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(invalid("symbolic links are not followed"));
     }
     if !fs::metadata(path)?.is_file() {
         return Err(invalid("expected a regular file"));
@@ -660,24 +658,41 @@ impl EditPlan {
     }
 }
 
-pub fn output_path(path: &Path) -> io::Result<PathBuf> {
+/// One spelling per location: the deepest existing ancestor of `path` is
+/// canonicalized and the rest of the path is appended. Two spellings of the
+/// same place, such as macOS `/var` and `/private/var` or a Windows 8.3 short
+/// name and its long name, resolve equal, so compare paths only in this form.
+pub fn resolved(path: &Path) -> io::Result<PathBuf> {
     let absolute = std::path::absolute(path)?;
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| invalid("output has no parent"))?;
-    for ancestor in parent.ancestors() {
-        if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
-            return Err(invalid("output parents cannot be symbolic links"));
+    let mut base = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if fs::symlink_metadata(base).is_ok() {
+            let mut out = fsio::canonical(base)?;
+            out.extend(rest.iter().rev());
+            return Ok(out);
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                base = parent;
+            }
+            _ => return Ok(absolute),
         }
     }
-    if path.exists() {
+}
+
+/// Where a written file lands, in [`resolved`] form. An existing output must
+/// be a regular file and never a symbolic link.
+pub fn output_path(path: &Path) -> io::Result<PathBuf> {
+    if fs::symlink_metadata(path).is_ok() {
         regular(path)?;
     }
-    Ok(fsio::canonical(parent)?.join(
-        absolute
-            .file_name()
-            .ok_or_else(|| invalid("output needs a filename"))?,
-    ))
+    let destination = resolved(path)?;
+    if destination.file_name().is_none() {
+        return Err(invalid("output needs a filename"));
+    }
+    Ok(destination)
 }
 
 /// A hard link publishes a complete sibling without replacing a racing writer.
@@ -746,4 +761,58 @@ pub struct ApplyReport {
     pub operations: usize,
     pub undo_id: Option<u64>,
     pub verified: VerifyReport,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_spells_new_and_existing_paths_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.bin");
+        fs::write(&file, b"x").unwrap();
+        let canonical = fsio::canonical(dir.path()).unwrap();
+        assert_eq!(resolved(&file).unwrap(), canonical.join("a.bin"));
+        assert_eq!(
+            resolved(&dir.path().join("new").join("deeper").join("b.bin")).unwrap(),
+            canonical.join("new").join("deeper").join("b.bin")
+        );
+        assert_eq!(output_path(&file).unwrap(), canonical.join("a.bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_parent_folders_resolve_but_linked_files_are_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let file = real.join("a.bin");
+        fs::write(&file, b"x").unwrap();
+        // A file reached through a linked folder, like macOS /var, is an input.
+        regular(&alias.join("a.bin")).unwrap();
+        // Both spellings of one place compare equal, existing or not.
+        assert_eq!(
+            resolved(&alias.join("a.bin")).unwrap(),
+            resolved(&file).unwrap()
+        );
+        assert_eq!(
+            output_path(&alias.join("b.bin")).unwrap(),
+            output_path(&real.join("b.bin")).unwrap()
+        );
+        // A link as the file itself is never followed, as input or output.
+        let link = real.join("link.bin");
+        symlink(&file, &link).unwrap();
+        assert_eq!(
+            regular(&link).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            output_path(&link).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }

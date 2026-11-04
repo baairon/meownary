@@ -1195,13 +1195,11 @@ fn archive_command(argv: &[OsString], out: &mut dyn Write, json_output: bool) ->
         && let Some(path) = a.path("--manifest")
     {
         let destination = plan::output_path(&path)?;
-        let input = crate::edit::fsio::canonical(&paths[0])?;
+        let input = plan::resolved(&paths[0])?;
+        let output = a.path("--output").map(|p| plan::resolved(&p)).transpose()?;
         if destination == input
             || (input.is_dir() && destination.starts_with(&input))
-            || a.path("--output").is_some_and(|p| {
-                std::path::absolute(p)
-                    .is_ok_and(|p| destination == p || destination.starts_with(&p))
-            })
+            || output.is_some_and(|o| destination == o || destination.starts_with(&o))
         {
             return Err(invalid("manifest must be separate from input and output"));
         }

@@ -451,12 +451,10 @@ pub fn pack_with_metadata(
     normalize: bool,
 ) -> io::Result<Manifest> {
     let destination = plan::output_path(output)?;
-    for ancestor in std::path::absolute(root)?.ancestors() {
-        if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
-            return Err(invalid("pack input cannot contain symbolic links"));
-        }
+    if fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(invalid("pack input cannot be a symbolic link"));
     }
-    let root = crate::edit::fsio::canonical(root)?;
+    let root = plan::resolved(root)?;
     if destination.starts_with(&root) {
         return Err(invalid(
             "archive output must be outside its input directory",

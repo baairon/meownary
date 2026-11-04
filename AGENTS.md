@@ -37,7 +37,11 @@ cargo package --locked --allow-dirty --no-verify
 ```
 
 - **MSRV** is Rust 1.88: CI also runs `cargo check --all-targets --locked` on
-  1.88.0, so avoid newer language and library features.
+  1.88.0, so avoid newer language and library features. Locked dependencies
+  count too: run `cargo +1.88.0 check --all-targets --locked` before pushing,
+  and when a crate's new release raises its `rust-version`, pin the last
+  compatible one with `cargo update <crate> --precise <version>` (uuid is held
+  at 1.26.1 for this reason).
 - **Features**: `tui` is the only feature and is on by default. Everything
   outside `src/tui/` must build and pass tests with `--no-default-features`.
 - **Tests on all three platforms**: the GitHub test job runs on Linux, macOS
@@ -46,8 +50,14 @@ cargo package --locked --allow-dirty --no-verify
 - **Windows shells**: from Git Bash, coreutils `link` can shadow the MSVC
   `link.exe`. Use the GNU toolchain (`RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu`)
   or a Developer PowerShell when MSVC linking fails with `extra operand`.
-- Use `cargo test --no-fail-fast` to see every failing target at once; plain
-  `cargo test` stops after the first failing test binary.
+- CI and local runs use `cargo test --no-fail-fast`, which reports every
+  failing target at once; plain `cargo test` stops after the first failing
+  test binary and hides the rest.
+- **Path aliases**: macOS temp folders sit behind the `/var` symlink and
+  Windows CI temp paths use 8.3 short names (`RUNNER~1`). Reproduce both before
+  pushing path code: run the suite with `TMPDIR` pointing through a symlinked
+  folder on Linux, and with `TMP` and `TEMP` set to a short-name path on
+  Windows (`cygpath -d` prints one).
 
 ## Source map
 
@@ -73,7 +83,10 @@ cargo package --locked --allow-dirty --no-verify
 
 - `unsafe_code` is forbidden crate-wide.
 - No network access, no execution of scanned files, no following of symbolic
-  links.
+  links as inputs, outputs or archive entries. Parent folders resolve
+  normally.
+- Compare paths only after `plan::resolved` (in `src/edit/precision/plan.rs`),
+  never an absolute spelling against a canonical one.
 - Originals are changed only by journaled operations (scrub, delete,
   `--in-place`), and the journal record is synced before the file changes.
 - Copies, plans and manifests are written to a temporary sibling, verified, and
