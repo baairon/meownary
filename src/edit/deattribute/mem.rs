@@ -121,37 +121,10 @@ pub(super) fn deattribute_with_mode(
     mode: Mode,
 ) -> MemOutcome {
     let view = SliceView::new(name, data);
-    let mut report = FileReport::new(view.path.clone(), data.len() as u64);
-    let mut panicked = false;
-    let (format, mut findings) = match guard::guarded(|| parsers::identify(&view)) {
-        Ok(found) => found,
-        Err(()) => {
-            panicked = true;
-            (None, Vec::new())
-        }
-    };
-    report.format = format.map(str::to_string);
-    if is_container(format) {
+    let report = report_bytes(&view, registry);
+    if is_container(report.format.as_deref()) {
         return MemOutcome::default();
     }
-    for probe in registry {
-        let wanted = probe.formats();
-        if !wanted.is_empty() && !format.is_some_and(|f| wanted.contains(&f)) {
-            continue;
-        }
-        let ctx = crate::scan::ProbeCtx::new(&view, format);
-        match guard::guarded(|| {
-            let mut local = Vec::new();
-            probe.run(&ctx, &mut local);
-            local
-        }) {
-            Ok(mut local) => findings.append(&mut local),
-            Err(()) => panicked = true,
-        }
-    }
-    report.findings = findings;
-    report.partial = panicked;
-
     let file_plan = match guard::guarded(|| plan_mode(&report, &view, mode)) {
         Ok(p) => p,
         Err(()) => {
@@ -167,8 +140,51 @@ pub(super) fn deattribute_with_mode(
             out.skipped.push(skip.reason);
         }
     }
+    out.bytes = apply(data, &file_plan.targets, &mut out);
+    out
+}
+
+/// Identify one buffer and run every probe that applies to it, as a scan of
+/// the file on disk would. A probe that panics marks the report partial.
+fn report_bytes(view: &SliceView, registry: &Registry) -> FileReport {
+    let mut report = FileReport::new(view.path.clone(), view.data.len() as u64);
+    let mut panicked = false;
+    let (format, mut findings) = match guard::guarded(|| parsers::identify(view)) {
+        Ok(found) => found,
+        Err(()) => {
+            panicked = true;
+            (None, Vec::new())
+        }
+    };
+    report.format = format.map(str::to_string);
+    if is_container(format) {
+        return report;
+    }
+    for probe in registry {
+        let wanted = probe.formats();
+        if !wanted.is_empty() && !format.is_some_and(|f| wanted.contains(&f)) {
+            continue;
+        }
+        let ctx = crate::scan::ProbeCtx::new(view, format);
+        match guard::guarded(|| {
+            let mut local = Vec::new();
+            probe.run(&ctx, &mut local);
+            local
+        }) {
+            Ok(mut local) => findings.append(&mut local),
+            Err(()) => panicked = true,
+        }
+    }
+    report.findings = findings;
+    report.partial = panicked;
+    report
+}
+
+/// `data` with every target's new bytes in place, counting what was blanked
+/// in `out`. `None` when no target could be applied.
+fn apply(data: &[u8], targets: &[super::Target], out: &mut MemOutcome) -> Option<Vec<u8>> {
     let mut buf: Option<Vec<u8>> = None;
-    for target in &file_plan.targets {
+    for target in targets {
         let RemovalStrategy::RawBlank { fill } = target.marker.removal else {
             note(&mut out.skipped, Reason::Unsafe);
             continue;
@@ -201,8 +217,84 @@ pub(super) fn deattribute_with_mode(
             Kind::Patch => out.patch += 1,
         }
     }
-    out.bytes = buf;
-    out
+    buf
+}
+
+/// Verify one archive entry's copy the way [`super::verify_copy`] verifies
+/// the same file on disk: plan the original entry, and when that plan edits
+/// it, require the copy to be exactly the original with those edits, keep the
+/// format, plan nothing more and pass the original's audit. An entry the plan
+/// leaves alone is not judged, as a standalone file with nothing to edit is
+/// never written. `name` is the entry's file name, as cleaning used.
+pub(super) fn verify_entry(
+    name: &str,
+    original: &[u8],
+    copy: &[u8],
+    registry: &Registry,
+    mode: Mode,
+) -> super::Verified {
+    let failed = super::Verified {
+        clean: false,
+        partial: false,
+        residual: None,
+    };
+    let view = SliceView::new(name, original);
+    let report = report_bytes(&view, registry);
+    if is_container(report.format.as_deref()) {
+        return super::Verified {
+            clean: original == copy,
+            ..failed
+        };
+    }
+    let Ok(plan) = guard::guarded(|| plan_mode(&report, &view, mode)) else {
+        return failed;
+    };
+    if plan.targets.is_empty() {
+        return super::Verified {
+            clean: original == copy,
+            ..failed
+        };
+    }
+    let expected = apply(original, &plan.targets, &mut MemOutcome::default());
+    let byte_integrity = expected.as_deref().unwrap_or(original) == copy;
+    let copy_view = SliceView::new(name, copy);
+    let again = report_bytes(&copy_view, registry);
+    let mut structure_valid = again.format == report.format;
+    if report.format.as_deref() == Some("pe") {
+        structure_valid &= parsers::pe::image::PeImage::parse(&copy_view)
+            .is_some_and(|p| p.layout_ok())
+            && super::deep::imports_unchanged(&view, &copy_view);
+    }
+    let mut complete = !report.partial
+        && !again.partial
+        && plan.errors.is_empty()
+        && !plan.skipped.iter().any(|s| {
+            matches!(
+                s.reason,
+                Reason::Io | Reason::Changed | Reason::MalformedMetadata | Reason::DeepBudget
+            )
+        });
+    let mut clean = guard::guarded(|| plan_mode(&again, &copy_view, mode))
+        .is_ok_and(|p| p.targets.is_empty() && p.errors.is_empty());
+    let mut residual = None;
+    if let Some(audit) = &plan.audit {
+        match audit.verify(&copy_view) {
+            Ok(found) => {
+                complete &= found.complete;
+                clean &= found.clean;
+                residual = found
+                    .residuals
+                    .first()
+                    .map(|r| super::residual_label(report.format.as_deref(), &r.region));
+            }
+            Err(_) => complete = false,
+        }
+    }
+    super::Verified {
+        clean: byte_integrity && structure_valid && complete && clean,
+        partial: !complete,
+        residual,
+    }
 }
 
 fn note(reasons: &mut Vec<Reason>, reason: Reason) {

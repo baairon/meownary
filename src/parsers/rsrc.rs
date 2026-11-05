@@ -17,6 +17,11 @@ pub(crate) struct Resource {
 pub(crate) struct Fork {
     pub resources: Vec<Resource>,
     pub apple_double: bool,
+    /// Where the fork starts in the file: 0, or the AppleDouble entry's offset.
+    pub base: u64,
+    /// The data and map ranges, as absolute `(offset, len)`.
+    pub data: (u64, u64),
+    pub map: (u64, u64),
 }
 
 fn read(view: &dyn FileView, at: u64, len: usize) -> Option<Vec<u8>> {
@@ -134,5 +139,8 @@ pub(crate) fn parse(view: &dyn FileView) -> Option<Fork> {
     Some(Fork {
         resources,
         apple_double,
+        base,
+        data: (base + data_off, data_len),
+        map: (base + map_off, map_len),
     })
 }

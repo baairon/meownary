@@ -149,9 +149,6 @@ pub fn verify_copy(
     if !matches!(found, Ok(Some(scan)) if scan.patches.is_empty()) {
         return (false, None);
     }
-    if mode != super::Mode::Deep {
-        return (true, None);
-    }
     let unpack = |path: &Path| -> Option<Vec<u8>> {
         let bytes = fs::read(path).ok()?;
         if gz {
@@ -163,10 +160,13 @@ pub fn verify_copy(
     let (Some(original_tar), Some(output_tar)) = (unpack(original), unpack(output)) else {
         return (false, None);
     };
-    match pe_residual_in_entries(&original_tar, &output_tar) {
-        Ok(Some(category)) => return (false, Some(category)),
-        Ok(None) => {}
+    match residual_in_entries(&original_tar, &output_tar, mode) {
+        Ok((true, _)) => {}
+        Ok((false, residual)) => return (false, residual),
         Err(()) => return (false, None),
+    }
+    if mode != super::Mode::Deep {
+        return (true, None);
     }
     let Some(terms) = original_pe_terms(&original_tar) else {
         return (false, None);
@@ -185,20 +185,25 @@ pub fn verify_copy(
     (clean, (!clean).then_some("tar metadata"))
 }
 
-/// Audit every PE entry of the output tar against the same entry of the
-/// original: a tar copy changes bytes in place, so the two line up, and an
-/// output that differs in length or holds an entry that no longer parses
-/// cannot be judged. The first category still carrying an original identity
-/// is returned.
-fn pe_residual_in_entries(original: &[u8], output: &[u8]) -> Result<Option<&'static str>, ()> {
+/// Audit every entry of the output tar against the same entry of the
+/// original, the way the entry would be verified on its own, and in deep mode
+/// with the PE identity check too. A tar copy changes bytes in place, so the
+/// two line up, and an output that differs in length or holds a PE entry that
+/// no longer parses cannot be judged. The verdict and the first residual.
+fn residual_in_entries(
+    original: &[u8],
+    output: &[u8],
+    mode: super::Mode,
+) -> Result<(bool, Option<&'static str>), ()> {
     if original.len() != output.len() {
         return Err(());
     }
+    let registry = crate::parsers::registry();
     let mut cursor = Cursor::new(output);
     let mut src = Seekable::new(&mut cursor, output.len() as u64).map_err(|_| ())?;
-    let mut residual = None;
+    let mut verdict = None;
     let ended = walk(&mut src, |entry, src| {
-        if residual.is_some()
+        if verdict.is_some()
             || !entry.is_file()
             || entry.size == 0
             || entry.sparse
@@ -217,22 +222,31 @@ fn pe_residual_in_entries(original: &[u8], output: &[u8]) -> Result<Option<&'sta
         else {
             return Err(EditError::Changed);
         };
-        let original_view = super::mem::SliceView::new(&entry.name, before);
-        if crate::parsers::pe::image::PeImage::parse(&original_view).is_none() {
-            return Ok(true);
+        let name = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+        let original_view = super::mem::SliceView::new(name, before);
+        if mode == super::Mode::Deep
+            && crate::parsers::pe::image::PeImage::parse(&original_view).is_some()
+        {
+            let copy_view = super::mem::SliceView::new(name, &copy);
+            if crate::parsers::pe::image::PeImage::parse(&copy_view).is_none() {
+                return Err(EditError::Changed);
+            }
+            if let Some(category) = super::deep::residual_category(&original_view, &copy_view) {
+                verdict = Some((false, Some(category)));
+                return Ok(true);
+            }
         }
-        let copy_view = super::mem::SliceView::new(&entry.name, &copy);
-        if crate::parsers::pe::image::PeImage::parse(&copy_view).is_none() {
-            return Err(EditError::Changed);
+        let checked = super::mem::verify_entry(name, before, &copy, &registry, mode);
+        if !checked.ok() {
+            verdict = Some((false, checked.residual));
         }
-        residual = super::deep::residual_category(&original_view, &copy_view);
         Ok(true)
     })
     .map_err(|_| ())?;
     if ended != Some(Stop::End) {
         return Err(());
     }
-    Ok(residual)
+    Ok(verdict.unwrap_or((true, None)))
 }
 
 fn original_pe_terms(tar: &[u8]) -> Option<BTreeSet<String>> {

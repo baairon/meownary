@@ -814,7 +814,7 @@ fn find(hay: &[u8], needle: &[u8]) -> usize {
 fn spaces(n: usize) -> String {
     " ".repeat(n)
 }
-fn pstr(text: &[u8]) -> Vec<u8> {
+pub(crate) fn pstr(text: &[u8]) -> Vec<u8> {
     let mut v = vec![text.len() as u8];
     v.extend_from_slice(text);
     v
@@ -1895,11 +1895,11 @@ fn signatures_out_of_reach_are_reported_instead_of_blanked() {
 }
 
 /// A resource's type, its name if it has one, and its data.
-type Resource<'a> = (&'a [u8; 4], Option<&'a [u8]>, Vec<u8>);
+pub(crate) type Resource<'a> = (&'a [u8; 4], Option<&'a [u8]>, Vec<u8>);
 
 /// A Macintosh resource fork with resource data from 0x100 on and the map
 /// after it. Every type holds one resource, named or not.
-fn resource_fork(resources: &[Resource<'_>]) -> Vec<u8> {
+pub(crate) fn resource_fork(resources: &[Resource<'_>]) -> Vec<u8> {
     let mut data = Vec::new();
     let mut at = Vec::new();
     for (_, _, body) in resources {
@@ -1943,7 +1943,7 @@ fn resource_fork(resources: &[Resource<'_>]) -> Vec<u8> {
 }
 
 /// An AppleDouble file holding empty Finder info and then `fork`.
-fn apple_double(fork: &[u8]) -> Vec<u8> {
+pub(crate) fn apple_double(fork: &[u8]) -> Vec<u8> {
     let mut b = vec![0, 5, 0x16, 7, 0, 2, 0, 0];
     b.resize(24, 0);
     b.extend(2u16.to_be_bytes());
@@ -2087,5 +2087,203 @@ fn resource_forks_clean_strings_and_pipl_and_keep_resource_names() {
                 .bytes
                 .is_none()
         );
+    }
+}
+
+#[test]
+fn import_address_tables_are_kept_without_an_iat_directory() {
+    // Regular imports from `pe_fixture` (lookup table 0x840, address table
+    // 0x860) and delay imports in both forms (name table 0x960, address
+    // table 0x970). None of the images has an IAT directory, and each
+    // address table holds a bound slot whose bytes read as an identity.
+    let cases = [
+        ("regular", pe_fixture(0x1234), 0x840usize, 0x860usize),
+        ("rva delay", delay_import_fixture(false), 0x960, 0x970),
+        ("va delay", delay_import_fixture(true), 0x960, 0x970),
+    ];
+    for (label, mut source, lookup, iat) in cases {
+        assert_eq!(u32_of(&source, OPT + 112 + 12 * 8), 0, "{label}: no IAT");
+        put(&mut source, iat, b"NovaFlow");
+        let out = deep("x.dll", &source);
+        assert_eq!(
+            out[lookup..lookup + 16],
+            source[lookup..lookup + 16],
+            "{label}"
+        );
+        assert_eq!(out[iat..iat + 16], source[iat..iat + 16], "{label}");
+        assert!(!has(&out[0x300..0x800], b"NovaFlow"), "{label}: the rest");
+        let before = SliceView::new("before", &source);
+        assert!(pe::imports_unchanged(
+            &before,
+            &SliceView::new("after", &out)
+        ));
+        for slot in [lookup, iat] {
+            let mut copy = source.clone();
+            copy[slot] ^= 0x01;
+            assert!(
+                !pe::imports_unchanged(&before, &SliceView::new("after", &copy)),
+                "{label}: an edit at {slot:#x} must fail verification"
+            );
+        }
+    }
+}
+
+/// Plan `source`, saved as `name`, in `mode` with `options`, write the copy
+/// and verify it. Returns the plan, the copy's bytes and the verdict.
+fn plan_on_disk(
+    name: &str,
+    source: &[u8],
+    mode: Mode,
+    options: &crate::edit::deattribute::policy::Options,
+) -> (
+    crate::edit::deattribute::FilePlan,
+    Vec<u8>,
+    crate::edit::deattribute::Verification,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    std::fs::write(&path, source).unwrap();
+    let report = crate::scan::scan_file_detailed(&path, &crate::parsers::registry()).report;
+    let view = crate::scan::WindowedFile::open(&path).unwrap();
+    let plan = crate::edit::deattribute::plan_with_options(&report, &view, mode, options).unwrap();
+    drop(view);
+    let output = crate::edit::deattribute::write_deattributed(
+        &path,
+        report.format.as_deref(),
+        report.size,
+        &plan.targets,
+    )
+    .unwrap();
+    let bytes = std::fs::read(&output).unwrap();
+    let check = crate::edit::deattribute::verify_plan(
+        &path,
+        &output,
+        report.format.as_deref(),
+        &plan,
+        mode,
+    );
+    (plan, bytes, check)
+}
+
+#[test]
+fn a_rule_naming_a_resource_type_keeps_the_map_and_cleans_the_text() {
+    use crate::edit::deattribute::policy::{Options, Rules, VerificationPolicy};
+    let fork = resource_fork(&[
+        (b"STAR", Some(b"STAR name"), vec![1, 2, 3, 4]),
+        (b"STR ", None, pstr(b"STAR Labs build")),
+    ]);
+    for boundary in ["substring", "identifier"] {
+        let rules: Rules = serde_json::from_str(&format!(
+            r#"{{"version":1,"identities":[{{"id":"publisher","scope":"publisher","names":["STAR"],"encodings":["ascii"],"boundary":"{boundary}"}}]}}"#
+        ))
+        .unwrap();
+        let options = Options {
+            rules: Some(rules),
+            ..Options::default()
+        };
+        for (name, source) in [
+            ("Glow.rsrc", fork.clone()),
+            ("._Glow.dll", apple_double(&fork)),
+        ] {
+            let parsed = crate::parsers::rsrc::parse(&SliceView::new(name, &source)).unwrap();
+            let text = find(&source, b"STAR Labs build");
+            for mode in [Mode::Basic, Mode::Deep] {
+                let label = format!("{name} {mode:?} {boundary}");
+                let (plan, bytes, check) = plan_on_disk(name, &source, mode, &options);
+                assert!(!plan.targets.is_empty(), "{label}: the text is cleaned");
+                for target in &plan.targets {
+                    let r = target.marker.region;
+                    assert!(
+                        r.offset >= text as u64 && r.offset + r.len <= text as u64 + 15,
+                        "{label}: a target at {:#x}+{} is outside the string body",
+                        r.offset,
+                        r.len
+                    );
+                }
+                assert!(!has(&bytes[text..text + 15], b"STAR"), "{label}");
+                // The fork sits at the end of its AppleDouble envelope.
+                let base = source.len() - fork.len();
+                assert_eq!(bytes[..base + 16], source[..base + 16], "{label}: headers");
+                let map = base + 0x100 + u32_of(&fork, 8).swap_bytes() as usize;
+                assert_eq!(bytes[map..], source[map..], "{label}: map");
+                let after = crate::parsers::rsrc::parse(&SliceView::new(name, &bytes)).unwrap();
+                let kinds = |f: &crate::parsers::rsrc::Fork| {
+                    f.resources
+                        .iter()
+                        .map(|r| (r.kind, r.off, r.len, r.name))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(kinds(&after), kinds(&parsed), "{label}");
+                assert!(!check.ok(VerificationPolicy::Strict), "{label}: {check:?}");
+                assert!(
+                    check.ok(VerificationPolicy::Protected),
+                    "{label}: {check:?}"
+                );
+                let kind_at = find(&source, b"STAR\0\0") as u64;
+                assert!(
+                    check.residuals.iter().any(|r| r.offset == kind_at
+                        && r.retained.as_deref() == Some("structural record")),
+                    "{label}: {:?}",
+                    check.residuals
+                );
+            }
+        }
+    }
+}
+
+fn capped(format: &str, name: &str, data: &[u8], max: usize) -> Deep {
+    let view = SliceView::new(name, data);
+    sweep_capped(
+        &crate::model::FileReport {
+            format: Some(format.into()),
+            ..crate::model::FileReport::new(name.into(), data.len() as u64)
+        },
+        &view,
+        &crate::edit::precision::pattern::Limits::default(),
+        max,
+    )
+}
+
+fn incomplete(found: &Deep) -> bool {
+    found.skipped.contains(&Reason::DeepBudget)
+        && found.audit.as_ref().is_some_and(|audit| !audit.complete)
+}
+
+#[test]
+fn the_candidate_cap_counts_resource_strings_exactly() {
+    let mut list = 3u16.to_be_bytes().to_vec();
+    for text in [&b"Glimmer Labs"[..], b"Render ready", b"NovaFlow Glow"] {
+        list.extend(pstr(text));
+    }
+    let fork = resource_fork(&[(b"STR#", None, list)]);
+    // Three strings and no raw scan: three fit, two do not.
+    assert!(!incomplete(&capped("rsrc", "x.rsrc", &fork, 3)));
+    assert!(incomplete(&capped("rsrc", "x.rsrc", &fork, 2)));
+    let double = apple_double(&fork);
+    assert!(!incomplete(&capped("appledouble", "._x", &double, 3)));
+    assert!(incomplete(&capped("appledouble", "._x", &double, 2)));
+}
+
+#[test]
+fn the_candidate_cap_counts_parsed_pe_metadata() {
+    let (resources, _) = rsrc_pe(&[
+        (
+            Res::Id(5),
+            dialog("Glimmer NovaFlow Setup", "Copyright 2024 Glimmer Labs"),
+        ),
+        (
+            Res::Id(11),
+            messages("Glimmer license expired.\r\n", "Copyright Glimmer\r\n"),
+        ),
+    ]);
+    let dotnet = dotnet_pe(&clr_metadata(
+        "Glimmer Labs",
+        "NovaFlow Suite",
+        "Glimmer license check failed",
+    ));
+    for (label, source) in [("resources", resources), (".NET", dotnet)] {
+        assert!(incomplete(&capped("pe", "x.dll", &source, 3)), "{label}");
+        let full = capped("pe", "x.dll", &source, MAX_DEEP_STRINGS);
+        assert!(!incomplete(&full), "{label}: {:?}", full.skipped);
     }
 }
