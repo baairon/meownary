@@ -205,20 +205,15 @@ pub struct DeattributeCheck {
     pub policy: deattribute::policy::VerificationPolicy,
     pub audit: Option<deattribute::audit::Audit>,
     pub coverage_complete: bool,
-    /// The input path as it was given when planning, with `/` separators:
-    /// what the rules' `files` globs were matched against, so applying the
-    /// plan matches them the same way wherever it runs. Plans saved before
-    /// this field fall back to the canonical path.
+    /// The input path as it was given when planning, through
+    /// [`logical_path`]: what the rules' `files` globs were matched against,
+    /// so applying the plan matches them the same way wherever it runs.
+    /// Plans saved before this field fall back to the canonical path.
     #[serde(default)]
     pub logical: Option<String>,
 }
 
-/// A path the way `files` globs see it: as typed, with `/` separators and
-/// no leading `./`.
-pub fn logical_path(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
-    text.strip_prefix("./").unwrap_or(&text).to_string()
-}
+pub use crate::edit::deattribute::policy::logical_path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

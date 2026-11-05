@@ -62,6 +62,11 @@ pub fn inspect(view: &dyn crate::scan::FileView) -> Layout {
     if format == Some("pe") {
         return super::deep::pe_layout(view);
     }
+    if matches!(format, Some("rsrc" | "appledouble"))
+        && let Some(layout) = super::deep::rsrc_layout(view)
+    {
+        return layout;
+    }
     let size = view.size();
     let fields: Vec<Span> = match format {
         Some("elf") => crate::parsers::elf::data_regions(view)

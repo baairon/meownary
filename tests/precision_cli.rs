@@ -387,6 +387,72 @@ fn relative_file_selectors_match_on_apply_from_anywhere() {
 }
 
 #[test]
+fn a_plan_made_from_a_dotted_path_applies_and_verifies_from_anywhere() {
+    let fx = Fixture::empty();
+    let root = fx.dir.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::write(root.join("bin").join("file.dll"), b"North Star data\0").unwrap();
+    fs::write(root.join("rules.json"), br#"{"version":1,"identities":[{"id":"publisher","scope":"publisher","names":["North Star"],"encodings":["utf8"],"boundary":"word","files":["bin/*.dll"]}]}"#).unwrap();
+    let spellings: &[&str] = if cfg!(windows) {
+        &["./bin/file.dll", ".\\bin\\file.dll", "bin\\file.dll"]
+    } else {
+        &["./bin/file.dll", ".//bin/./file.dll"]
+    };
+    let elsewhere = tempfile::tempdir().unwrap();
+    for (i, spelling) in spellings.iter().enumerate() {
+        let plan = root.join(format!("plan{i}.json"));
+        common::run_in(
+            fx.state.path(),
+            Some(root),
+            &[
+                "deattribute",
+                spelling,
+                "--rules",
+                "rules.json",
+                "--dry-run",
+                "--plan-out",
+                plan.to_str().unwrap(),
+                "--json",
+            ],
+        )
+        .assert_code(0);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+        assert_eq!(
+            saved["deattribute"]["logical"], "bin/file.dll",
+            "{spelling}: {saved}"
+        );
+        for cwd in [root, elsewhere.path()] {
+            let output = root.join(format!("out{i}.dll"));
+            let _ = fs::remove_file(&output);
+            common::run_in(
+                fx.state.path(),
+                Some(cwd),
+                &[
+                    "apply",
+                    plan.to_str().unwrap(),
+                    "--output",
+                    output.to_str().unwrap(),
+                    "--json",
+                ],
+            )
+            .assert_code(0);
+            assert_eq!(fs::read(&output).unwrap(), b"           data\0");
+            common::run_in(
+                fx.state.path(),
+                Some(cwd),
+                &[
+                    "verify",
+                    plan.to_str().unwrap(),
+                    output.to_str().unwrap(),
+                    "--json",
+                ],
+            )
+            .assert_code(0);
+        }
+    }
+}
+
+#[test]
 fn malformed_pe_is_not_edited_and_header_edits_require_raw() {
     let fx = Fixture::empty();
     let input = fx.dir.path().join("input.exe");
@@ -576,4 +642,74 @@ fn changed_payloads_and_tampered_plans_leave_existing_output_intact() {
     fs::write(&plan, serde_json::to_vec(&value).unwrap()).unwrap();
     run(fx.state.path(), &apply).assert_code(2);
     assert_eq!(fs::read(&output).unwrap(), b"existing output");
+}
+
+#[test]
+fn an_excluded_utf16_credit_is_audited_in_either_byte_order() {
+    for (encoding, units) in [
+        ("utf16le", (|c: u16| c.to_le_bytes()) as fn(u16) -> [u8; 2]),
+        ("utf16be", |c: u16| c.to_be_bytes()),
+    ] {
+        let fx = Fixture::empty();
+        let input = fx.dir.path().join("input.exe");
+        let rules = fx.dir.path().join("rules.json");
+        let output = fx.dir.path().join("output.exe");
+        let mut bytes = common::pe_bytes();
+        // Two bullets (U+2022) sit right before the credit: punctuation
+        // whose bytes are nonzero in either order, so the credit starts on a
+        // word boundary with no zero byte ahead of it.
+        bytes.extend(
+            "\u{2022}\u{2022}patched by North Star"
+                .encode_utf16()
+                .chain([0])
+                .flat_map(units),
+        );
+        fs::write(&input, &bytes).unwrap();
+        fs::write(
+            &rules,
+            format!(
+                r#"{{"version":1,"exclusions":[{{"kind":"text","value":"North Star","encoding":"{encoding}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let args = |policy: &'static str| {
+            vec![
+                "deattribute".to_string(),
+                input.to_str().unwrap().to_string(),
+                "--rules".into(),
+                rules.to_str().unwrap().into(),
+                "--verify".into(),
+                policy.into(),
+                "--output".into(),
+                output.to_str().unwrap().into(),
+                "--json".into(),
+            ]
+        };
+        let strict_args = args("strict");
+        let strict_args: Vec<&str> = strict_args.iter().map(String::as_str).collect();
+        let strict = run(fx.state.path(), &strict_args);
+        strict.assert_code(75);
+        assert!(!output.exists(), "{encoding}: {}", strict.stdout);
+        let protected_args = args("protected");
+        let protected_args: Vec<&str> = protected_args.iter().map(String::as_str).collect();
+        let protected = run(fx.state.path(), &protected_args);
+        protected.assert_code(0);
+        let events = protected.events();
+        let report = events
+            .iter()
+            .find(|e| e["event"] == "verification")
+            .unwrap_or_else(|| panic!("{encoding}: {}", protected.stdout));
+        let residuals = report["data"]["audit"]["residuals"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{encoding}: {}", protected.stdout));
+        assert!(
+            !residuals.is_empty()
+                && residuals
+                    .iter()
+                    .all(|r| r["retained"] == "explicit exclusion"),
+            "{encoding}: {}",
+            protected.stdout
+        );
+        assert_eq!(fs::read(&input).unwrap(), bytes, "{encoding}");
+    }
 }

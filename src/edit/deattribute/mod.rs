@@ -352,10 +352,12 @@ pub fn plan_with_options(
     }
     // Non-native container parsers authorize individual metadata fields. Their
     // markers do not make surrounding container bytes available to raw edits.
+    // A resource fork's own parser already names every editable field, so a
+    // finding marker never widens it into the map or the headers.
     if report
         .format
         .as_deref()
-        .is_some_and(|f| !matches!(f, "pe" | "elf" | "macho"))
+        .is_some_and(|f| !matches!(f, "pe" | "elf" | "macho" | "rsrc" | "appledouble"))
     {
         for finding in &report.findings {
             if select(&finding.category, &finding.signature_id).is_some()
@@ -1156,8 +1158,22 @@ pub fn verify_copy(
     };
     planned.targets = targets.to_vec();
     let result = verify_plan(original, output, format, &planned, mode);
-    let residual = result.residuals.first().map(|r| match format {
-        Some("pe") => match r.region.as_str() {
+    let residual = result
+        .residuals
+        .first()
+        .map(|r| residual_label(format, &r.region));
+    Verified {
+        clean: result.ok(policy::VerificationPolicy::Strict),
+        partial: !result.coverage_complete,
+        residual,
+    }
+}
+
+/// The category a verdict names for the first residual left in `region` of
+/// a file in `format`.
+pub(super) fn residual_label(format: Option<&str>, region: &str) -> &'static str {
+    match format {
+        Some("pe") => match region {
             "PE code" => "PE code",
             "PE header" => "PE header",
             "PE overlay" => "PE overlay",
@@ -1166,11 +1182,6 @@ pub fn verify_copy(
         Some("elf") => "ELF data",
         Some("macho") => "Mach-O data",
         _ => "file data",
-    });
-    Verified {
-        clean: result.ok(policy::VerificationPolicy::Strict),
-        partial: !result.coverage_complete,
-        residual,
     }
 }
 
@@ -1244,27 +1255,29 @@ fn audit_credit_patterns(
     Ok(())
 }
 
-/// Whether `bytes`, less trailing NULs, read as text of at least four
-/// characters with no control characters, as UTF-8 or as UTF-16LE.
+/// Whether `bytes` read as text of at least four characters with no control
+/// characters, as UTF-8 or as UTF-16 in either byte order. Terminators are
+/// trimmed by whole units, so a UTF-16 character whose high or low byte is
+/// zero, and the two-byte terminator after it, are never split.
 fn readable_credit(bytes: &[u8]) -> bool {
-    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    let trimmed = &bytes[..end];
+    use crate::edit::precision::pattern::Encoding;
     let readable = |text: &str| text.chars().count() >= 4 && !text.chars().any(char::is_control);
-    if let Ok(text) = std::str::from_utf8(trimmed)
-        && readable(text)
-    {
+    let utf8 = &bytes[..bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)];
+    if std::str::from_utf8(utf8).is_ok_and(readable) {
         return true;
     }
-    if !trimmed.len().is_multiple_of(2) {
+    if !bytes.len().is_multiple_of(2) {
         return false;
     }
-    let units: Vec<u16> = trimmed
-        .as_chunks::<2>()
-        .0
+    let units = bytes.as_chunks::<2>().0;
+    let end = units
         .iter()
-        .map(|c| u16::from_le_bytes(*c))
-        .collect();
-    String::from_utf16(&units).is_ok_and(|text| readable(&text))
+        .rposition(|u| *u != [0, 0])
+        .map_or(0, |i| i + 1);
+    let trimmed = &bytes[..end * 2];
+    [Encoding::Utf16le, Encoding::Utf16be]
+        .into_iter()
+        .any(|encoding| encoding.decode(trimmed).is_some_and(|text| readable(&text)))
 }
 
 /// Stream both files and compare, with each target's new bytes laid over the
@@ -1443,6 +1456,35 @@ mod tests {
 
     fn named(p: &str) -> PathBuf {
         deattributed_name(Path::new(p))
+    }
+
+    #[test]
+    fn utf16_credits_are_read_by_whole_units_in_either_byte_order() {
+        let le = |text: &str| -> Vec<u8> {
+            text.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        let be = |text: &str| -> Vec<u8> {
+            text.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_be_bytes)
+                .collect()
+        };
+        // `r` has a zero high byte, `\u{100}` a zero low byte, and each is
+        // followed by its two-byte terminator.
+        for text in ["North Star", "North Sta\u{100}"] {
+            assert!(readable_credit(&le(text)), "{text:?} LE");
+            assert!(readable_credit(&be(text)), "{text:?} BE");
+        }
+        assert!(readable_credit(b"North Star\0\0"), "UTF-8 still reads");
+        assert!(!readable_credit(&le("abc")), "too short");
+        assert!(
+            !readable_credit(&[b'N', 0, b'o', 0, b'r', 0, b't', 0, b'h']),
+            "half a character"
+        );
+        assert!(!readable_credit(&[0; 8]), "a zeroed field");
     }
 
     #[test]

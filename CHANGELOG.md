@@ -79,6 +79,32 @@ All notable changes to meownary are recorded here. The format follows
 - **Deep string discovery** keeps at most 500,000 candidates per sweep and
   reports incomplete coverage past that, and the PE sweep no longer clones its
   candidate lists.
+- **Import address tables**: deep mode protects both the lookup and the
+  address table of every regular, RVA-form delay and VA-form delay import
+  (and a delay import's bound and unload tables), with or without an IAT
+  directory, and import verification fails a copy that edits either table.
+- **Resource-fork structure**: a fork's header, map, type list, resource
+  types, IDs and reference records and its AppleDouble envelope are kept in
+  normal and deep mode, so a rule naming a type code such as `STAR` cleans
+  `STR `, `STR#` and PiPL text and reports the type code as a retained
+  `structural record`. Normal mode now cleans fork text under a rule instead
+  of leaving the fork unverified.
+- **UTF-16 credits**: the credit audit reads UTF-16 in both byte orders by
+  whole units, so a little-endian credit no longer loses half its last
+  character and terminator, and an excluded UTF-16 credit fails `strict` and
+  is an `explicit exclusion` under `protected`.
+- **Archive entries of every format**: a ZIP, tar or tar.gz copy verifies each
+  entry with the same plan, checks and audit it would get as a file on its
+  own, so a resource fork, ELF or Mach-O entry gets the verdict it gets
+  standalone, not only a PE.
+- **One path normalization**: planning, applying and verifying normalize the
+  input path the same way (`\` to `/`, `.` segments and repeated separators
+  dropped), so a plan made from `./bin/file.dll` or `bin\file.dll` matches
+  `bin/*.dll` and applies and verifies from any folder.
+- **Candidate cap**: the 500,000 deep candidates now count parsed metadata
+  (exports, resource strings, dialogs, message tables, manifests, PiPL lists
+  and .NET user strings) as well as raw strings, and a sweep past it reports
+  incomplete coverage.
 - The highlight no longer moves when a file appears or disappears above it,
   such as a `.deattributed` copy sorting before its original.
 - Columns line up for file names with wide characters.

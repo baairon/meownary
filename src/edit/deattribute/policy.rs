@@ -108,6 +108,24 @@ impl Options {
     }
 }
 
+/// A path the way `files` globs see it, the same at planning, applying and
+/// verifying: `/` separators, no `.` segments and no repeated separators.
+/// `..` stays as written, since resolving it would need the file system.
+pub fn logical_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let absolute = text.starts_with('/');
+    let parts: Vec<&str> = text
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 /// Simple case-sensitive `*`/`?` globs over the normalized logical path.
 /// No regex, shell expansion, or platform-dependent path interpretation.
 pub fn glob(pattern: &str, value: &str) -> bool {
@@ -194,7 +212,7 @@ impl Rules {
                 offset: m.offset,
                 len: m.len,
             }));
-        let path = view.path().to_string_lossy().replace('\\', "/");
+        let path = logical_path(view.path());
         let mut audit = Audit {
             layout,
             limits: limits.clone(),
@@ -380,6 +398,34 @@ mod tests {
                 category: "raw".into(),
             }],
             ..Layout::default()
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_a_relative_path_names_the_same_file() {
+        for spelling in [
+            "bin/file.dll",
+            "./bin/file.dll",
+            ".//bin/./file.dll",
+            "bin\\file.dll",
+            ".\\bin\\file.dll",
+        ] {
+            assert_eq!(
+                logical_path(std::path::Path::new(spelling)),
+                "bin/file.dll",
+                "{spelling}"
+            );
+        }
+        assert_eq!(logical_path(std::path::Path::new("../bin/x")), "../bin/x");
+        assert_eq!(logical_path(std::path::Path::new("/opt//x")), "/opt/x");
+        // A selector matches every spelling the same way.
+        let rules: Rules = serde_json::from_str(r#"{"version":1,"identities":[{"id":"publisher","scope":"publisher","names":["North"],"encodings":["ascii"],"files":["bin/*.dll"]}]}"#).unwrap();
+        for spelling in ["bin/file.dll", "./bin/file.dll", "bin\\file.dll"] {
+            let view = MemView::new(spelling, b"North".to_vec());
+            let plan = rules
+                .plan(&view, raw_layout(view.size()), &Limits::default())
+                .unwrap();
+            assert_eq!(plan.matches, 1, "{spelling}");
         }
     }
 

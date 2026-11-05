@@ -387,8 +387,8 @@ pub(crate) fn imports_unchanged(original: &dyn FileView, output: &dyn FileView) 
             import_protected: Protected::default(),
             rewrites: Vec::new(),
             caveats: Vec::new(),
-            resource_hits: Vec::new(),
             structured_hits: Vec::new(),
+            budget: super::Budget::new(usize::MAX),
             pipls: Vec::new(),
             evidence: Vec::new(),
             skipped: Vec::new(),
@@ -927,8 +927,9 @@ struct Walk<'a> {
     import_protected: Protected,
     rewrites: Vec<Rewrite>,
     caveats: Vec<Caveat>,
-    resource_hits: Vec<Hit>,
     structured_hits: Vec<Hit>,
+    /// The sweep's candidate allowance, shared by parsed and raw strings.
+    budget: super::Budget,
     pipls: Vec<Pipl>,
     evidence: Evidence,
     skipped: Vec<Reason>,
@@ -1013,6 +1014,31 @@ impl Walk<'_> {
         }
     }
 
+    /// Protect an address table at `rva`: each nonzero slot up to the zero
+    /// terminator, without following its values. A delay-load address table
+    /// points at loader stubs until the first call, so its slots are not
+    /// names; they are still what the loader patches, so they must not move.
+    fn thunk_slots(&mut self, rva: u32) {
+        let Some(mut at) = self.img.rva_to_off(rva) else {
+            return;
+        };
+        let width = if self.img.is64 { 8usize } else { 4 };
+        for _ in 0..MAX_ENTRIES {
+            let Some(raw) = read_full(self.view, at, width) else {
+                return;
+            };
+            if raw.iter().all(|&b| b == 0) {
+                // The terminator is part of the table the loader reads.
+                self.protected.add(at, width as u64);
+                self.import_protected.add(at, width as u64);
+                return;
+            }
+            self.protected.add(at, width as u64);
+            self.import_protected.add(at, width as u64);
+            at += width as u64;
+        }
+    }
+
     fn imports(&mut self) {
         let Some(d) = self.img.dir(DIR_IMPORT) else {
             return;
@@ -1036,7 +1062,17 @@ impl Walk<'_> {
                 return;
             };
             self.import_name_at(name);
-            self.thunks(if lookup != 0 { lookup } else { iat }, 0);
+            // Both tables are the loader's: the lookup table names each
+            // import, the address table is what it patches, and with no
+            // lookup table the address table names them too.
+            if lookup != 0 {
+                self.thunks(lookup, 0);
+                if iat != 0 {
+                    self.thunk_slots(iat);
+                }
+            } else {
+                self.thunks(iat, 0);
+            }
             at += 20;
         }
     }
@@ -1063,6 +1099,12 @@ impl Walk<'_> {
             else {
                 return;
             };
+            // The address table, and the optional bound and unload copies.
+            let tables: Vec<u32> = [12, 20, 24]
+                .iter()
+                .filter_map(|&at| u32_at(&desc, at))
+                .filter(|&ptr| ptr != 0)
+                .collect();
             // Version 1 descriptors hold RVAs; the older form holds virtual
             // addresses, which come back to RVAs by taking off the image base.
             // Either form names a DLL the loader resolves, so both are
@@ -1071,6 +1113,9 @@ impl Walk<'_> {
             if attrs & 1 != 0 {
                 self.import_name_at(name);
                 self.thunks(names, 0);
+                for table in tables {
+                    self.thunk_slots(table);
+                }
             } else {
                 let base = self.img.image_base;
                 let rva = |va: u32| {
@@ -1078,10 +1123,14 @@ impl Walk<'_> {
                         .checked_sub(base)
                         .and_then(|rva| u32::try_from(rva).ok())
                 };
-                match (rva(name), rva(names)) {
-                    (Some(name), Some(names)) => {
+                let converted: Option<Vec<u32>> = tables.iter().map(|&va| rva(va)).collect();
+                match (rva(name), rva(names), converted) {
+                    (Some(name), Some(names), Some(tables)) => {
                         self.import_name_at(name);
                         self.thunks(names, base);
+                        for table in tables {
+                            self.thunk_slots(table);
+                        }
                     }
                     _ => self.skipped.push(Reason::MalformedMetadata),
                 }
@@ -1115,7 +1164,7 @@ impl Walk<'_> {
                             < u64::from(d.rva) + u64::from(d.size)
                         && let Ok(text) = String::from_utf8(bytes.clone())
                     {
-                        self.structured_hits.push(Hit {
+                        self.admit_one(Hit {
                             off,
                             len: bytes.len(),
                             text,
@@ -1136,7 +1185,7 @@ impl Walk<'_> {
                         && let Some((off, bytes)) = self.name_at(rva)
                         && let Ok(text) = String::from_utf8(bytes.clone())
                     {
-                        self.structured_hits.push(Hit {
+                        self.admit_one(Hit {
                             off,
                             len: bytes.len(),
                             text,
@@ -1257,22 +1306,19 @@ impl Walk<'_> {
                                 Source::Manifest,
                             )
                         }));
-                        self.structured_hits.extend(names);
+                        self.admit(names);
                     }
                     Some(RT_STRING) => {
                         self.protected.add(off, u64::from(size));
-                        self.structured_hits
-                            .extend(string_table(self.view, off, size as usize))
+                        self.admit(string_table(self.view, off, size as usize));
                     }
                     Some(RT_DIALOG) => {
                         self.protected.add(off, u64::from(size));
-                        self.structured_hits
-                            .extend(dialog_table(self.view, off, size as usize));
+                        self.admit(dialog_table(self.view, off, size as usize));
                     }
                     Some(RT_MESSAGETABLE) => {
                         self.protected.add(off, u64::from(size));
-                        self.structured_hits
-                            .extend(message_table(self.view, off, size as usize));
+                        self.admit(message_table(self.view, off, size as usize));
                     }
                     Some(RT_PIPL) => {
                         self.protected.add(off, u64::from(size));
@@ -1281,7 +1327,7 @@ impl Walk<'_> {
                         {
                             Some(pipl) => {
                                 self.evidence.extend(pipl.evidence());
-                                self.structured_hits.extend(pipl.text_fields());
+                                self.admit(pipl.text_fields());
                                 self.pipls.push(pipl);
                             }
                             None => self.skipped.push(Reason::MalformedMetadata),
@@ -1328,7 +1374,19 @@ impl Walk<'_> {
         self.rewrites.extend(rewrites);
         self.evidence.extend(evidence);
         self.skipped.extend(skipped);
-        user_strings(self.view, md, u64::from(md_size)).unwrap_or_default()
+        let user = user_strings(self.view, md, u64::from(md_size)).unwrap_or_default();
+        self.budget.admit(user)
+    }
+
+    /// Take parsed strings into the candidates, as many as the allowance
+    /// holds.
+    fn admit(&mut self, hits: Vec<Hit>) {
+        let kept = self.budget.admit(hits);
+        self.structured_hits.extend(kept);
+    }
+
+    fn admit_one(&mut self, hit: Hit) {
+        self.admit(vec![hit]);
     }
 
     fn debug(&mut self) {
@@ -1621,6 +1679,12 @@ pub(super) fn sweep(view: &dyn FileView) -> Deep {
 }
 
 pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
+    sweep_capped(view, limits, super::MAX_DEEP_STRINGS)
+}
+
+/// [`sweep_with_limits`] with at most `max` candidates across every source:
+/// exports, resources, PiPL lists, .NET strings and raw strings.
+pub(super) fn sweep_capped(view: &dyn FileView, limits: &Limits, max: usize) -> Deep {
     let Some(img) = PeImage::parse(view) else {
         return Deep {
             skipped: vec![Reason::MalformedMetadata],
@@ -1640,8 +1704,8 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
         import_protected: Protected::default(),
         rewrites: Vec::new(),
         caveats: Vec::new(),
-        resource_hits: Vec::new(),
         structured_hits: Vec::new(),
+        budget: super::Budget::new(max),
         pipls: Vec::new(),
         evidence: Vec::new(),
         skipped: Vec::new(),
@@ -1716,9 +1780,9 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
         &regions,
         &mut w.skipped,
         limits.max_scan_bytes,
-        super::MAX_DEEP_STRINGS,
+        w.budget.left(),
     );
-    hits.extend(std::mem::take(&mut w.resource_hits));
+    w.budget.spend(hits.len(), false);
     hits.extend(w.structured_hits.iter().cloned());
     hits.sort();
     hits.dedup();
@@ -1741,13 +1805,15 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
         })
         .map(|section| (u64::from(section.raw_ptr), u64::from(section.raw_size)))
         .collect();
-    hits.extend(super::region_strings_limited(
+    let code_hits = super::region_strings_limited(
         view,
         &code_regions,
         &mut w.skipped,
         limits.max_scan_bytes,
-        super::MAX_DEEP_STRINGS.saturating_sub(hits.len()),
-    ));
+        w.budget.left(),
+    );
+    w.budget.spend(code_hits.len(), false);
+    hits.extend(code_hits);
     audit_terms.extend(vendor_alias_terms(&hits, &roots, stem, &w.evidence));
     audit_terms.extend(library_terms(&hits));
     hits.truncate(data_hits);
@@ -1763,6 +1829,19 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
         offset: h.off,
         len: h.len as u64,
     }));
+    // Everything that can make coverage incomplete is known before the
+    // audit says whether it is.
+    let mut pipl_rewrites = Vec::new();
+    for pipl in &w.pipls {
+        let (planned, skipped) = pipl.rewrites(&roots);
+        pipl_rewrites.extend(planned);
+        w.skipped.extend(
+            skipped
+                .into_iter()
+                .filter(|reason| *reason != Reason::FunctionalName),
+        );
+    }
+    w.budget.report(&mut w.skipped);
     let mut audit = Audit {
         patterns: identity_patterns(&audit_terms),
         layout: layout(&w, fields),
@@ -1781,15 +1860,7 @@ pub(super) fn sweep_with_limits(view: &dyn FileView, limits: &Limits) -> Deep {
         w.skipped.push(Reason::DeepBudget);
     }
     rewrites.extend(identity_rewrites);
-    for pipl in &w.pipls {
-        let (planned, skipped) = pipl.rewrites(&roots);
-        rewrites.extend(planned);
-        w.skipped.extend(
-            skipped
-                .into_iter()
-                .filter(|reason| *reason != Reason::FunctionalName),
-        );
-    }
+    rewrites.extend(pipl_rewrites);
     let blanks = certificate
         .into_iter()
         .map(|marker| (Kind::Brand, marker))

@@ -261,7 +261,9 @@ pub fn zip_file_count(path: &Path) -> Option<usize> {
     )
 }
 
-/// Whether the copy is stable and its PE entries have no original identity left.
+/// Whether the copy is stable and every entry passes the audit its original
+/// would get as a standalone file; in deep mode also whether its PE entries
+/// and the archive's own metadata keep no original identity.
 pub fn verify_copy(original: &Path, output: &Path, mode: Mode) -> (bool, Option<&'static str>) {
     let Ok(data) = fs::read(output) else {
         return (false, None);
@@ -271,19 +273,20 @@ pub fn verify_copy(original: &Path, output: &Path, mode: Mode) -> (bool, Option<
     {
         return (false, None);
     }
-    if mode != Mode::Deep {
-        return (true, None);
-    }
     let Ok(source) = fs::read(original) else {
         return (false, None);
     };
-    match pe_residual_in_entries(&source, &data) {
-        Ok(category) => (category.is_none(), category),
-        Err(()) => (false, None),
-    }
+    residual_in_entries(&source, &data, mode).unwrap_or((false, None))
 }
 
-fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'static str>, ()> {
+/// Audit every entry of `output` against the same entry of `source`, the way
+/// the entry would be verified on its own, and in deep mode the PE identity
+/// check and the archive metadata. The verdict and the first residual.
+fn residual_in_entries(
+    source: &[u8],
+    output: &[u8],
+    mode: Mode,
+) -> Result<(bool, Option<&'static str>), ()> {
     let entries = |data: &[u8]| {
         let view = SliceView::new("archive.zip", data);
         let arch = parsers::zip::parse(&view).ok_or(())?;
@@ -295,6 +298,7 @@ fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'stati
     if source_entries.len() != output_entries.len() {
         return Err(());
     }
+    let registry = parsers::registry();
     let mut terms = BTreeSet::new();
     for (before, after) in source_entries.iter().zip(&output_entries) {
         if before.size != after.size {
@@ -308,22 +312,32 @@ fn pe_residual_in_entries(source: &[u8], output: &[u8]) -> Result<Option<&'stati
         let original_bytes = unpack(source, before, &source_span).ok_or(())?;
         let copy_bytes = unpack(output, after, &output_span).ok_or(())?;
         let original_view = SliceView::new(before.file_name(), &original_bytes);
-        if PeImage::parse(&original_view).is_none() {
-            continue;
+        if mode == Mode::Deep && PeImage::parse(&original_view).is_some() {
+            terms.extend(deep::pe_terms(&original_view));
+            let copy_view = SliceView::new(after.file_name(), &copy_bytes);
+            if PeImage::parse(&copy_view).is_none() {
+                return Err(());
+            }
+            if let Some(category) = deep::residual_category(&original_view, &copy_view) {
+                return Ok((false, Some(category)));
+            }
         }
-        terms.extend(deep::pe_terms(&original_view));
-        let copy_view = SliceView::new(after.file_name(), &copy_bytes);
-        if PeImage::parse(&copy_view).is_none() {
-            return Err(());
-        }
-        if let Some(category) = deep::residual_category(&original_view, &copy_view) {
-            return Ok(Some(category));
+        let verdict = super::mem::verify_entry(
+            before.file_name(),
+            &original_bytes,
+            &copy_bytes,
+            &registry,
+            mode,
+        );
+        if !verdict.ok() {
+            return Ok((false, verdict.residual));
         }
     }
-    if metadata_contains_terms(output, &output_arch, &output_entries, &terms)? {
-        return Ok(Some("ZIP metadata"));
+    if mode == Mode::Deep && metadata_contains_terms(output, &output_arch, &output_entries, &terms)?
+    {
+        return Ok((false, Some("ZIP metadata")));
     }
-    Ok(None)
+    Ok((true, None))
 }
 
 fn metadata_contains_terms(
@@ -1262,6 +1276,78 @@ pub(crate) mod tests {
         assert!(!entries[0].name.contains("NovaFlow"));
         assert!(!comment.windows(8).any(|w| w == b"NovaFlow"));
         assert!(verify_copy(&path, &out, Mode::Deep).0);
+    }
+
+    #[test]
+    fn a_resource_fork_gets_the_same_verdict_alone_and_in_every_archive() {
+        use super::super::deep::tests::{apple_double, pstr, resource_fork};
+        use super::super::tar;
+        let dir = tempfile::tempdir().unwrap();
+        // The string is cleaned; the resource name is linkage and keeps the
+        // vendor, so strict verification fails wherever the fork sits.
+        let mut list = 2u16.to_be_bytes().to_vec();
+        list.extend(pstr(b"\xa9 2024 North Star Labs"));
+        list.extend(pstr(b"Render ready"));
+        let fork = resource_fork(&[(b"STR#", Some(b"North Star Resource"), list)]);
+        for (name, data) in [
+            ("Glow.rsrc", fork.clone()),
+            ("._Glow.dll", apple_double(&fork)),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, &data).unwrap();
+            let report = crate::scan::scan_file_detailed(&path, &crate::parsers::registry()).report;
+            let view = crate::scan::WindowedFile::open(&path).unwrap();
+            let plan = super::super::plan_mode(&report, &view, Mode::Deep);
+            drop(view);
+            let output = super::super::write_deattributed(
+                &path,
+                report.format.as_deref(),
+                report.size,
+                &plan.targets,
+            )
+            .unwrap();
+            let alone = super::super::verify_copy(
+                &path,
+                &output,
+                report.format.as_deref(),
+                &plan.targets,
+                Mode::Deep,
+            );
+            let alone = (alone.ok(), alone.residual);
+            assert_eq!(alone, (false, Some("file data")), "{name}");
+
+            let inner = format!("res/{name}");
+            let zip_path = dir.path().join("fork.zip");
+            let zip_out = dir.path().join("fork.deattributed.zip");
+            fs::write(&zip_path, build(&[item(&inner, &data, true)], b"")).unwrap();
+            deattribute_zip_mode(&zip_path, &zip_out, false, Mode::Deep).unwrap();
+            let in_zip = verify_copy(&zip_path, &zip_out, Mode::Deep);
+            assert_eq!(in_zip, alone, "{name} in a ZIP");
+
+            let mut t = Vec::new();
+            tar::tests::entry(&mut t, &inner, b'0', &data);
+            tar::tests::end(&mut t);
+            for gz in [false, true] {
+                let (file, out) = if gz {
+                    ("fork.tar.gz", "fork.deattributed.tar.gz")
+                } else {
+                    ("fork.tar", "fork.deattributed.tar")
+                };
+                let tar_path = dir.path().join(file);
+                let tar_out = dir.path().join(out);
+                let bytes = if gz {
+                    tar::tests::gz_member(&t, false)
+                } else {
+                    t.clone()
+                };
+                fs::write(&tar_path, bytes).unwrap();
+                tar::deattribute_tar_mode(&tar_path, gz, &tar_out, Mode::Deep)
+                    .unwrap()
+                    .unwrap();
+                let in_tar = tar::verify_copy(&tar_path, &tar_out, gz, Mode::Deep);
+                assert_eq!(in_tar, alone, "{name} in {file}");
+            }
+        }
     }
 
     #[test]

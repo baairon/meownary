@@ -40,6 +40,12 @@ pub(super) fn pe_layout(view: &dyn FileView) -> super::layout::Layout {
     .unwrap_or_default()
 }
 
+/// A resource fork's layout: its structure kept, its string bodies and PiPL
+/// text editable, its names linkage. `None` when it does not parse.
+pub(super) fn rsrc_layout(view: &dyn FileView) -> Option<super::layout::Layout> {
+    rsrc::layout(view)
+}
+
 /// Longest string the sweep considers, in characters.
 const MAX_STRING: usize = 64 * 1024;
 /// Largest region read in one piece.
@@ -50,6 +56,53 @@ const MAX_TOTAL: u64 = 256 * 1024 * 1024;
 /// reports [`Reason::DeepBudget`], so the copy counts as incompletely
 /// covered rather than clean.
 pub(super) const MAX_DEEP_STRINGS: usize = 500_000;
+
+/// What is left of a sweep's candidate allowance, shared by every source a
+/// sweep reads: raw strings and parsed metadata alike. Once a source is cut
+/// short the sweep reports [`Reason::DeepBudget`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Budget {
+    left: usize,
+    hit: bool,
+}
+
+impl Budget {
+    pub(super) fn new(max: usize) -> Self {
+        Self {
+            left: max,
+            hit: false,
+        }
+    }
+
+    /// Candidates the sweep may still take.
+    pub(super) fn left(&self) -> usize {
+        self.left
+    }
+
+    /// Keep as many of `items` as the allowance holds.
+    pub(super) fn admit<T>(&mut self, mut items: Vec<T>) -> Vec<T> {
+        if items.len() > self.left {
+            items.truncate(self.left);
+            self.hit = true;
+        }
+        self.left -= items.len();
+        items
+    }
+
+    /// Count `n` candidates taken elsewhere, `cut` when that source stopped
+    /// at the allowance.
+    pub(super) fn spend(&mut self, n: usize, cut: bool) {
+        self.left = self.left.saturating_sub(n);
+        self.hit |= cut;
+    }
+
+    /// Record the budget reason once when any source was cut short.
+    pub(super) fn report(&self, skipped: &mut Vec<Reason>) {
+        if self.hit && !skipped.contains(&Reason::DeepBudget) {
+            skipped.push(Reason::DeepBudget);
+        }
+    }
+}
 /// Largest plain-text file the text sweep reads.
 const MAX_TEXT: u64 = 16 * 1024 * 1024;
 /// Window for the entropy guard of the fallback sweep.
@@ -110,14 +163,31 @@ pub(super) fn sweep_with_limits(
     view: &dyn FileView,
     limits: &crate::edit::precision::pattern::Limits,
 ) -> Deep {
+    sweep_capped(report, view, limits, MAX_DEEP_STRINGS)
+}
+
+/// [`sweep_with_limits`] with at most `max` candidates across every source.
+pub(super) fn sweep_capped(
+    report: &FileReport,
+    view: &dyn FileView,
+    limits: &crate::edit::precision::pattern::Limits,
+    max: usize,
+) -> Deep {
     match report.format.as_deref() {
-        Some("pe") => pe::sweep_with_limits(view, limits),
-        Some("rsrc" | "appledouble") => rsrc::sweep(view, limits),
+        Some("pe") => pe::sweep_capped(view, limits, max),
+        Some("rsrc" | "appledouble") => rsrc::sweep(view, limits, max),
         Some("elf") => {
             let mut regions = elf::data_regions(view);
             regions.extend(elf::debug_string_regions(view));
             regions.sort_unstable();
-            binary(view, &regions, &Protected::default(), &Vec::new(), limits)
+            binary(
+                view,
+                &regions,
+                &Protected::default(),
+                &Vec::new(),
+                limits,
+                max,
+            )
         }
         Some("macho") => {
             let found = macho::deep_regions(view);
@@ -145,6 +215,7 @@ pub(super) fn sweep_with_limits(
                 &Protected::default(),
                 &evidence,
                 limits,
+                max,
             );
             for sig in &found.signatures {
                 if sig.len > MAX_TOTAL {
@@ -185,7 +256,7 @@ pub(super) fn sweep_with_limits(
                 text(view)
             }
         }
-        None => fallback_limited(view, limits.max_scan_bytes),
+        None => fallback_limited(view, limits.max_scan_bytes, max),
         _ => Deep::default(),
     }
 }
@@ -1067,15 +1138,10 @@ fn binary(
     protected: &Protected,
     evidence: &Evidence,
     limits: &crate::edit::precision::pattern::Limits,
+    max: usize,
 ) -> Deep {
     let mut skipped = Vec::new();
-    let hits = region_strings_limited(
-        view,
-        regions,
-        &mut skipped,
-        limits.max_scan_bytes,
-        MAX_DEEP_STRINGS,
-    );
+    let hits = region_strings_limited(view, regions, &mut skipped, limits.max_scan_bytes, max);
     let roots = roots(&hits, None, evidence);
     skipped.extend(residuals(&hits, &[], &[], &roots));
     let mut layout = super::layout::inspect(view);
@@ -1192,7 +1258,7 @@ fn entropy(bytes: &[u8]) -> f64 {
 /// A file no parser describes: only patch credits, copyright marks and build
 /// paths in NUL-bounded strings, and only where the bytes around the string
 /// are not compressed or encrypted.
-fn fallback_limited(view: &dyn FileView, max_bytes: u64) -> Deep {
+fn fallback_limited(view: &dyn FileView, max_bytes: u64, max: usize) -> Deep {
     let size = view.size();
     let mut skipped = Vec::new();
     if size > max_bytes {
@@ -1203,7 +1269,7 @@ fn fallback_limited(view: &dyn FileView, max_bytes: u64) -> Deep {
         &[(0, size.min(max_bytes))],
         &mut skipped,
         max_bytes,
-        MAX_DEEP_STRINGS,
+        max,
     );
     let mut rewrites = Vec::new();
     for hit in hits {

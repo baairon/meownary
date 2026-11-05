@@ -145,10 +145,10 @@ inspect and test the copy before using it.
 
 | Format | Deep also changes |
 |---|---|
-| PE | recognized identity bytes in data and code sections and the overlay past them, including RTTI, exports, URLs, registry keys and licensing strings; parsed import DLL/function names and thunk tables stay byte-exact; string table, dialog and message table resources; the .NET `#US` heap and assembly attribution; Adobe plug-in property lists named `PiPL` or `PIPL`, with neutral effect names and same-length match ids of at least three characters; the export directory's DLL name, rewritten to a neutral same-length `module` name; build and debug stamps, PDB paths, and the Authenticode directory, cleared so the copy is unsigned |
+| PE | recognized identity bytes in data and code sections and the overlay past them, including RTTI, exports, URLs, registry keys and licensing strings; parsed import DLL/function names and the lookup and address tables stay byte-exact; string table, dialog and message table resources; the .NET `#US` heap and assembly attribution; Adobe plug-in property lists named `PiPL` or `PIPL`, with neutral effect names and same-length match ids of at least three characters; the export directory's DLL name, rewritten to a neutral same-length `module` name; build and debug stamps, PDB paths, and the Authenticode directory, cleared so the copy is unsigned |
 | ELF | strings in `.rodata`, `.data`, `.comment`, `.debug_str` and `.debug_line_str` |
 | Mach-O | strings in `__TEXT` `__cstring`, `__const`, `__ustring` and `__oslogstring`, and `__DATA` `__const` and `__data`; the source and object file paths of debug stabs; the embedded code signature, blanked with `LC_CODE_SIGNATURE` emptied so the copy is cleanly unsigned |
-| Resource fork | `STR ` and `STR#` strings and PiPL properties, in a raw Macintosh resource fork or an AppleDouble `._` file |
+| Resource fork | `STR ` and `STR#` strings and PiPL text, in a raw Macintosh resource fork or an AppleDouble `._` file; every other byte stays |
 | Plain text | patch credits, copyright marks and build paths, filled with spaces up to the end of their line or quoted value, so quotes, tags and newlines stay put |
 | Anything else | patch credits, copyright marks and build paths in NUL-terminated strings, only where the bytes around them do not look compressed or encrypted |
 
@@ -163,13 +163,17 @@ break code and host linkage.
 
 Deep never touches:
 
-- PE structural fields such as import and export address arrays, parsed import
-  names and thunk tables, relocations, load config, and resource directory offsets;
+- PE structural fields such as export address arrays, parsed import names,
+  the lookup and address tables of regular and delay imports (in either
+  delay descriptor form, with or without an IAT directory), relocations, load
+  config, and resource directory offsets;
 - ELF `.dynstr`, `.symtab`, `.dynamic`, notes, unwind data or Go build info;
 - Mach-O symbol names, `__LINKEDIT` data besides stab paths and the code
   signature, Objective-C class and selector names, or a section holding
   instructions;
-- the names of resources in a resource fork, which the host looks up;
+- a resource fork's header, map, type list, resource types, IDs, reference
+  records and names (which the host looks up), resource bodies other than
+  string and PiPL text, or the AppleDouble envelope;
 - URLs and registry keys outside PE files.
 
 Outside PE deep mode and the structures above, a string is swept only when it stands alone:
@@ -207,12 +211,19 @@ output. Failed verification prevents publication of the staged copy.
 Both policies audit identities learned from the original. Removing the source
 of an identity cannot make the verifier forget it: every credit the plan blanks,
 and every one an exclusion keeps, joins the audit as its exact bytes, in normal
-mode as well as deep. A learned name kept on purpose, in an import name, a
+mode as well as deep. A credit counts when it reads as text of four characters
+or more as UTF-8 or as UTF-16 in either byte order; UTF-16 is trimmed by whole
+two-byte units, so a character and its terminator are never split. A learned name kept on purpose, in an import name, a
 resource name or an excluded span, is a retained residual: `protected` passes
-and names the reason, `strict` fails. PE checks also compare parsed imports and
-thunk records against the original, delay imports in either descriptor form
-included. Malformed PE layouts are refused. A ZIP or tar copy is audited entry by
-entry against the original. The existing `clean <path> --deattribute` command
+and names the reason, `strict` fails. PE checks also compare parsed imports, both
+lookup and address tables, against the original, delay imports in either
+descriptor form included, so an edit to either table fails verification.
+Malformed PE layouts are refused. A resource fork's layout keeps its map and
+types in normal mode too, so a rule naming a type code such as `STAR` cleans
+string text and reports the type code as a retained `structural record`.
+Every entry of a ZIP, tar or tar.gz copy gets the checks and audit it would get
+as a file on its own, whatever its format, so a resource fork that fails
+`strict` alone fails the same way inside any of the three. The existing `clean <path> --deattribute` command
 and the interactive view retain their folder and archive workflows, judge with
 `strict`, and report incomplete verification as exit 75.
 
@@ -246,9 +257,12 @@ them. Compound names stay intact instead of turning each short word into a rule.
 Raw UTF-16 discovery requires endian evidence; declared encodings and exact rules
 can match Unicode directly, including surrogate pairs.
 
-Optional `files` globs match the input path as it was given, with `/` even on
-Windows; a saved plan keeps that path, so `apply` matches the same way from any
-folder. Optional `regions` globs match labels from `inspect`, such as `PE data`
+Optional `files` globs match the input path as it was given, normalized the
+same way when planning, applying and verifying: `\` becomes `/`, and `.`
+segments and repeated separators are dropped, so `bin/file.dll`,
+`./bin/file.dll` and `bin\file.dll` all match `bin/*.dll`. `..` is kept as
+typed. A saved plan keeps that path, so `apply` and `verify` match the same way
+from any folder. Optional `regions` globs match labels from `inspect`, such as `PE data`
 or `PE resource`. Globs support case-sensitive `*` and `?`. `expected_matches`
 checks distinct selected byte ranges in the input before editing; the cleaned
 output is judged by the audit, not by the count.
@@ -259,8 +273,10 @@ planned edit when it overlaps the selected bytes, so structural rewrites are
 not partially applied. Explicit rules retain the engine's structural protections.
 
 `--max-scan` defaults to 1,073,741,824 bytes per streaming pass and `--max-matches`
-to 100,000. Deep string discovery keeps at most 500,000 candidates per sweep and
-reports incomplete coverage past that. An incomplete rules or exclusion scan
+to 100,000. A deep sweep keeps at most 500,000 string candidates, counting raw strings and
+parsed metadata alike (exports, resource strings, dialogs, message tables,
+manifests, PiPL lists and .NET user strings), and reports incomplete coverage
+past that. An incomplete rules or exclusion scan
 refuses editing. Reports distinguish unexplored ranges from explained residuals. `--details` can expose
 identity text and audit patterns; ordinary reports omit those values.
 `--plan-out` alone saves a plan without applying it; `--dry-run` performs no
